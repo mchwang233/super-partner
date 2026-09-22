@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .config import settings
 from .db import Database
 from .models import Event, ExecutionRun, NodeStatus, RunStatus
+from .projects import git_snapshot
 from .providers import ProviderRegistry
 
 
@@ -16,6 +18,7 @@ class Executor:
         self.model_lookup = model_lookup
         self.tasks: dict[str, asyncio.Task] = {}
         self.locks: dict[str, asyncio.Lock] = {}
+        self.project_locks: dict[str, asyncio.Lock] = {}
 
     def start(self, run_id: str) -> None:
         task = self.tasks.get(run_id)
@@ -41,6 +44,11 @@ class Executor:
                 node.status = NodeStatus.PENDING
         self._save(run)
         self.emit(run.id, "run.started")
+        if run.project_dir:
+            self.emit(
+                run.id, "workspace.snapshot", project_dir=run.project_dir,
+                **await asyncio.to_thread(git_snapshot, Path(run.project_dir)),
+            )
         running: dict[asyncio.Task, str] = {}
         try:
             while True:
@@ -144,10 +152,25 @@ class Executor:
             if item.id in node.dependencies and item.result
         ]
         prompt = f"Task: {node.instructions}\n\nDependency results:\n" + "\n".join(context)
+        in_project = bool(run.project_dir and node.needs_workspace)
+        if in_project:
+            prompt = (
+                f"You are working in the user's existing project at {run.project_dir}. "
+                "Edit files in place, keep changes focused on the task, and do not commit.\n\n"
+                + prompt
+            )
         try:
-            workspace = settings.workspace_root / run_id
-            workspace.mkdir(parents=True, exist_ok=True)
-            result = await self.providers.complete(node.model_id or "mock:local", prompt, workspace)
+            if in_project:
+                workspace = Path(run.project_dir)
+                # CLI agents editing the same checkout concurrently would clobber each other.
+                async with self.project_locks.setdefault(run.project_dir, asyncio.Lock()):
+                    result = await self.providers.complete(
+                        node.model_id or "mock:local", prompt, workspace, allow_api_fallback=False,
+                    )
+            else:
+                workspace = settings.workspace_root / run_id
+                workspace.mkdir(parents=True, exist_ok=True)
+                result = await self.providers.complete(node.model_id or "mock:local", prompt, workspace)
             async with lock:
                 latest = self.db.get_run(run_id)
                 if not latest:

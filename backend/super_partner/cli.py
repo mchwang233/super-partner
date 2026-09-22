@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -26,12 +27,20 @@ def plan(
     prompt: str,
     budget: float = 2.0,
     use_cli: bool = typer.Option(True, "--use-cli/--no-use-cli", help="Allow membership CLIs"),
+    project: Optional[Path] = None,
     as_json: bool = False,
 ):
     response = httpx.post(
         f"{settings.api_base_url}/api/tasks",
-        json={"prompt": prompt, "budget_usd": budget, "use_cli": use_cli},
+        json={
+            "prompt": prompt, "budget_usd": budget, "use_cli": use_cli,
+            "project_dir": str(project.expanduser().resolve()) if project else None,
+        },
+        timeout=180,
     )
+    if response.is_error:
+        typer.echo(response.json().get("detail", response.text), err=True)
+        raise typer.Exit(1)
     response.raise_for_status()
     data = response.json()
     if as_json:
@@ -39,8 +48,11 @@ def plan(
         return
     typer.echo(f"Task {data['id']} — {data['plan']['summary']}")
     typer.echo(f"CLI routing: {'enabled' if data['use_cli'] else 'disabled'}")
+    if data.get("project_dir"):
+        typer.echo(f"Project: {data['project_dir']}")
     for node in data["plan"]["nodes"]:
-        typer.echo(f"  {node['title']}: {node['model_id']} (${node['estimated_cost_usd']:.6f})")
+        where = " [project]" if node.get("needs_workspace") else ""
+        typer.echo(f"  {node['title']}: {node['model_id']}{where} (${node['estimated_cost_usd']:.6f})")
     estimate = data["plan"]["estimate"]
     typer.echo(f"Estimated ${estimate['low_usd']:.4f}–${estimate['high_usd']:.4f}; limit ${estimate['hard_limit_usd']:.2f}")
 

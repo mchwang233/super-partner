@@ -68,7 +68,7 @@ class SlowProviders:
         self.peak = 0
         self.calls = 0
 
-    async def complete(self, model_id, prompt, workspace=None, cli_timeout=900):
+    async def complete(self, model_id, prompt, workspace=None, **kwargs):
         self.calls += 1
         self.active += 1
         self.peak = max(self.peak, self.active)
@@ -158,11 +158,20 @@ async def test_cancelled_cli_call_kills_spawned_processes(tmp_path: Path, monkey
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    for _ in range(100):
-        if not Path(f"/proc/{child_pid}").exists():
+    for _ in range(200):
+        if not process_alive(child_pid):
             break
         await asyncio.sleep(0.01)
-    assert not Path(f"/proc/{child_pid}").exists()
+    assert not process_alive(child_pid)
+
+
+def process_alive(pid: int) -> bool:
+    """True unless the process is gone or a zombie awaiting reaping by its new parent."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
 async def test_provider_retries_rate_limited_requests(monkeypatch):

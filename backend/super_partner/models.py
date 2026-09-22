@@ -78,6 +78,8 @@ class TaskNode(BaseModel):
     estimated_input_tokens: int = 1500
     estimated_output_tokens: int = 800
     quality_threshold: float = 0.65
+    # True when the node must read or change files in the run's project directory.
+    needs_workspace: bool = False
     model_id: Optional[str] = None
     estimated_cost_usd: float = 0.0
     status: NodeStatus = NodeStatus.PENDING
@@ -110,6 +112,7 @@ class ExecutionRun(BaseModel):
     plan: TaskPlan
     budget_usd: float
     use_cli: bool = True
+    project_dir: Optional[str] = None
     actual_cost_usd: float = 0.0
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)

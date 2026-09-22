@@ -49,7 +49,10 @@ class ProviderRegistry:
                 configured.add(model_id)
         return configured
 
-    async def complete(self, model_id: str, prompt: str, workspace=None, cli_timeout: int = 900) -> ProviderResult:
+    async def complete(
+        self, model_id: str, prompt: str, workspace=None, cli_timeout: int = 900,
+        allow_api_fallback: bool = True,
+    ) -> ProviderResult:
         provider, model = model_id.split(":", 1)
         if provider == "cli":
             try:
@@ -60,6 +63,8 @@ class ProviderRegistry:
                     text=text, input_tokens=0, output_tokens=0, used_model_id=model_id,
                 )
             except RuntimeError as exc:
+                if not allow_api_fallback:
+                    raise ProviderError(str(exc)) from exc
                 fallback = CLI_SPECS[model_id].fallback_model_id
                 if fallback not in self.configured_models([fallback]):
                     raise ProviderError(f"{exc}; no API fallback is configured") from exc

@@ -121,11 +121,17 @@ class CliChannelRegistry:
             stdin = None
         else:
             stdin = prompt.encode()
-        process = await asyncio.create_subprocess_exec(
+        spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
             executable, *args, cwd=str(cwd), stdin=asyncio.subprocess.PIPE if stdin else None,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
-        )
+        ))
+        try:
+            process = await asyncio.shield(spawn)
+        except asyncio.CancelledError:
+            # The CLI may already be running; finish spawning so its whole group can be killed.
+            await _kill_process_group(await spawn)
+            raise
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(stdin), timeout=timeout)
         except asyncio.TimeoutError:

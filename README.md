@@ -41,8 +41,24 @@ Open <http://localhost:5173>. The built-in mock model works without credentials,
 super-partner models
 super-partner plan "Research and implement a health endpoint" --budget 2
 super-partner plan "Use APIs only" --no-use-cli
+super-partner plan "Fix the flaky test" --project ~/prj/my-app
 super-partner run TASK_ID
 ```
+
+## Working on an existing project
+
+Give a task a project directory to have membership CLI agents edit that checkout in place:
+
+```bash
+super-partner plan "Fix the failing login test" --project ~/prj/my-app
+```
+
+In the web console, fill in the project directory field under the prompt.
+
+- The directory must be an existing absolute path inside `SUPER_PARTNER_PROJECT_ROOTS` (a JSON list, default: your home directory), and cannot be the Super Partner data directory.
+- The planner sees the project's top-level layout and git state, and marks nodes that must read or change project files. Only those nodes run in the project; everything else runs in a scratch workspace.
+- Project nodes route only to membership CLIs, because API models cannot see local files, and they never fall back to an API. Nodes editing the same project run one at a time, across runs as well.
+- Each run records the starting git HEAD, branch, and uncommitted file count as a `workspace.snapshot` event. Agents are told not to commit, so review changes with `git diff` and revert with `git checkout`/`git stash` if needed. Starting from a clean working tree makes that easiest.
 
 ## Provider credentials
 
@@ -52,7 +68,7 @@ Seed prices for models marked `pricing_verified: false` are placeholders and mus
 
 ## Main API
 
-- `POST /api/tasks` creates a plan and estimate.
+- `POST /api/tasks` creates a plan and estimate; pass `project_dir` to work on an existing project.
 - `POST /api/tasks/{id}/confirm` confirms the budget and starts execution.
 - `GET /api/tasks/{id}` returns the full graph and results.
 - `GET /api/tasks/{id}/events` streams audit events as SSE.

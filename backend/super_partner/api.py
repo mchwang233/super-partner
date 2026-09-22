@@ -17,6 +17,7 @@ from .db import Database
 from .executor import Executor
 from .models import Event, ExecutionRun, NodeStatus, RunStatus
 from .planner import autonomous_plan
+from .projects import ProjectDirError, project_context, resolve_project_dir
 from .providers import ProviderError, ProviderRegistry
 from .routing import NoEligibleModelError, eligible_for_node, estimate, route_node
 from .secrets import (
@@ -32,6 +33,7 @@ class CreateTask(BaseModel):
     prompt: str = Field(min_length=3)
     budget_usd: float = Field(default=2, gt=0, le=10_000)
     use_cli: bool = True
+    project_dir: Optional[str] = Field(default=None, max_length=4096)
 
 
 class ConfirmTask(BaseModel):
@@ -170,7 +172,16 @@ async def create_task(body: CreateTask):
     configured = providers.configured_models(list(models))
     if not body.use_cli:
         configured = {model_id for model_id in configured if not model_id.startswith("cli:")}
-    plan = await autonomous_plan(body.prompt, list(models.values()), configured, providers)
+    project_dir = None
+    if body.project_dir and body.project_dir.strip():
+        try:
+            project_dir = resolve_project_dir(body.project_dir.strip())
+        except ProjectDirError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    plan = await autonomous_plan(
+        body.prompt, list(models.values()), configured, providers,
+        project_context=await asyncio.to_thread(project_context, project_dir) if project_dir else None,
+    )
     try:
         for node in plan.nodes:
             available = eligible_for_node(node, list(models.values()), configured)
@@ -195,6 +206,7 @@ async def create_task(body: CreateTask):
     run = ExecutionRun(
         id=str(uuid4()), prompt=body.prompt, status=RunStatus.AWAITING_CONFIRMATION,
         plan=plan, budget_usd=body.budget_usd, use_cli=body.use_cli,
+        project_dir=str(project_dir) if project_dir else None,
         actual_cost_usd=plan.planning_cost_usd,
     )
     db.save_run(run)
@@ -202,6 +214,7 @@ async def create_task(body: CreateTask):
         run_id=run.id, kind="plan.created",
         data={
             "estimate": plan.estimate.model_dump(), "use_cli": body.use_cli,
+            "project_dir": run.project_dir,
             "planning_method": plan.planning_method,
             "planner_model_id": plan.planner_model_id,
             "planning_note": plan.planning_note,

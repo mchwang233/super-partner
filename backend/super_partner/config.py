@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     data_dir: Path = Path(".super-partner")
     database_path: Optional[Path] = None
     workspace_root: Path = Path("workspaces")
+    # Existing project directories a task may target; CLI agents edit files there in place.
+    project_roots: list[Path] = [Path.home()]
     allow_host_shell: bool = False
     default_budget_usd: float = 2.0
     max_parallel_nodes: int = 3

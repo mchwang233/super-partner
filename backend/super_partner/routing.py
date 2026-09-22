@@ -20,6 +20,8 @@ def eligible_for_node(
         if model.enabled
         and model.id in configured
         and model.context_window >= node.estimated_input_tokens + node.estimated_output_tokens
+        # Only CLI agents run inside the project directory; API models never see its files.
+        and (not node.needs_workspace or model.channel == "cli")
     ]
 
 
@@ -30,6 +32,11 @@ def route_node(node: TaskNode, models: list[ModelProfile], configured: set[str])
         if model.scores.score_for(node.capability) >= node.quality_threshold
     ]
     if not eligible:
+        if not available and node.needs_workspace:
+            raise NoEligibleModelError(
+                f"{node.title} must work inside the project directory, which requires an "
+                "enabled and authenticated membership CLI (Codex, Claude Code, Gemini, or Qwen)."
+            )
         if not available:
             raise NoEligibleModelError(
                 "No enabled and configured model can run this node. Enable a membership CLI, "
