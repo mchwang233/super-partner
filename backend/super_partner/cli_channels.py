@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import shutil
+import signal
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -53,6 +56,13 @@ CLI_SPECS = {
         fallback_model_id="qwen:qwen-plus",
     ),
 }
+
+
+async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+    """Kill the CLI and any tools it spawned; they share the session started for it."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    await process.wait()
 
 
 class CliChannelRegistry:
@@ -114,13 +124,16 @@ class CliChannelRegistry:
         process = await asyncio.create_subprocess_exec(
             executable, *args, cwd=str(cwd), stdin=asyncio.subprocess.PIPE if stdin else None,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(stdin), timeout=timeout)
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            await _kill_process_group(process)
             raise RuntimeError(f"{spec.executable} timed out after {timeout}s")
+        except asyncio.CancelledError:
+            await _kill_process_group(process)
+            raise
         if process.returncode:
             raise RuntimeError(f"{spec.executable} failed: {stderr.decode(errors='replace')[-500:]}")
         text = stdout.decode(errors="replace").strip()

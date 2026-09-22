@@ -22,6 +22,11 @@ class Executor:
         if not task or task.done():
             self.tasks[run_id] = asyncio.create_task(self.execute(run_id))
 
+    def cancel(self, run_id: str) -> None:
+        task = self.tasks.get(run_id)
+        if task and not task.done():
+            task.cancel()
+
     def emit(self, run_id: str, kind: str, **data) -> None:
         self.db.add_event(Event(run_id=run_id, kind=kind, data=data))
 
@@ -36,19 +41,26 @@ class Executor:
                 node.status = NodeStatus.PENDING
         self._save(run)
         self.emit(run.id, "run.started")
+        running: dict[asyncio.Task, str] = {}
         try:
             while True:
                 run = self.db.get_run(run_id)
-                if not run or run.status in {RunStatus.CANCELLED, RunStatus.PAUSED}:
+                if not run:
                     return
-                pending = [node for node in run.plan.nodes if node.status == NodeStatus.PENDING]
-                if not pending:
-                    break
-                completed = {node.id for node in run.plan.nodes if node.status == NodeStatus.SUCCEEDED}
-                ready = [node for node in pending if set(node.dependencies) <= completed]
-                if not ready:
-                    raise RuntimeError("Task graph is blocked by failed or cyclic dependencies")
-                await asyncio.gather(*(self._execute_node(run_id, node.id) for node in ready[:3]))
+                if run.status in {RunStatus.CANCELLED, RunStatus.PAUSED}:
+                    # Let in-flight nodes finish so their results and costs are recorded.
+                    if not running:
+                        return
+                else:
+                    dispatched_for_budget = self._dispatch(run, running)
+                    if not running:
+                        if dispatched_for_budget:
+                            self._pause_for_budget(run)
+                            return
+                        break
+                done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    running.pop(task)
             run = self.db.get_run(run_id)
             if not run:
                 return
@@ -56,18 +68,66 @@ class Executor:
             if failed:
                 raise RuntimeError(f"{len(failed)} task node(s) failed")
             if any(node.status != NodeStatus.SUCCEEDED for node in run.plan.nodes):
-                raise RuntimeError("Run finished with unfinished task nodes")
+                raise RuntimeError("Task graph is blocked by failed or cyclic dependencies")
             run.status = RunStatus.SUCCEEDED
             run.final_result = run.plan.nodes[-1].result
             self._save(run)
             self.emit(run.id, "run.succeeded", actual_cost_usd=run.actual_cost_usd)
+        except asyncio.CancelledError:
+            await self._stop_nodes(running)
+            run = self.db.get_run(run_id)
+            # Only a user cancel marks nodes cancelled; on shutdown they stay RUNNING to resume.
+            if run and run.status == RunStatus.CANCELLED:
+                for node in run.plan.nodes:
+                    if node.status == NodeStatus.RUNNING:
+                        node.status = NodeStatus.CANCELLED
+                self._save(run)
+            raise
         except Exception as exc:
+            await self._stop_nodes(running)
             run = self.db.get_run(run_id)
             if run:
                 run.status = RunStatus.FAILED
                 run.error = str(exc)
                 self._save(run)
                 self.emit(run.id, "run.failed", error=str(exc))
+
+    def _dispatch(self, run: ExecutionRun, running: dict[asyncio.Task, str]) -> bool:
+        """Start ready nodes up to the parallel limit; return True if budget held any back."""
+        in_flight = set(running.values())
+        completed = {node.id for node in run.plan.nodes if node.status == NodeStatus.SUCCEEDED}
+        ready = [
+            node for node in run.plan.nodes
+            if node.status == NodeStatus.PENDING and node.id not in in_flight
+            and set(node.dependencies) <= completed
+        ]
+        reserved = run.actual_cost_usd + sum(
+            node.estimated_cost_usd for node in run.plan.nodes if node.id in in_flight
+        )
+        held_back = False
+        for node in ready:
+            if len(running) >= settings.max_parallel_nodes:
+                break
+            if node.estimated_cost_usd and reserved + node.estimated_cost_usd > run.budget_usd:
+                held_back = True
+                continue
+            reserved += node.estimated_cost_usd
+            running[asyncio.create_task(self._execute_node(run.id, node.id))] = node.id
+        return held_back
+
+    def _pause_for_budget(self, run: ExecutionRun) -> None:
+        run.status = RunStatus.PAUSED
+        self._save(run)
+        self.emit(
+            run.id, "approval.required", reason="budget_insufficient",
+            actual_cost_usd=run.actual_cost_usd, budget_usd=run.budget_usd,
+        )
+
+    @staticmethod
+    async def _stop_nodes(running: dict[asyncio.Task, str]) -> None:
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
 
     async def _execute_node(self, run_id: str, node_id: str) -> None:
         lock = self.locks.setdefault(run_id, asyncio.Lock())

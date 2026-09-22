@@ -15,7 +15,7 @@ from .catalog import builtin_models
 from .config import settings
 from .db import Database
 from .executor import Executor
-from .models import Event, ExecutionRun, RunStatus
+from .models import Event, ExecutionRun, NodeStatus, RunStatus
 from .planner import autonomous_plan
 from .providers import ProviderError, ProviderRegistry
 from .routing import NoEligibleModelError, eligible_for_node, estimate, route_node
@@ -228,10 +228,17 @@ async def confirm_task(run_id: str, body: ConfirmTask):
     run = get_task(run_id)
     if run.status not in {RunStatus.AWAITING_CONFIRMATION, RunStatus.PAUSED}:
         raise HTTPException(409, f"Cannot confirm task in {run.status} status")
-    if body.budget_usd is not None:
-        run.budget_usd = body.budget_usd
-        if run.plan.estimate:
-            run.plan.estimate.hard_limit_usd = body.budget_usd
+    budget = body.budget_usd if body.budget_usd is not None else run.budget_usd
+    required = run.actual_cost_usd + sum(
+        node.estimated_cost_usd for node in run.plan.nodes if node.status != NodeStatus.SUCCEEDED
+    )
+    if required > budget:
+        raise HTTPException(
+            409, f"Budget ${budget:.2f} is below the ${required:.4f} needed to finish this task",
+        )
+    run.budget_usd = budget
+    if run.plan.estimate:
+        run.plan.estimate.hard_limit_usd = budget
     run.status = RunStatus.QUEUED
     db.save_run(run)
     db.add_event(Event(run_id=run.id, kind="run.confirmed", data={"budget_usd": run.budget_usd}))
@@ -240,13 +247,14 @@ async def confirm_task(run_id: str, body: ConfirmTask):
 
 
 @app.post("/api/tasks/{run_id}/cancel", response_model=ExecutionRun)
-def cancel_task(run_id: str):
+async def cancel_task(run_id: str):
     run = get_task(run_id)
     if run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}:
         raise HTTPException(409, "Task has already finished")
     run.status = RunStatus.CANCELLED
     db.save_run(run)
     db.add_event(Event(run_id=run.id, kind="run.cancelled"))
+    executor.cancel(run.id)
     return run
 
 

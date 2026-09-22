@@ -1,12 +1,17 @@
+import asyncio
+import os
 from pathlib import Path
 
+import httpx
 import pytest
 from super_partner.catalog import builtin_models
+from super_partner.cli_channels import CliChannelRegistry
+from super_partner.config import settings
 from super_partner.db import Database
 from super_partner.executor import Executor
-from super_partner.models import ExecutionRun, NodeStatus, RunStatus
+from super_partner.models import ExecutionRun, NodeStatus, RunStatus, TaskNode, TaskPlan
 from super_partner.planner import heuristic_plan
-from super_partner.providers import ProviderRegistry
+from super_partner.providers import ProviderError, ProviderRegistry, ProviderResult
 from super_partner.routing import estimate, route_node
 
 
@@ -53,3 +58,143 @@ async def test_resume_reruns_nodes_interrupted_while_running(tmp_path: Path):
     assert result.status == RunStatus.SUCCEEDED
     assert result.plan.nodes[-1].status == NodeStatus.SUCCEEDED
     assert result.final_result
+
+
+class SlowProviders:
+    def __init__(self, delay: float = 0.05, tokens: tuple[int, int] = (10, 10)):
+        self.delay = delay
+        self.tokens = tokens
+        self.active = 0
+        self.peak = 0
+        self.calls = 0
+
+    async def complete(self, model_id, prompt, workspace=None, cli_timeout=900):
+        self.calls += 1
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            await asyncio.sleep(self.delay)
+        finally:
+            self.active -= 1
+        return ProviderResult(
+            text="ok", input_tokens=self.tokens[0], output_tokens=self.tokens[1], used_model_id=model_id,
+        )
+
+
+def wide_run(
+    database: Database, width: int, cost: float, budget: float, model_id: str = "mock:local",
+) -> ExecutionRun:
+    nodes = [
+        TaskNode(id=f"n{i}", title=f"Node {i}", instructions="work", capability="planning",
+                 model_id=model_id, estimated_cost_usd=cost)
+        for i in range(width)
+    ]
+    run = ExecutionRun(id="wide", prompt="demo", status=RunStatus.QUEUED,
+                       plan=TaskPlan(summary="wide", nodes=nodes), budget_usd=budget)
+    database.save_run(run)
+    return run
+
+
+@pytest.mark.asyncio
+async def test_executor_respects_parallel_limit(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(settings, "max_parallel_nodes", 2)
+    database = Database(tmp_path / "test.db")
+    run = wide_run(database, width=5, cost=0, budget=1)
+    providers = SlowProviders()
+    executor = Executor(database, providers, {model.id: model for model in builtin_models()})
+    await executor.execute(run.id)
+    assert database.get_run(run.id).status == RunStatus.SUCCEEDED
+    assert providers.calls == 5
+    assert providers.peak == 2
+
+
+@pytest.mark.asyncio
+async def test_executor_holds_nodes_that_would_exceed_budget(tmp_path: Path):
+    database = Database(tmp_path / "test.db")
+    run = wide_run(database, width=3, cost=0.4, budget=1, model_id="openai:gpt-5.6-sol")
+    # 20k input + 16k output tokens on GPT-5.6 Sol cost exactly the $0.40 estimate.
+    providers = SlowProviders(delay=0, tokens=(20_000, 16_000))
+    executor = Executor(database, providers, {model.id: model for model in builtin_models()})
+    await executor.execute(run.id)
+    result = database.get_run(run.id)
+    assert result.status == RunStatus.PAUSED
+    assert providers.calls == 2
+    assert [node.status for node in result.plan.nodes].count(NodeStatus.PENDING) == 1
+    assert database.events(run.id)[-1].kind == "approval.required"
+
+
+@pytest.mark.asyncio
+async def test_cancel_stops_running_nodes(tmp_path: Path):
+    database = Database(tmp_path / "test.db")
+    run = wide_run(database, width=2, cost=0, budget=1)
+    providers = SlowProviders(delay=30)
+    executor = Executor(database, providers, {model.id: model for model in builtin_models()})
+    executor.start(run.id)
+    while providers.active < 2:
+        await asyncio.sleep(0.01)
+    cancelled = database.get_run(run.id)
+    cancelled.status = RunStatus.CANCELLED
+    database.save_run(cancelled)
+    executor.cancel(run.id)
+    with pytest.raises(asyncio.CancelledError):
+        await executor.tasks[run.id]
+    result = database.get_run(run.id)
+    assert providers.active == 0
+    assert result.status == RunStatus.CANCELLED
+    assert {node.status for node in result.plan.nodes} == {NodeStatus.CANCELLED}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cli_call_kills_spawned_processes(tmp_path: Path, monkeypatch):
+    child_pid_file = tmp_path / "child.pid"
+    fake_cli = tmp_path / "codex"
+    fake_cli.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {child_pid_file}\nwait\n")
+    fake_cli.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    task = asyncio.create_task(CliChannelRegistry().complete("cli:codex", "hi", tmp_path))
+    while not child_pid_file.exists() or not child_pid_file.read_text().strip():
+        await asyncio.sleep(0.01)
+    child_pid = int(child_pid_file.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(100):
+        if not Path(f"/proc/{child_pid}").exists():
+            break
+        await asyncio.sleep(0.01)
+    assert not Path(f"/proc/{child_pid}").exists()
+
+
+async def test_provider_retries_rate_limited_requests(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    responses = [
+        httpx.Response(429, headers={"retry-after": "0"}),
+        httpx.Response(503),
+        httpx.Response(200, json={
+            "choices": [{"message": {"content": "done"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }),
+    ]
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return responses[len(calls) - 1]
+
+    providers = ProviderRegistry()
+    providers.retry_base_delay = 0
+    providers.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    result = await providers.complete("deepseek:deepseek-chat", "hello")
+    await providers.client.aclose()
+    assert result.text == "done"
+    assert len(calls) == 3
+
+
+async def test_provider_gives_up_after_max_attempts(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    providers = ProviderRegistry()
+    providers.retry_base_delay = 0
+    providers.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    with pytest.raises(ProviderError, match="500"):
+        await providers.complete("deepseek:deepseek-chat", "hello")
+    await providers.client.aclose()

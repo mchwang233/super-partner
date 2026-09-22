@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 
@@ -21,10 +22,16 @@ class ProviderError(RuntimeError):
     pass
 
 
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504, 529}
+
+
 class ProviderRegistry:
     def __init__(self) -> None:
         self.client = httpx.AsyncClient(timeout=120)
         self.cli = CliChannelRegistry()
+        self.max_attempts = 4
+        self.retry_base_delay = 1.0
+        self.retry_max_delay = 30.0
 
     def configured_models(self, model_ids: list[str]) -> set[str]:
         configured = {"mock:local", *self.cli.available_model_ids()}
@@ -110,6 +117,25 @@ class ProviderRegistry:
             )
         return "Connection verified"
 
+    async def _post(self, provider: str, url: str, **kwargs) -> httpx.Response:
+        """POST with exponential backoff on rate limits, server errors, and network failures."""
+        for attempt in range(1, self.max_attempts + 1):
+            delay = self.retry_base_delay * 2 ** (attempt - 1)
+            try:
+                response = await self.client.post(url, **kwargs)
+            except httpx.TransportError as exc:
+                if attempt == self.max_attempts:
+                    raise ProviderError(f"{provider} request failed: {exc}") from exc
+            else:
+                if response.status_code not in RETRYABLE_STATUS or attempt == self.max_attempts:
+                    return response
+                try:
+                    delay = float(response.headers.get("retry-after", delay))
+                except ValueError:
+                    pass
+            await asyncio.sleep(min(delay, self.retry_max_delay))
+        raise AssertionError("unreachable")
+
     async def _openai_compatible(self, provider: str, model: str, prompt: str) -> ProviderResult:
         configs = {
             "openai": ("https://api.openai.com/v1/chat/completions", "OPENAI_API_KEY"),
@@ -121,8 +147,8 @@ class ProviderRegistry:
             "kimi": ("https://api.moonshot.cn/v1/chat/completions", "MOONSHOT_API_KEY"),
         }
         url, env = configs[provider]
-        response = await self.client.post(
-            url, headers={"Authorization": f"Bearer {os.environ[env]}"},
+        response = await self._post(
+            provider, url, headers={"Authorization": f"Bearer {os.environ[env]}"},
             json={"model": model, "messages": [{"role": "user", "content": prompt}]},
         )
         if response.is_error:
@@ -136,8 +162,8 @@ class ProviderRegistry:
         )
 
     async def _anthropic(self, model: str, prompt: str) -> ProviderResult:
-        response = await self.client.post(
-            "https://api.anthropic.com/v1/messages",
+        response = await self._post(
+            "anthropic", "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01"},
             json={"model": model, "max_tokens": 4096, "messages": [{"role": "user", "content": prompt}]},
         )
@@ -147,8 +173,8 @@ class ProviderRegistry:
         return ProviderResult(data["content"][0]["text"], data["usage"]["input_tokens"], data["usage"]["output_tokens"], f"anthropic:{model}")
 
     async def _gemini(self, model: str, prompt: str) -> ProviderResult:
-        response = await self.client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        response = await self._post(
+            "google", f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             params={"key": os.environ["GEMINI_API_KEY"]}, json={"contents": [{"parts": [{"text": prompt}]}]},
         )
         if response.is_error:
