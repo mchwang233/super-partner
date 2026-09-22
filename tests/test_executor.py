@@ -4,7 +4,7 @@ import pytest
 from super_partner.catalog import builtin_models
 from super_partner.db import Database
 from super_partner.executor import Executor
-from super_partner.models import ExecutionRun, RunStatus
+from super_partner.models import ExecutionRun, NodeStatus, RunStatus
 from super_partner.planner import heuristic_plan
 from super_partner.providers import ProviderRegistry
 from super_partner.routing import estimate, route_node
@@ -29,3 +29,27 @@ async def test_mock_execution_completes(tmp_path: Path):
     assert result.status == RunStatus.SUCCEEDED
     assert result.final_result
     assert all(node.result for node in result.plan.nodes)
+
+
+@pytest.mark.asyncio
+async def test_resume_reruns_nodes_interrupted_while_running(tmp_path: Path):
+    database = Database(tmp_path / "test.db")
+    catalog = builtin_models()
+    plan = heuristic_plan("Analyze this task")
+    for node in plan.nodes:
+        route_node(node, catalog, {"mock:local"})
+    for node in plan.nodes[:-1]:
+        node.status = NodeStatus.SUCCEEDED
+        node.result = "done"
+    plan.nodes[-1].status = NodeStatus.RUNNING
+    run = ExecutionRun(id="resumed", prompt="demo", status=RunStatus.QUEUED, plan=plan, budget_usd=1)
+    database.save_run(run)
+    providers = ProviderRegistry()
+    executor = Executor(database, providers, {model.id: model for model in catalog})
+    await executor.execute(run.id)
+    result = database.get_run(run.id)
+    await providers.client.aclose()
+    assert result is not None
+    assert result.status == RunStatus.SUCCEEDED
+    assert result.plan.nodes[-1].status == NodeStatus.SUCCEEDED
+    assert result.final_result

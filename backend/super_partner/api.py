@@ -58,6 +58,7 @@ for seed_model in seed_models:
     if seed_model.id in existing_enabled:
         seed_model.enabled = existing_enabled[seed_model.id]
 db.save_models(seed_models)
+db.delete_models_except(model.id for model in seed_models)
 hydrate_provider_keys()
 providers = ProviderRegistry()
 models = {model.id: model for model in db.list_models()}
@@ -129,8 +130,7 @@ def update_model_by_id(body: UpdateModelById):
 def store_provider_key(provider: str, body: ProviderKey):
     try:
         set_provider_key(provider, body.api_key)
-        hydrate_provider_keys()
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
 

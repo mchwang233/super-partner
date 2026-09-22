@@ -57,7 +57,7 @@ def builtin_models() -> list[ModelProfile]:
             source_url="https://developers.openai.com/api/docs/models", pricing_verified=True,
         ),
         ModelProfile(
-            id="anthropic:claude-sonnet", provider="anthropic", display_name="Claude Sonnet",
+            id="anthropic:claude-sonnet-5", provider="anthropic", display_name="Claude Sonnet 5",
             context_window=200_000, input_per_million=3, output_per_million=15,
             supports_vision=True, pricing_verified=False,
             scores=CapabilityScore(coding=.91, planning=.90, research=.87, chinese=.84,

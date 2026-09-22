@@ -30,6 +30,10 @@ class Executor:
         if not run or run.status not in {RunStatus.QUEUED, RunStatus.PAUSED}:
             return
         run.status = RunStatus.RUNNING
+        # Nodes left RUNNING by an interrupted process never finished; run them again.
+        for node in run.plan.nodes:
+            if node.status == NodeStatus.RUNNING:
+                node.status = NodeStatus.PENDING
         self._save(run)
         self.emit(run.id, "run.started")
         try:
@@ -51,6 +55,8 @@ class Executor:
             failed = [node for node in run.plan.nodes if node.status == NodeStatus.FAILED]
             if failed:
                 raise RuntimeError(f"{len(failed)} task node(s) failed")
+            if any(node.status != NodeStatus.SUCCEEDED for node in run.plan.nodes):
+                raise RuntimeError("Run finished with unfinished task nodes")
             run.status = RunStatus.SUCCEEDED
             run.final_result = run.plan.nodes[-1].result
             self._save(run)

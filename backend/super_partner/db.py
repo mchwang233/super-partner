@@ -43,6 +43,12 @@ class Database:
                     (model.id, model.model_dump_json(), model.effective_at.isoformat()),
                 )
 
+    def delete_models_except(self, keep_ids: Iterable[str]) -> None:
+        keep = list(keep_ids)
+        placeholders = ",".join("?" for _ in keep)
+        with self.lock, self.connection:
+            self.connection.execute(f"DELETE FROM models WHERE id NOT IN ({placeholders})", keep)
+
     def list_models(self) -> list[ModelProfile]:
         with self.lock:
             rows = self.connection.execute("SELECT body FROM models ORDER BY id").fetchall()

@@ -40,7 +40,7 @@ CLI_SPECS = {
     "cli:claude": CliSpec(
         id="cli:claude", executable="claude", auth_command=("auth", "status"),
         invoke_args=("-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--no-session-persistence"),
-        fallback_model_id="anthropic:claude-sonnet",
+        fallback_model_id="anthropic:claude-sonnet-5",
     ),
     "cli:gemini": CliSpec(
         id="cli:gemini", executable="gemini", auth_command=("--version",),

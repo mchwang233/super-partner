@@ -1,11 +1,15 @@
+import os
 from pathlib import Path
 
+import keyring
 from super_partner.catalog import builtin_models
+from super_partner.cli_channels import CLI_SPECS
 from super_partner.db import Database
 from super_partner.models import ExecutionRun, RunStatus
 from super_partner.planner import autonomous_plan, heuristic_plan
 from super_partner.providers import ProviderRegistry, ProviderResult
 from super_partner.routing import estimate, route_node
+from super_partner.secrets import set_provider_key
 
 
 def test_planner_builds_valid_dependency_graph():
@@ -104,3 +108,26 @@ def test_new_chinese_providers_are_routable(monkeypatch):
     model_ids = [model.id for model in builtin_models()]
     configured = registry.configured_models(model_ids)
     assert {"glm:glm-5.2", "minimax:MiniMax-M2.7", "kimi:kimi-k3"} <= configured
+
+
+def test_stored_provider_key_replaces_existing_environment_value(monkeypatch):
+    stored = {}
+    monkeypatch.setattr(keyring, "set_password", lambda service, name, value: stored.update({name: value}))
+    monkeypatch.setenv("OPENAI_API_KEY", "old-key-value")
+    set_provider_key("openai", "new-key-value")
+    assert stored["openai"] == "new-key-value"
+    assert os.environ["OPENAI_API_KEY"] == "new-key-value"
+
+
+def test_database_prunes_retired_models(tmp_path: Path):
+    database = Database(tmp_path / "test.db")
+    catalog = builtin_models()
+    retired = catalog[0].model_copy(update={"id": "anthropic:retired"})
+    database.save_models([*catalog, retired])
+    database.delete_models_except(model.id for model in catalog)
+    assert {model.id for model in database.list_models()} == {model.id for model in catalog}
+
+
+def test_cli_fallbacks_reference_catalog_models():
+    catalog_ids = {model.id for model in builtin_models()}
+    assert {spec.fallback_model_id for spec in CLI_SPECS.values()} <= catalog_ids

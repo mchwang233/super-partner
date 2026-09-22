@@ -19,6 +19,7 @@ def set_provider_key(provider: str, value: str) -> None:
         keyring.set_password(SERVICE, provider, value)
     except KeyringError as exc:
         raise RuntimeError("No secure OS keyring is available; use an environment variable") from exc
+    os.environ[PROVIDER_ENV[provider]] = value
 
 
 def delete_provider_key(provider: str) -> None:
