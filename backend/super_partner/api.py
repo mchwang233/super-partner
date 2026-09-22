@@ -17,7 +17,7 @@ from .db import Database
 from .executor import Executor
 from .models import Event, ExecutionRun, NodeStatus, RunStatus
 from .planner import autonomous_plan
-from .projects import ProjectDirError, project_context, resolve_project_dir
+from .projects import ProjectDirError, browse_directories, project_context, resolve_project_dir
 from .providers import ProviderError, ProviderRegistry
 from .routing import NoEligibleModelError, eligible_for_node, estimate, route_node
 from .secrets import (
@@ -164,6 +164,14 @@ async def test_provider(provider: str):
         message = await providers.test_provider(provider)
         return {"ok": True, "message": message}
     except ProviderError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/projects/browse")
+def browse_projects(path: Optional[str] = None, hidden: bool = False):
+    try:
+        return browse_directories(path, show_hidden=hidden)
+    except ProjectDirError as exc:
         raise HTTPException(400, str(exc)) from exc
 
 

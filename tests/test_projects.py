@@ -12,6 +12,7 @@ from super_partner.models import ExecutionRun, NodeStatus, RunStatus, TaskNode, 
 from super_partner.planner import _validate_plan, heuristic_plan
 from super_partner.projects import (
     ProjectDirError,
+    browse_directories,
     git_snapshot,
     project_context,
     resolve_project_dir,
@@ -165,3 +166,25 @@ async def test_planner_marks_workspace_nodes_only_for_project_runs():
     project = await autonomous_plan("Implement a fix", models, {"mock:local"}, NoPlanner(), "Target project: /x")
     assert not any(node.needs_workspace for node in scratch.nodes)
     assert any(node.needs_workspace for node in project.nodes)
+
+
+def test_browse_lists_subdirectories_within_roots(project_root: Path, tmp_path: Path):
+    (project_root / "app" / ".git").mkdir()
+    (project_root / "docs").mkdir()
+    (project_root / ".cache").mkdir()
+    (project_root / "notes.txt").write_text("x")
+    (project_root / "escape").symlink_to(tmp_path)
+    listing = browse_directories()
+    assert listing["path"] == str(project_root.resolve())
+    assert listing["parent"] is None
+    assert [(entry["name"], entry["git"]) for entry in listing["entries"]] == [("app", True), ("docs", False)]
+    assert ".cache" in [entry["name"] for entry in browse_directories(show_hidden=True)["entries"]]
+    child = browse_directories(str(project_root / "app"))
+    assert child["parent"] == str(project_root.resolve()) and child["git"]
+
+
+def test_browse_hides_data_dir_and_rejects_outside_roots(project_root: Path, tmp_path: Path):
+    settings.data_dir.mkdir()
+    assert browse_directories(str(project_root / "app"))["entries"] == []
+    with pytest.raises(ProjectDirError, match="allowed root"):
+        browse_directories(str(tmp_path))
