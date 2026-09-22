@@ -1,0 +1,30 @@
+.super-partner/
+workspaces/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.pyc
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+.agents/
+.codex/

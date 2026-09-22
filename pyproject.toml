@@ -1,0 +1,39 @@
+[project]
+name = "super-partner"
+version = "0.1.0"
+description = "Local-first multi-model autonomous task orchestrator"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.115,<0.130",
+  "uvicorn[standard]>=0.32,<0.40",
+  "httpx>=0.27,<1",
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.6,<3",
+  "typer>=0.13,<0.16",
+  "cryptography>=43,<46",
+  "keyring>=25,<26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1", "ruff>=0.8,<1"]
+
+[project.scripts]
+super-partner = "super_partner.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/super_partner"]
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+extend-ignore = ["BLE001", "FA100", "UP045"]
