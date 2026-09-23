@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 from pathlib import Path
 
@@ -11,9 +12,12 @@ from super_partner.executor import Executor
 from super_partner.models import ExecutionRun, NodeStatus, RunStatus, TaskNode, TaskPlan
 from super_partner.planner import _validate_plan, heuristic_plan
 from super_partner.projects import (
+    NativePickerError,
     ProjectDirError,
     browse_directories,
     git_snapshot,
+    native_pick_directory,
+    native_picker_status,
     project_context,
     resolve_project_dir,
 )
@@ -188,3 +192,58 @@ def test_browse_hides_data_dir_and_rejects_outside_roots(project_root: Path, tmp
     assert browse_directories(str(project_root / "app"))["entries"] == []
     with pytest.raises(ProjectDirError, match="allowed root"):
         browse_directories(str(tmp_path))
+
+
+def test_native_picker_needs_a_desktop_and_zenity(monkeypatch):
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    assert native_picker_status() == {"available": False, "reason": "No desktop session is attached to the API process"}
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr("super_partner.projects.shutil.which", lambda _: None)
+    assert native_picker_status()["reason"] == "zenity is not installed"
+    monkeypatch.setattr("super_partner.projects.shutil.which", lambda name: f"/bin/{name}")
+    assert native_picker_status() == {"available": True, "reason": None}
+
+
+@pytest.fixture
+def fake_zenity(project_root: Path, tmp_path: Path, monkeypatch):
+    def install(script: str):
+        (tmp_path / "zenity").write_text(f"#!/bin/sh\n{script}\n")
+        (tmp_path / "zenity").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+        monkeypatch.setenv("DISPLAY", ":0")
+    return install
+
+
+@pytest.mark.asyncio
+async def test_native_pick_returns_chosen_directory(project_root: Path, fake_zenity):
+    fake_zenity(f"echo {project_root / 'app'}")
+    assert await native_pick_directory() == (project_root / "app").resolve()
+
+
+@pytest.mark.asyncio
+async def test_native_pick_returns_none_when_cancelled(fake_zenity):
+    fake_zenity("exit 1")
+    assert await native_pick_directory() is None
+
+
+@pytest.mark.asyncio
+async def test_native_pick_rejects_directory_outside_roots(tmp_path: Path, fake_zenity):
+    fake_zenity("echo /etc")
+    with pytest.raises(ProjectDirError, match="allowed root"):
+        await native_pick_directory()
+
+
+@pytest.mark.asyncio
+async def test_native_pick_reports_dialog_failure(fake_zenity):
+    fake_zenity("echo 'cannot open display' >&2\nexit 255")
+    with pytest.raises(NativePickerError, match="cannot open display"):
+        await native_pick_directory()
+
+
+@pytest.mark.asyncio
+async def test_native_pick_kills_a_dialog_that_outlives_the_timeout(fake_zenity, monkeypatch):
+    fake_zenity("sleep 30")
+    monkeypatch.setattr("super_partner.projects.NATIVE_PICKER_TIMEOUT", 0.2)
+    with pytest.raises(asyncio.TimeoutError):
+        await native_pick_directory()

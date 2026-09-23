@@ -17,7 +17,15 @@ from .db import Database
 from .executor import Executor
 from .models import Event, ExecutionRun, NodeStatus, RunStatus
 from .planner import autonomous_plan
-from .projects import ProjectDirError, browse_directories, project_context, resolve_project_dir
+from .projects import (
+    NativePickerError,
+    ProjectDirError,
+    browse_directories,
+    native_pick_directory,
+    native_picker_status,
+    project_context,
+    resolve_project_dir,
+)
 from .providers import ProviderError, ProviderRegistry
 from .routing import NoEligibleModelError, eligible_for_node, estimate, route_node
 from .secrets import (
@@ -173,6 +181,25 @@ def browse_projects(path: Optional[str] = None, hidden: bool = False):
         return browse_directories(path, show_hidden=hidden)
     except ProjectDirError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/projects/native-picker")
+def native_picker():
+    return native_picker_status()
+
+
+@app.post("/api/projects/native-picker")
+async def open_native_picker():
+    """Open the desktop folder dialog on the machine running this API."""
+    try:
+        path = await native_pick_directory()
+    except NativePickerError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except ProjectDirError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(408, "The folder dialog timed out") from exc
+    return {"path": str(path) if path else None}
 
 
 @app.post("/api/tasks", response_model=ExecutionRun, status_code=201)

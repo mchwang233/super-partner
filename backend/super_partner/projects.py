@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import os
+import shutil
+import signal
 import subprocess
 from pathlib import Path
 
@@ -11,6 +16,46 @@ MAX_BROWSE_ENTRIES = 500
 
 class ProjectDirError(ValueError):
     pass
+
+
+class NativePickerError(RuntimeError):
+    pass
+
+
+NATIVE_PICKER_TIMEOUT = 300
+
+
+def native_picker_status() -> dict:
+    """The API runs on the user's own machine, so it can open the desktop's folder dialog."""
+    if not os.getenv("DISPLAY") and not os.getenv("WAYLAND_DISPLAY"):
+        return {"available": False, "reason": "No desktop session is attached to the API process"}
+    if not shutil.which("zenity"):
+        return {"available": False, "reason": "zenity is not installed"}
+    return {"available": True, "reason": None}
+
+
+async def native_pick_directory() -> Path | None:
+    """Open the desktop folder dialog; returns None when the user cancels it."""
+    status = native_picker_status()
+    if not status["available"]:
+        raise NativePickerError(status["reason"])
+    process = await asyncio.create_subprocess_exec(
+        "zenity", "--file-selection", "--directory", "--title=Choose a project folder",
+        f"--filename={allowed_roots()[0]}/",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=NATIVE_PICKER_TIMEOUT)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
+        raise
+    if process.returncode == 1:
+        return None
+    if process.returncode:
+        raise NativePickerError(stderr.decode(errors="replace").strip()[:200] or "Folder dialog failed")
+    return resolve_project_dir(stdout.decode().strip())
 
 
 def allowed_roots() -> list[Path]:

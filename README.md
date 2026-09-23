@@ -53,7 +53,10 @@ Give a task a project directory to have membership CLI agents edit that checkout
 super-partner plan "Fix the failing login test" --project ~/prj/my-app
 ```
 
-In the web console, fill in the project directory field under the prompt.
+In the web console, use the project directory field under the prompt. **Browse…** opens a folder
+picker served by the API, and **System dialog…** opens the desktop's own folder dialog on the
+machine running the API (needs `DISPLAY`/`WAYLAND_DISPLAY` and `zenity`; the button is hidden
+otherwise, and the dialog appears on that machine's desktop, not on a remote browser's).
 
 - The directory must be an existing absolute path inside `SUPER_PARTNER_PROJECT_ROOTS` (a JSON list, default: your home directory), and cannot be the Super Partner data directory.
 - The planner sees the project's top-level layout and git state, and marks nodes that must read or change project files. Only those nodes run in the project; everything else runs in a scratch workspace.
@@ -68,6 +71,7 @@ Seed prices for models marked `pricing_verified: false` are placeholders and mus
 
 ## Main API
 
+- `GET /api/projects/browse` lists selectable folders; `GET`/`POST /api/projects/native-picker` reports and opens the desktop folder dialog.
 - `POST /api/tasks` creates a plan and estimate; pass `project_dir` to work on an existing project.
 - `POST /api/tasks/{id}/confirm` confirms the budget and starts execution.
 - `GET /api/tasks/{id}` returns the full graph and results.
