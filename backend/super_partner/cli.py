@@ -18,8 +18,14 @@ def models():
     response = httpx.get(f"{settings.api_base_url}/api/models")
     response.raise_for_status()
     for model in response.json():
-        ready = "ready" if model["configured"] else "needs key"
-        typer.echo(f"{model['id']:<32} {ready:<10} ${model['input_per_million']}/${model['output_per_million']}")
+        ready = "ready" if model["configured"] and model["enabled"] else "not active"
+        if not model.get("routing_ready", True):
+            ready = "pending metadata / unavailable"
+        prices = "/".join(
+            f"${model[key]}" if model[key] is not None else "unknown"
+            for key in ("input_per_million", "output_per_million")
+        )
+        typer.echo(f"{model['id']:<40} {ready:<30} {prices}")
 
 
 @app.command()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
@@ -55,18 +55,40 @@ class ModelProfile(BaseModel):
     provider: str
     display_name: str
     enabled: bool = True
-    context_window: int
-    input_per_million: float
-    output_per_million: float
+    context_window: Optional[int] = Field(default=None, gt=0)
+    input_per_million: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    output_per_million: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     cached_input_per_million: Optional[float] = None
-    supports_tools: bool = True
-    supports_vision: bool = False
-    scores: CapabilityScore
+    supports_tools: Optional[bool] = None
+    supports_vision: Optional[bool] = None
+    supports_reasoning: Optional[bool] = None
+    supports_structured_output: Optional[bool] = None
+    scores: Optional[CapabilityScore] = None
     source_url: Optional[str] = None
     effective_at: datetime = Field(default_factory=utcnow)
     pricing_verified: bool = False
     channel: str = "api"
     execution_priority: int = 100
+    description: Optional[str] = None
+    release_date: Optional[date] = None
+    catalog_source: str = "builtin"
+    catalog_status: str = "listed"
+    catalog_checked_at: Optional[datetime] = None
+    discovered_at: datetime = Field(default_factory=utcnow)
+    pricing_source: str = "builtin"
+    available_via_api: Optional[bool] = None
+    api_checked_at: Optional[datetime] = None
+
+    @property
+    def routing_ready(self) -> bool:
+        return (
+            self.scores is not None
+            and self.context_window is not None
+            and self.input_per_million is not None
+            and self.output_per_million is not None
+            and self.catalog_status not in {"deprecated", "retired"}
+            and self.available_via_api is not False
+        )
 
 
 class TaskNode(BaseModel):

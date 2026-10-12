@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional
 
-from .models import Event, ExecutionRun, ModelProfile
+from .models import Event, ExecutionRun, ModelProfile, RunStatus
 
 
 class Database:
@@ -32,6 +32,12 @@ class Database:
                     kind TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
+                CREATE TABLE IF NOT EXISTS catalog_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1), body TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS benchmark_cache (
+                    source TEXT PRIMARY KEY, body TEXT NOT NULL
+                );
                 """
             )
 
@@ -48,6 +54,30 @@ class Database:
         placeholders = ",".join("?" for _ in keep)
         with self.lock, self.connection:
             self.connection.execute(f"DELETE FROM models WHERE id NOT IN ({placeholders})", keep)
+
+    def save_catalog_state(self, state: dict) -> None:
+        with self.lock, self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO catalog_state(id, body) VALUES (1, ?)",
+                (json.dumps(state),),
+            )
+
+    def load_catalog_state(self) -> dict:
+        with self.lock:
+            row = self.connection.execute("SELECT body FROM catalog_state WHERE id = 1").fetchone()
+        return json.loads(row["body"]) if row else {}
+
+    def save_benchmark_cache(self, source: str, body: dict) -> None:
+        with self.lock, self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO benchmark_cache(source, body) VALUES (?, ?)",
+                (source, json.dumps(body, ensure_ascii=False)),
+            )
+
+    def load_benchmark_cache(self) -> dict:
+        with self.lock:
+            rows = self.connection.execute("SELECT source, body FROM benchmark_cache").fetchall()
+        return {row["source"]: json.loads(row["body"]) for row in rows}
 
     def list_models(self) -> list[ModelProfile]:
         with self.lock:
@@ -79,6 +109,23 @@ class Database:
                 "SELECT body FROM runs ORDER BY created_at DESC"
             ).fetchall()
         return [ExecutionRun.model_validate_json(row["body"]) for row in rows]
+
+    def delete_run(self, run_id: str) -> bool:
+        """Delete a finished run and its events atomically, leaving workspace files alone."""
+        with self.lock, self.connection:
+            deleted = self.connection.execute(
+                "DELETE FROM runs WHERE id = ? AND status IN (?, ?, ?)",
+                (run_id, RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED),
+            )
+            if not deleted.rowcount:
+                exists = self.connection.execute(
+                    "SELECT 1 FROM runs WHERE id = ?", (run_id,),
+                ).fetchone()
+                if exists:
+                    raise ValueError("只能删除已完成、失败或已取消的任务记录。")
+                return False
+            self.connection.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
+        return True
 
     def add_event(self, event: Event) -> Event:
         with self.lock, self.connection:

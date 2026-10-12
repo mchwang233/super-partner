@@ -4,11 +4,13 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .cli_channels import CLI_SPECS
 from .config import settings
 from .db import Database
 from .models import Event, ExecutionRun, NodeStatus, RunStatus
 from .projects import git_snapshot
 from .providers import ProviderRegistry
+from .routing import node_cost
 
 
 class Executor:
@@ -78,7 +80,7 @@ class Executor:
             if any(node.status != NodeStatus.SUCCEEDED for node in run.plan.nodes):
                 raise RuntimeError("Task graph is blocked by failed or cyclic dependencies")
             run.status = RunStatus.SUCCEEDED
-            run.final_result = run.plan.nodes[-1].result
+            run.final_result = self._final_result(run)
             self._save(run)
             self.emit(run.id, "run.succeeded", actual_cost_usd=run.actual_cost_usd)
         except asyncio.CancelledError:
@@ -170,18 +172,16 @@ class Executor:
             else:
                 workspace = settings.workspace_root / run_id
                 workspace.mkdir(parents=True, exist_ok=True)
-                result = await self.providers.complete(node.model_id or "mock:local", prompt, workspace)
+                result = await self.providers.complete(
+                    node.model_id or "mock:local", prompt, workspace,
+                    allow_api_fallback=self._fallback_allowed(run, node),
+                )
             async with lock:
                 latest = self.db.get_run(run_id)
                 if not latest:
                     return
                 node = next(item for item in latest.plan.nodes if item.id == node_id)
-                charged_model_id = result.used_model_id or node.model_id
-                model = self.model_lookup[charged_model_id]
-                actual = (
-                    result.input_tokens * model.input_per_million
-                    + result.output_tokens * model.output_per_million
-                ) / 1_000_000
+                actual = self._actual_cost(result, node)
                 node.result = result.text
                 node.status = NodeStatus.SUCCEEDED
                 latest.actual_cost_usd = round(latest.actual_cost_usd + actual, 6)
@@ -202,6 +202,41 @@ class Executor:
                     node.result = str(exc)
                     self._save(latest)
                     self.emit(run_id, "node.failed", node_id=node.id, error=str(exc))
+
+    def _actual_cost(self, result, node) -> float:
+        """Charge by token usage; if the model or its price has since left the catalog, the
+        work is still done, so charge the routed estimate rather than failing the node."""
+        model = self.model_lookup.get(result.used_model_id or node.model_id)
+        if not model or model.input_per_million is None or model.output_per_million is None:
+            return node.estimated_cost_usd
+        return (
+            result.input_tokens * model.input_per_million
+            + result.output_tokens * model.output_per_million
+        ) / 1_000_000
+
+    @staticmethod
+    def _final_result(run: ExecutionRun):
+        """Results of the graph's end nodes, which nothing else depends on, in plan order."""
+        required = {dep for node in run.plan.nodes for dep in node.dependencies}
+        sinks = [node for node in run.plan.nodes if node.id not in required]
+        if len(sinks) == 1:
+            return sinks[0].result
+        return "\n\n".join(f"{node.title}:\n{node.result}" for node in sinks if node.result) or None
+
+    def _fallback_allowed(self, run: ExecutionRun, node) -> bool:
+        """A CLI node may fall back to its metered API only if enabled and within budget."""
+        spec = CLI_SPECS.get(node.model_id or "")
+        if not spec:
+            return True
+        model = self.model_lookup.get(spec.fallback_model_id)
+        if not model or not model.enabled or not model.routing_ready:
+            return False
+        # CLI nodes reserve nothing, so the fallback's cost must fit what other nodes leave.
+        reserved = run.actual_cost_usd + sum(
+            item.estimated_cost_usd for item in run.plan.nodes
+            if item.status == NodeStatus.RUNNING and item.id != node.id
+        )
+        return reserved + node_cost(node, model) <= run.budget_usd
 
     def _save(self, run: ExecutionRun) -> None:
         run.updated_at = datetime.now(timezone.utc)

@@ -24,7 +24,7 @@ prepare() {
     echo "[setup] Creating Python environment..."
     python3 -m venv "$PROJECT_DIR/.venv"
   fi
-  if ! "$PROJECT_DIR/.venv/bin/python" -c 'import fastapi, super_partner' 2>/dev/null; then
+  if ! "$PROJECT_DIR/.venv/bin/python" -c 'import fastapi, openpyxl, super_partner' 2>/dev/null; then
     echo "[setup] Installing backend dependencies..."
     "$PROJECT_DIR/.venv/bin/python" -m pip install -e "$PROJECT_DIR"
   fi
@@ -51,16 +51,23 @@ start() {
   fi
   if ! is_running "$WEB_PID_FILE"; then
     echo "[start] Starting web console..."
-    nohup npm --prefix "$PROJECT_DIR/frontend" run dev -- --host 127.0.0.1 \
+    nohup "$PROJECT_DIR/frontend/node_modules/.bin/vite" "$PROJECT_DIR/frontend" \
+      --host 127.0.0.1 --port 5173 --strictPort \
       >"$LOG_DIR/web.log" 2>&1 </dev/null &
     echo "$!" >"$WEB_PID_FILE"
     web_started=1
   fi
 
   local ready=0
-  for _ in {1..60}; do
-    if curl --silent --fail "$API_URL/health" >/dev/null 2>&1 \
-      && curl --silent --fail "$WEB_URL" >/dev/null 2>&1; then
+  local deadline=$((SECONDS + 60))
+  while (( SECONDS < deadline )); do
+    if ! is_running "$API_PID_FILE" || ! is_running "$WEB_PID_FILE"; then
+      break
+    fi
+    if curl --noproxy '*' --connect-timeout 1 --max-time 2 \
+      --silent --fail "$API_URL/health" >/dev/null 2>&1 \
+      && curl --noproxy '*' --connect-timeout 1 --max-time 2 \
+        --silent --fail "$WEB_URL" >/dev/null 2>&1; then
       ready=1
       break
     fi

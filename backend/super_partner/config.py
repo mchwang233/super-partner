@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +19,13 @@ class Settings(BaseSettings):
     default_budget_usd: float = 2.0
     max_parallel_nodes: int = 3
     api_base_url: str = "http://127.0.0.1:8000"
+    # Host names the API answers to; any other Host header is refused to block DNS rebinding.
+    allowed_hosts: list[str] = ["127.0.0.1", "localhost", "::1"]
+    # Browser origins that may call the API; other origins cannot change state.
+    allowed_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    catalog_auto_sync: bool = True
+    catalog_sync_interval_hours: float = Field(default=24, ge=1, le=720)
+    artificial_analysis_api_key: Optional[SecretStr] = Field(default=None, repr=False)
 
     @property
     def db_path(self) -> Path:

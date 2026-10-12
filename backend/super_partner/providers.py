@@ -8,6 +8,7 @@ import httpx
 
 from .cli_channels import CLI_SPECS, CliChannelRegistry
 from .config import settings
+from .secrets import PROVIDER_ENV
 
 
 @dataclass
@@ -35,16 +36,9 @@ class ProviderRegistry:
 
     def configured_models(self, model_ids: list[str]) -> set[str]:
         configured = {"mock:local", *self.cli.available_model_ids()}
-        env_names = {
-            "openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
-            "google": "GEMINI_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
-            "qwen": "DASHSCOPE_API_KEY", "doubao": "ARK_API_KEY",
-            "glm": "ZHIPU_API_KEY", "minimax": "MINIMAX_API_KEY",
-            "kimi": "MOONSHOT_API_KEY",
-        }
         for model_id in model_ids:
             provider = model_id.split(":", 1)[0]
-            env_name = env_names.get(provider)
+            env_name = PROVIDER_ENV.get(provider)
             if env_name and os.getenv(env_name):
                 configured.add(model_id)
         return configured
@@ -81,41 +75,31 @@ class ProviderRegistry:
         return await self._openai_compatible(provider, model, prompt)
 
     async def test_provider(self, provider: str) -> str:
-        configs = {
-            "openai": ("https://api.openai.com/v1/models", "OPENAI_API_KEY", {}),
-            "anthropic": (
-                "https://api.anthropic.com/v1/models", "ANTHROPIC_API_KEY",
-                {"anthropic-version": "2023-06-01"},
-            ),
-            "deepseek": ("https://api.deepseek.com/models", "DEEPSEEK_API_KEY", {}),
-            "qwen": (
-                "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
-                "DASHSCOPE_API_KEY", {},
-            ),
-            "doubao": ("https://ark.cn-beijing.volces.com/api/v3/models", "ARK_API_KEY", {}),
-            "glm": ("https://open.bigmodel.cn/api/paas/v4/models", "ZHIPU_API_KEY", {}),
-            "minimax": ("https://api.minimax.io/v1/models", "MINIMAX_API_KEY", {}),
-            "kimi": ("https://api.moonshot.cn/v1/models", "MOONSHOT_API_KEY", {}),
+        urls = {
+            "openai": "https://api.openai.com/v1/models",
+            "anthropic": "https://api.anthropic.com/v1/models",
+            "deepseek": "https://api.deepseek.com/models",
+            "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+            "doubao": "https://ark.cn-beijing.volces.com/api/v3/models",
+            "glm": "https://open.bigmodel.cn/api/paas/v4/models",
+            "minimax": "https://api.minimax.io/v1/models",
+            "kimi": "https://api.moonshot.cn/v1/models",
         }
+        if provider != "google" and provider not in urls:
+            raise ProviderError(f"Unsupported provider: {provider}")
+        key = os.getenv(PROVIDER_ENV[provider])
+        if not key:
+            raise ProviderError(f"No API key is configured for {provider}")
         if provider == "google":
-            key = os.getenv("GEMINI_API_KEY")
-            if not key:
-                raise ProviderError("No API key is configured for google")
             response = await self.client.get(
                 "https://generativelanguage.googleapis.com/v1beta/models", params={"key": key},
             )
-        else:
-            if provider not in configs:
-                raise ProviderError(f"Unsupported provider: {provider}")
-            url, env_name, extra_headers = configs[provider]
-            key = os.getenv(env_name)
-            if not key:
-                raise ProviderError(f"No API key is configured for {provider}")
-            auth_header = "x-api-key" if provider == "anthropic" else "Authorization"
-            auth_value = key if provider == "anthropic" else f"Bearer {key}"
+        elif provider == "anthropic":
             response = await self.client.get(
-                url, headers={auth_header: auth_value, **extra_headers},
+                urls[provider], headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
             )
+        else:
+            response = await self.client.get(urls[provider], headers={"Authorization": f"Bearer {key}"})
         if response.is_error:
             raise ProviderError(
                 f"Connection test failed ({response.status_code}): {response.text[:200]}"
@@ -142,16 +126,16 @@ class ProviderRegistry:
         raise AssertionError("unreachable")
 
     async def _openai_compatible(self, provider: str, model: str, prompt: str) -> ProviderResult:
-        configs = {
-            "openai": ("https://api.openai.com/v1/chat/completions", "OPENAI_API_KEY"),
-            "deepseek": ("https://api.deepseek.com/chat/completions", "DEEPSEEK_API_KEY"),
-            "qwen": ("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "DASHSCOPE_API_KEY"),
-            "doubao": ("https://ark.cn-beijing.volces.com/api/v3/chat/completions", "ARK_API_KEY"),
-            "glm": ("https://open.bigmodel.cn/api/paas/v4/chat/completions", "ZHIPU_API_KEY"),
-            "minimax": ("https://api.minimax.io/v1/chat/completions", "MINIMAX_API_KEY"),
-            "kimi": ("https://api.moonshot.cn/v1/chat/completions", "MOONSHOT_API_KEY"),
+        urls = {
+            "openai": "https://api.openai.com/v1/chat/completions",
+            "deepseek": "https://api.deepseek.com/chat/completions",
+            "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            "doubao": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+            "glm": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            "minimax": "https://api.minimax.io/v1/chat/completions",
+            "kimi": "https://api.moonshot.cn/v1/chat/completions",
         }
-        url, env = configs[provider]
+        url, env = urls[provider], PROVIDER_ENV[provider]
         response = await self._post(
             provider, url, headers={"Authorization": f"Bearer {os.environ[env]}"},
             json={"model": model, "messages": [{"role": "user", "content": prompt}]},
@@ -169,7 +153,7 @@ class ProviderRegistry:
     async def _anthropic(self, model: str, prompt: str) -> ProviderResult:
         response = await self._post(
             "anthropic", "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01"},
+            headers={"x-api-key": os.environ[PROVIDER_ENV["anthropic"]], "anthropic-version": "2023-06-01"},
             json={"model": model, "max_tokens": 4096, "messages": [{"role": "user", "content": prompt}]},
         )
         if response.is_error:
@@ -180,7 +164,7 @@ class ProviderRegistry:
     async def _gemini(self, model: str, prompt: str) -> ProviderResult:
         response = await self._post(
             "google", f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            params={"key": os.environ["GEMINI_API_KEY"]}, json={"contents": [{"parts": [{"text": prompt}]}]},
+            params={"key": os.environ[PROVIDER_ENV["google"]]}, json={"contents": [{"parts": [{"text": prompt}]}]},
         )
         if response.is_error:
             raise ProviderError(f"google returned {response.status_code}: {response.text[:300]}")

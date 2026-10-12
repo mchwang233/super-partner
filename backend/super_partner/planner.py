@@ -78,7 +78,10 @@ User request:
 
 
 def select_planner_model(models: list[ModelProfile], configured: set[str]) -> Optional[ModelProfile]:
-    candidates = [model for model in models if model.enabled and model.id in configured]
+    candidates = [
+        model for model in models
+        if model.enabled and model.routing_ready and model.id in configured
+    ]
     if not candidates:
         return None
     return min(

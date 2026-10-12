@@ -207,3 +207,55 @@ async def test_provider_gives_up_after_max_attempts(monkeypatch):
     with pytest.raises(ProviderError, match="500"):
         await providers.complete("deepseek:deepseek-chat", "hello")
     await providers.client.aclose()
+
+
+class FixedProviders:
+    def __init__(self, used_model_id=None):
+        self.used_model_id = used_model_id
+
+    async def complete(self, model_id, prompt, workspace=None, **_):
+        return ProviderResult(text=f"out {prompt.split()[1]}", input_tokens=1000,
+                              output_tokens=1000, used_model_id=self.used_model_id or model_id)
+
+
+def graph_run(nodes, budget=1.0):
+    return ExecutionRun(id="graph", prompt="demo", status=RunStatus.QUEUED, budget_usd=budget,
+                        plan=TaskPlan(summary="graph", nodes=nodes))
+
+
+async def test_final_result_comes_from_graph_end_nodes_not_list_order(tmp_path: Path):
+    nodes = [
+        TaskNode(id="report", title="Report", instructions="report", capability="research",
+                 model_id="mock:local", dependencies=["data"]),
+        TaskNode(id="data", title="Data", instructions="data", capability="research",
+                 model_id="mock:local"),
+    ]
+    database = Database(tmp_path / "test.db")
+    database.save_run(graph_run(nodes))
+    await Executor(database, FixedProviders(), {m.id: m for m in builtin_models()}).execute("graph")
+    assert database.get_run("graph").final_result == "out report"
+
+
+async def test_parallel_end_nodes_are_all_in_final_result(tmp_path: Path):
+    nodes = [
+        TaskNode(id=key, title=key.title(), instructions=key, capability="research",
+                 model_id="mock:local")
+        for key in ("left", "right")
+    ]
+    database = Database(tmp_path / "test.db")
+    database.save_run(graph_run(nodes))
+    await Executor(database, FixedProviders(), {m.id: m for m in builtin_models()}).execute("graph")
+    assert database.get_run("graph").final_result == "Left:\nout left\n\nRight:\nout right"
+
+
+async def test_finished_work_is_kept_when_used_model_left_the_catalog(tmp_path: Path):
+    node = TaskNode(id="only", title="Only", instructions="only", capability="coding",
+                    model_id="cli:codex", estimated_cost_usd=0.25)
+    database = Database(tmp_path / "test.db")
+    database.save_run(graph_run([node]))
+    catalog = {m.id: m for m in builtin_models()}
+    await Executor(database, FixedProviders("openai:removed"), catalog).execute("graph")
+    result = database.get_run("graph")
+    assert result.status == RunStatus.SUCCEEDED
+    assert result.plan.nodes[0].result == "out only"
+    assert result.actual_cost_usd == 0.25

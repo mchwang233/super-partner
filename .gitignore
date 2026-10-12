@@ -20,11 +20,14 @@ frontend/*.tsbuildinfo
 *.p12
 *.pfx
 credentials.json
+.aws
 secrets.json
 
 # Editor and operating-system metadata
 .idea/
 .vscode/
 .DS_Store
+*.swp
+*.swo
 .agents/
 .codex/

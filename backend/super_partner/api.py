@@ -6,12 +6,13 @@ from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .catalog import builtin_models
+from .benchmarks import BenchmarkCatalog
+from .catalog_sync import CatalogSync, seed_catalog
 from .config import settings
 from .db import Database
 from .executor import Executor
@@ -62,35 +63,57 @@ class UpdateModelById(UpdateModel):
 
 settings.prepare()
 db = Database(settings.db_path)
-existing_enabled = {model.id: model.enabled for model in db.list_models()}
-seed_models = builtin_models()
-for seed_model in seed_models:
-    if seed_model.id in existing_enabled:
-        seed_model.enabled = existing_enabled[seed_model.id]
-db.save_models(seed_models)
-db.delete_models_except(model.id for model in seed_models)
+models = seed_catalog(db)
 hydrate_provider_keys()
 providers = ProviderRegistry()
-models = {model.id: model for model in db.list_models()}
 executor = Executor(db, providers, models)
+benchmarks = BenchmarkCatalog(db)
+catalog_sync = CatalogSync(
+    db, models, auto_sync=settings.catalog_auto_sync,
+    interval_hours=settings.catalog_sync_interval_hours,
+    benchmarks=benchmarks,
+)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    catalog_sync.start()
     for run in db.list_runs():
+        # An interrupted run may have left a project half-edited; resume only once confirmed.
         if run.status in {RunStatus.QUEUED, RunStatus.RUNNING}:
-            run.status = RunStatus.QUEUED
+            run.status = RunStatus.PAUSED
             db.save_run(run)
-            executor.start(run.id)
-    yield
-    await providers.client.aclose()
+            db.add_event(Event(run_id=run.id, kind="approval.required", data={"reason": "interrupted"}))
+    try:
+        yield
+    finally:
+        await catalog_sync.close()
+        await providers.client.aclose()
 
 
 app = FastAPI(title="Super Partner", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    CORSMiddleware, allow_origins=settings.allowed_origins,
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _host_name(host: str) -> str:
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+@app.middleware("http")
+async def local_only(request: Request, call_next):
+    """Refuse rebinding hosts and cross-site writes; the API can drive agents on local files."""
+    if _host_name(request.headers.get("host", "")).lower() not in settings.allowed_hosts:
+        return JSONResponse({"detail": "Host not allowed"}, status_code=403)
+    origin = request.headers.get("origin")
+    if request.method not in SAFE_METHODS and origin and origin not in settings.allowed_origins:
+        return JSONResponse({"detail": "Origin not allowed"}, status_code=403)
+    return await call_next(request)
 
 
 @app.get("/health")
@@ -108,11 +131,14 @@ def list_cli_channels(refresh: bool = False):
 
 
 @app.get("/api/models")
-def list_models():
+async def list_models():
     configured = providers.configured_models(list(models))
+    benchmark_matches = benchmarks.match_models(list(models.values()))
     return [
         {
             **model.model_dump(), "configured": model.id in configured,
+            "routing_ready": model.routing_ready,
+            "benchmarks": benchmark_matches.get(model.id, []),
             "auth_type": (
                 providers.cli.statuses[model.id].auth_type if model.channel == "cli" else "api_key"
             ),
@@ -121,19 +147,32 @@ def list_models():
     ]
 
 
+@app.get("/api/models/sync")
+async def catalog_status():
+    return catalog_sync.status()
+
+
+@app.post("/api/models/sync", status_code=202)
+async def refresh_catalog():
+    catalog_sync.trigger()
+    return catalog_sync.status()
+
+
 @app.patch("/api/models/{model_id}")
-def update_model(model_id: str, body: UpdateModel):
+async def update_model(model_id: str, body: UpdateModel):
     model = models.get(model_id)
     if not model:
         raise HTTPException(404, "Model not found")
+    if body.enabled and not model.routing_ready:
+        raise HTTPException(422, "模型尚缺少调度所需的评分、规格或价格，或已被来源标记为不可用。")
     model.enabled = body.enabled
     db.save_models([model])
     return {"id": model.id, "enabled": model.enabled}
 
 
 @app.patch("/api/models")
-def update_model_by_id(body: UpdateModelById):
-    return update_model(body.model_id, body)
+async def update_model_by_id(body: UpdateModelById):
+    return await update_model(body.model_id, body)
 
 
 @app.put("/api/providers/{provider}/key", status_code=204)
@@ -271,6 +310,21 @@ def get_task(run_id: str):
     return run
 
 
+@app.delete("/api/tasks/{run_id}", status_code=204)
+async def delete_task(run_id: str):
+    task = executor.tasks.get(run_id)
+    if task and not task.done():
+        raise HTTPException(409, "任务仍在执行或结束处理中，请稍后再删除。")
+    try:
+        deleted = db.delete_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not deleted:
+        raise HTTPException(404, "Task not found")
+    executor.tasks.pop(run_id, None)
+    executor.locks.pop(run_id, None)
+
+
 @app.post("/api/tasks/{run_id}/confirm", response_model=ExecutionRun)
 async def confirm_task(run_id: str, body: ConfirmTask):
     run = get_task(run_id)
@@ -325,7 +379,10 @@ async def task_events(run_id: str, after: int = 0):
                 idle += 1
                 yield ": keepalive\n\n"
             run = db.get_run(run_id)
-            if run and run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED} and not events:
+            if not run or (
+                run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}
+                and not events
+            ):
                 break
             await asyncio.sleep(1)
 

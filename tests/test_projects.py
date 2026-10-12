@@ -98,14 +98,15 @@ def test_planner_reads_needs_workspace_flag():
 
 
 class RecordingProviders:
-    def __init__(self):
+    def __init__(self, project=None):
+        self.project = project
         self.calls = []
         self.active_in_project = 0
         self.peak_in_project = 0
 
     async def complete(self, model_id, prompt, workspace=None, allow_api_fallback=True, **_):
         self.calls.append((Path(workspace), allow_api_fallback, prompt))
-        in_project = not allow_api_fallback
+        in_project = Path(workspace) == self.project
         self.active_in_project += in_project
         self.peak_in_project = max(self.peak_in_project, self.active_in_project)
         await asyncio.sleep(0.02)
@@ -126,7 +127,7 @@ async def test_project_nodes_run_serially_in_project_without_fallback(project_ro
                        plan=TaskPlan(summary="proj", nodes=nodes), project_dir=str(project))
     database = Database(tmp_path / "test.db")
     database.save_run(run)
-    providers = RecordingProviders()
+    providers = RecordingProviders(project)
     executor = Executor(database, providers, {model.id: model for model in builtin_models()})
     await executor.execute(run.id)
     result = database.get_run(run.id)

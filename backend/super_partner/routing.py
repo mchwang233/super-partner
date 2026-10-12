@@ -6,6 +6,8 @@ class NoEligibleModelError(ValueError):
 
 
 def node_cost(node: TaskNode, model: ModelProfile) -> float:
+    if model.input_per_million is None or model.output_per_million is None:
+        raise NoEligibleModelError(f"Pricing is not available for {model.id}")
     return (
         node.estimated_input_tokens * model.input_per_million
         + node.estimated_output_tokens * model.output_per_million
@@ -18,6 +20,7 @@ def eligible_for_node(
     return [
         model for model in models
         if model.enabled
+        and model.routing_ready
         and model.id in configured
         and model.context_window >= node.estimated_input_tokens + node.estimated_output_tokens
         # Only CLI agents run inside the project directory; API models never see its files.
