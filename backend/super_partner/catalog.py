@@ -2,125 +2,99 @@ from .models import CapabilityScore, ModelProfile
 
 
 def builtin_models() -> list[ModelProfile]:
-    """Conservative seed data. Unverified prices cannot be used for real billing claims."""
+    """Conservative seed data. Unverified prices cannot be used for real billing claims.
+
+    Routing scores come only from Artificial Analysis (see scoring.py); only the offline demo
+    model carries fixed scores.
+    """
     return [
         ModelProfile(
             id="cli:codex", provider="openai", display_name="Codex CLI (membership)",
             context_window=1_000_000, input_per_million=0, output_per_million=0,
             supports_vision=True, pricing_verified=True, channel="cli", execution_priority=0,
-            scores=CapabilityScore(coding=.97, planning=.96, research=.90, chinese=.90,
-                                   tool_use=.98, structured_output=.94, reliability=.92),
         ),
         ModelProfile(
             id="cli:claude", provider="anthropic", display_name="Claude Code CLI (membership)",
             context_window=200_000, input_per_million=0, output_per_million=0,
             supports_vision=True, pricing_verified=True, channel="cli", execution_priority=0,
-            scores=CapabilityScore(coding=.95, planning=.95, research=.89, chinese=.87,
-                                   tool_use=.97, structured_output=.92, reliability=.92),
         ),
         ModelProfile(
             id="cli:gemini", provider="google", display_name="Gemini CLI (membership)",
             context_window=1_000_000, input_per_million=0, output_per_million=0,
             supports_vision=True, pricing_verified=True, channel="cli", execution_priority=0,
-            scores=CapabilityScore(coding=.88, planning=.88, research=.94, chinese=.88,
-                                   tool_use=.92, structured_output=.90, reliability=.87),
         ),
         ModelProfile(
             id="cli:qwen", provider="qwen", display_name="Qwen Code CLI (membership)",
             context_window=128_000, input_per_million=0, output_per_million=0,
             pricing_verified=True, channel="cli", execution_priority=0,
-            scores=CapabilityScore(coding=.86, planning=.82, research=.78, chinese=.96,
-                                   tool_use=.90, structured_output=.88, reliability=.84),
         ),
         ModelProfile(
             id="openai:gpt-5.6-sol", provider="openai", display_name="GPT-5.6 Sol",
             context_window=1_050_000, input_per_million=4, output_per_million=20,
             cached_input_per_million=0.4, supports_vision=True,
-            scores=CapabilityScore(coding=.96, planning=.96, research=.90, chinese=.90,
-                                   tool_use=.96, structured_output=.96, reliability=.94),
             source_url="https://developers.openai.com/api/docs/models", pricing_verified=True,
         ),
         ModelProfile(
             id="openai:gpt-5.6-terra", provider="openai", display_name="GPT-5.6 Terra",
             context_window=1_050_000, input_per_million=2, output_per_million=12,
             cached_input_per_million=.2, supports_vision=True,
-            scores=CapabilityScore(coding=.89, planning=.89, research=.86, chinese=.87,
-                                   tool_use=.90, structured_output=.92, reliability=.90),
             source_url="https://developers.openai.com/api/docs/models", pricing_verified=True,
         ),
         ModelProfile(
             id="openai:gpt-5.6-luna", provider="openai", display_name="GPT-5.6 Luna",
             context_window=1_050_000, input_per_million=.2, output_per_million=1.2,
             cached_input_per_million=.02, supports_vision=True,
-            scores=CapabilityScore(coding=.74, planning=.70, research=.74, chinese=.76,
-                                   tool_use=.80, structured_output=.84, reliability=.82),
             source_url="https://developers.openai.com/api/docs/models", pricing_verified=True,
         ),
         ModelProfile(
             id="anthropic:claude-sonnet-5", provider="anthropic", display_name="Claude Sonnet 5",
             context_window=200_000, input_per_million=3, output_per_million=15,
             supports_vision=True, pricing_verified=False,
-            scores=CapabilityScore(coding=.91, planning=.90, research=.87, chinese=.84,
-                                   tool_use=.91, structured_output=.88, reliability=.91),
         ),
         ModelProfile(
             id="google:gemini-pro", provider="google", display_name="Gemini Pro",
             context_window=1_000_000, input_per_million=2, output_per_million=12,
             supports_vision=True, pricing_verified=False,
-            scores=CapabilityScore(coding=.88, planning=.89, research=.92, chinese=.86,
-                                   tool_use=.90, structured_output=.90, reliability=.88),
         ),
         ModelProfile(
             id="deepseek:deepseek-chat", provider="deepseek", display_name="DeepSeek Chat",
             context_window=128_000, input_per_million=.3, output_per_million=1.2,
             pricing_verified=False,
-            scores=CapabilityScore(coding=.82, planning=.78, research=.72, chinese=.90,
-                                   tool_use=.78, structured_output=.82, reliability=.78),
         ),
         ModelProfile(
             id="qwen:qwen-plus", provider="qwen", display_name="Qwen Plus",
             context_window=128_000, input_per_million=.4, output_per_million=1.2,
             pricing_verified=False,
-            scores=CapabilityScore(coding=.79, planning=.76, research=.74, chinese=.94,
-                                   tool_use=.84, structured_output=.85, reliability=.82),
         ),
         ModelProfile(
             id="doubao:doubao-pro", provider="doubao", display_name="Doubao Pro",
             context_window=128_000, input_per_million=.4, output_per_million=1.2,
             pricing_verified=False,
-            scores=CapabilityScore(coding=.75, planning=.75, research=.75, chinese=.93,
-                                   tool_use=.81, structured_output=.82, reliability=.81),
         ),
         ModelProfile(
             id="glm:glm-5.2", provider="glm", display_name="GLM-5.2",
             context_window=200_000, input_per_million=1, output_per_million=4,
             supports_vision=False, pricing_verified=False,
-            scores=CapabilityScore(coding=.90, planning=.89, research=.83, chinese=.96,
-                                   tool_use=.91, structured_output=.90, reliability=.87),
             source_url="https://docs.bigmodel.cn/cn/api/introduction",
         ),
         ModelProfile(
             id="minimax:MiniMax-M2.7", provider="minimax", display_name="MiniMax M2.7",
             context_window=204_800, input_per_million=1, output_per_million=4,
             supports_vision=False, pricing_verified=False,
-            scores=CapabilityScore(coding=.91, planning=.90, research=.84, chinese=.94,
-                                   tool_use=.92, structured_output=.89, reliability=.87),
             source_url="https://platform.minimax.io/docs/api-reference/api-overview",
         ),
         ModelProfile(
             id="kimi:kimi-k3", provider="kimi", display_name="Kimi K3",
             context_window=1_000_000, input_per_million=3, output_per_million=15,
             supports_vision=True, pricing_verified=False,
-            scores=CapabilityScore(coding=.93, planning=.92, research=.94, chinese=.97,
-                                   tool_use=.93, structured_output=.91, reliability=.89),
             source_url="https://platform.kimi.com/docs/api/overview",
         ),
         ModelProfile(
             id="mock:local", provider="mock", display_name="Local Demo Model",
             context_window=128_000, input_per_million=.01, output_per_million=.02,
-            scores=CapabilityScore(coding=.8, planning=.8, research=.8, chinese=.8,
-                                   tool_use=.8, structured_output=.8, reliability=.8),
-            pricing_verified=True,
+            scores=CapabilityScore(coding=80, planning=80, research=80, chinese=80,
+                                   tool_use=80, structured_output=80, reliability=80),
+            scores_source="demo", pricing_verified=True,
             execution_priority=1000,
         ),
     ]

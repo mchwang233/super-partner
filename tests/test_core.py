@@ -1,7 +1,6 @@
-import os
 from pathlib import Path
 
-import keyring
+from conftest import scored_models
 from super_partner.catalog import builtin_models
 from super_partner.cli_channels import CLI_SPECS
 from super_partner.db import Database
@@ -9,7 +8,6 @@ from super_partner.models import ExecutionRun, RunStatus
 from super_partner.planner import autonomous_plan, heuristic_plan
 from super_partner.providers import ProviderRegistry, ProviderResult
 from super_partner.routing import estimate, route_node
-from super_partner.secrets import set_provider_key
 
 
 def test_planner_builds_valid_dependency_graph():
@@ -21,30 +19,43 @@ def test_planner_builds_valid_dependency_graph():
     assert plan.nodes[-1].capability == "structured_output"
 
 
-def test_router_chooses_cheapest_eligible_model():
-    models = builtin_models()
+def test_router_chooses_cheapest_eligible_api_model():
+    models = scored_models()
     node = heuristic_plan("Analyze this task").nodes[0]
-    route_node(node, models, {model.id for model in models})
-    assert node.model_id == "cli:codex"
-    assert node.estimated_cost_usd == 0
+    configured = {model.id for model in models if model.provider != "mock"}
+    route_node(node, models, configured)
+    api = [m for m in models if m.channel != "cli" and m.id in configured]
+    assert node.model_id == min(api, key=lambda m: m.input_per_million * 1500 + m.output_per_million * 800).id
+    assert node.routing_note.startswith("子任务优先用 API 模型")
 
 
-def test_router_prefers_cli_over_cheaper_api():
-    models = builtin_models()
+def test_subtasks_use_a_cli_only_when_no_api_model_qualifies(monkeypatch):
+    from super_partner.config import settings
+    models = scored_models()
+    luna = next(model for model in models if model.id == "openai:gpt-5.6-luna")
     node = heuristic_plan("Implement this feature").nodes[0]
-    route_node(node, models, {"cli:claude", "mock:local"})
+    route_node(node, models, {"cli:claude", luna.id})
+    assert node.model_id == luna.id
+    luna.scores = luna.scores.model_copy(update={node.capability: node.quality_threshold - 5})
+    route_node(node, models, {"cli:claude", luna.id})
+    assert node.model_id == "cli:claude"
+    assert "API 模型最高只有" in node.routing_note and "改用会员 CLI" in node.routing_note
+    # With the policy off, the free membership CLI comes first again.
+    monkeypatch.setattr(settings, "subtasks_prefer_api", False)
+    luna.scores = luna.scores.model_copy(update={node.capability: 95})
+    route_node(node, models, {"cli:claude", luna.id})
     assert node.model_id == "cli:claude"
 
 
 def test_router_can_exclude_all_cli_channels():
-    models = builtin_models()
+    models = scored_models()
     node = heuristic_plan("Implement this feature").nodes[0]
     route_node(node, models, {"openai:gpt-5.6-luna", "mock:local"})
     assert node.model_id == "openai:gpt-5.6-luna"
 
 
 def test_router_never_selects_disabled_model():
-    models = builtin_models()
+    models = scored_models()
     next(model for model in models if model.id == "cli:codex").enabled = False
     node = heuristic_plan("Implement this feature").nodes[0]
     route_node(node, models, {"cli:codex", "cli:claude"})
@@ -79,7 +90,7 @@ async def test_autonomous_planner_builds_model_generated_dag():
                 input_tokens=100, output_tokens=100, used_model_id="openai:gpt-5.6-sol",
             )
 
-    catalog = builtin_models()
+    catalog = scored_models()
     plan = await autonomous_plan(
         "Build it", catalog, {"openai:gpt-5.6-sol"}, FakeProviders(),
     )
@@ -110,15 +121,6 @@ def test_new_chinese_providers_are_routable(monkeypatch):
     assert {"glm:glm-5.2", "minimax:MiniMax-M2.7", "kimi:kimi-k3"} <= configured
 
 
-def test_stored_provider_key_replaces_existing_environment_value(monkeypatch):
-    stored = {}
-    monkeypatch.setattr(keyring, "set_password", lambda service, name, value: stored.update({name: value}))
-    monkeypatch.setenv("OPENAI_API_KEY", "old-key-value")
-    set_provider_key("openai", "new-key-value")
-    assert stored["openai"] == "new-key-value"
-    assert os.environ["OPENAI_API_KEY"] == "new-key-value"
-
-
 def test_database_prunes_retired_models(tmp_path: Path):
     database = Database(tmp_path / "test.db")
     catalog = builtin_models()
@@ -131,3 +133,52 @@ def test_database_prunes_retired_models(tmp_path: Path):
 def test_cli_fallbacks_reference_catalog_models():
     catalog_ids = {model.id for model in builtin_models()}
     assert {spec.fallback_model_id for spec in CLI_SPECS.values()} <= catalog_ids
+
+
+def _priced(model_id: str, priority: int, price: float, coding: float):
+    from super_partner.models import CapabilityScore, ModelProfile
+    return ModelProfile(
+        id=model_id, provider="x", display_name=model_id, context_window=200_000,
+        input_per_million=price, output_per_million=price, execution_priority=priority,
+        scores=CapabilityScore(coding=coding, reliability=90),
+    )
+
+
+def test_difficulty_decides_between_the_cheapest_and_the_strongest_model():
+    from super_partner.models import TaskNode
+    models = [_priced("cheap", 100, .1, 82), _priced("strong", 100, 5, 97), _priced("cli", 0, 0, 91)]
+    configured = {model.id for model in models}
+
+    def routed(difficulty: str) -> str:
+        node = TaskNode(id="n", title="t", instructions="i", capability="coding",
+                        difficulty=difficulty, quality_threshold={"easy": 70, "normal": 80, "hard": 90}[difficulty])
+        return route_node(node, models, configured).model_id
+
+    # Easy and normal: membership CLI first, then the cheapest that clears the threshold.
+    assert routed("easy") == routed("normal") == "cli"
+    without_cli = [model for model in models if model.id != "cli"]
+    node = TaskNode(id="n", title="t", instructions="i", capability="coding", quality_threshold=80)
+    assert route_node(node, without_cli, configured).model_id == "cheap"
+    # Hard: the highest score wins even though it costs more than the free CLI.
+    assert routed("hard") == "strong"
+
+
+def test_planner_difficulty_sets_the_threshold_and_old_plans_derive_it():
+    from super_partner.models import TaskNode
+    from super_partner.planner import _validate_plan
+    plan = _validate_plan({"nodes": [
+        {"key": "a", "instructions": "x", "difficulty": "hard"},
+        {"key": "b", "instructions": "y", "dependencies": ["a"], "difficulty": "Easy"},
+        {"key": "c", "instructions": "z", "quality_threshold": .8},
+    ]})
+    assert [(n.difficulty, n.quality_threshold) for n in plan.nodes] == [("hard", 90), ("easy", 70), ("normal", 80)]
+    saved = TaskNode(id="n", title="t", instructions="i", capability="coding", quality_threshold=.92)
+    assert (saved.difficulty, saved.quality_threshold) == ("hard", 92)
+
+
+def test_reviews_also_go_to_api_models_first():
+    from super_partner.routing import pick_reviewer
+    models = scored_models()
+    configured = {"cli:claude", "openai:gpt-5.6-luna"}
+    assert pick_reviewer(models, configured, exclude="openai:gpt-6", tokens=1000).id == "openai:gpt-5.6-luna"
+    assert pick_reviewer(models, {"cli:claude"}, exclude=None, tokens=1000).id == "cli:claude"

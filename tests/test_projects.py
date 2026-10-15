@@ -5,6 +5,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from conftest import scored_models
 from super_partner.catalog import builtin_models
 from super_partner.config import settings
 from super_partner.db import Database
@@ -14,8 +15,9 @@ from super_partner.planner import _validate_plan, heuristic_plan
 from super_partner.projects import (
     NativePickerError,
     ProjectDirError,
-    browse_directories,
+    discover_projects,
     git_snapshot,
+    inspect_project,
     native_pick_directory,
     native_picker_status,
     project_context,
@@ -79,13 +81,23 @@ def test_git_snapshot_handles_plain_directory(tmp_path: Path):
     assert git_snapshot(tmp_path) == {"git": False}
 
 
-def test_workspace_nodes_only_route_to_cli():
+def test_workspace_nodes_need_an_agent_that_can_act(monkeypatch):
     node = heuristic_plan("Implement this feature", in_project=True).nodes[0]
     assert node.needs_workspace
-    models = builtin_models()
+    models = scored_models()
+    # API models act through tools, so they take project work before a CLI does;
+    # the demo model never acts.
     route_node(node, models, {"cli:qwen", "openai:gpt-5.6-sol", "mock:local"})
+    assert node.model_id == "openai:gpt-5.6-sol"
+    route_node(node, models, {"cli:qwen", "mock:local"})
     assert node.model_id == "cli:qwen"
-    with pytest.raises(NoEligibleModelError, match="membership CLI"):
+    next(m for m in models if m.id == "openai:gpt-5.6-sol").supports_tools = False
+    with pytest.raises(NoEligibleModelError, match="membership CLI or an API model"):
+        route_node(node, models, {"openai:gpt-5.6-sol", "mock:local"})
+    # With API tools turned off, only CLIs can work in the project.
+    monkeypatch.setattr(settings, "api_agent", False)
+    next(m for m in models if m.id == "openai:gpt-5.6-sol").supports_tools = None
+    with pytest.raises(NoEligibleModelError):
         route_node(node, models, {"openai:gpt-5.6-sol", "mock:local"})
 
 
@@ -115,7 +127,8 @@ class RecordingProviders:
 
 
 @pytest.mark.asyncio
-async def test_project_nodes_run_serially_in_project_without_fallback(project_root: Path, tmp_path: Path):
+async def test_project_nodes_run_serially_in_project_without_fallback(project_root: Path, tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(settings, "review_nodes", False)
     project = project_root / "app"
     nodes = [
         TaskNode(id=f"edit{i}", title=f"Edit {i}", instructions="edit", capability="coding",
@@ -173,26 +186,41 @@ async def test_planner_marks_workspace_nodes_only_for_project_runs():
     assert any(node.needs_workspace for node in project.nodes)
 
 
-def test_browse_lists_subdirectories_within_roots(project_root: Path, tmp_path: Path):
-    (project_root / "app" / ".git").mkdir()
-    (project_root / "docs").mkdir()
-    (project_root / ".cache").mkdir()
-    (project_root / "notes.txt").write_text("x")
-    (project_root / "escape").symlink_to(tmp_path)
-    listing = browse_directories()
-    assert listing["path"] == str(project_root.resolve())
-    assert listing["parent"] is None
-    assert [(entry["name"], entry["git"]) for entry in listing["entries"]] == [("app", True), ("docs", False)]
-    assert ".cache" in [entry["name"] for entry in browse_directories(show_hidden=True)["entries"]]
-    child = browse_directories(str(project_root / "app"))
-    assert child["parent"] == str(project_root.resolve()) and child["git"]
+def make_repo(path: Path, touched: float) -> Path:
+    (path / ".git").mkdir(parents=True)
+    (path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    os.utime(path / ".git" / "HEAD", (touched, touched))
+    return path
 
 
-def test_browse_hides_data_dir_and_rejects_outside_roots(project_root: Path, tmp_path: Path):
-    settings.data_dir.mkdir()
-    assert browse_directories(str(project_root / "app"))["entries"] == []
+def test_discover_finds_repositories_most_recent_first(project_root: Path, tmp_path: Path):
+    old = make_repo(project_root / "work" / "old", 1_000)
+    new = make_repo(project_root / "work" / "new", 2_000)
+    make_repo(project_root / "work" / "new" / "nested", 3_000)          # inside a repo: not listed
+    make_repo(project_root / "web" / "node_modules" / "pkg", 4_000)     # dependency folder
+    make_repo(project_root / ".hidden" / "repo", 5_000)                 # hidden folder
+    make_repo(project_root / "a" / "b" / "c" / "d" / "e" / "deep", 6_000)  # beyond max depth
+    make_repo(tmp_path / "outside", 7_000)
+    (project_root / "link").symlink_to(tmp_path / "outside")            # symlinks are not followed
+    result = discover_projects()
+    assert [entry["path"] for entry in result["projects"]] == [str(new), str(old)]
+    assert result["projects"][0]["name"] == "new" and not result["truncated"]
+
+
+def test_discover_stops_at_the_limit(project_root: Path):
+    for index in range(5):
+        make_repo(project_root / f"repo{index}", index)
+    result = discover_projects(limit=3)
+    assert len(result["projects"]) == 3 and result["truncated"]
+
+
+def test_inspect_describes_a_project_and_rejects_bad_paths(project_root: Path, tmp_path: Path):
+    plain = inspect_project(str(project_root / "app"))
+    assert plain == {"path": str((project_root / "app").resolve()), "git": False}
     with pytest.raises(ProjectDirError, match="allowed root"):
-        browse_directories(str(tmp_path))
+        inspect_project(str(tmp_path))
+    with pytest.raises(ProjectDirError, match="does not exist"):
+        inspect_project(str(project_root / "missing"))
 
 
 def test_native_picker_needs_a_desktop_and_zenity(monkeypatch):
@@ -248,3 +276,12 @@ async def test_native_pick_kills_a_dialog_that_outlives_the_timeout(fake_zenity,
     monkeypatch.setattr("super_partner.projects.NATIVE_PICKER_TIMEOUT", 0.2)
     with pytest.raises(asyncio.TimeoutError):
         await native_pick_directory()
+
+
+@pytest.mark.asyncio
+async def test_native_pick_opens_at_the_requested_folder_when_allowed(project_root: Path, tmp_path: Path, fake_zenity):
+    # The fake dialog echoes the folder it was asked to start in.
+    fake_zenity('for arg; do case "$arg" in --filename=*) echo "${arg#--filename=}";; esac; done')
+    assert await native_pick_directory(str(project_root / "app")) == (project_root / "app").resolve()
+    assert await native_pick_directory(str(tmp_path)) == project_root.resolve()
+    assert await native_pick_directory() == project_root.resolve()

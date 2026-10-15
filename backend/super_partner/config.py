@@ -18,6 +18,30 @@ class Settings(BaseSettings):
     allow_host_shell: bool = False
     default_budget_usd: float = 2.0
     max_parallel_nodes: int = 3
+    # API models work on files and run sandboxed commands through tools (agent.py); off, they
+    # only return text and cannot be routed to nodes that change a project.
+    api_agent: bool = True
+    api_agent_max_turns: int = Field(default=40, ge=1, le=200)
+    # Local TCP ports that API models' sandboxed commands may still reach, such as an EDA
+    # license server: lmgrd's port plus its vendor daemon's, which must be pinned in the license
+    # file (VENDOR snpslmd port=...). All other network access stays blocked. Needs socat.
+    sandbox_host_ports: list[int] = []
+    # Host environment variables copied into that sandbox, e.g. VCS_HOME or
+    # SNPSLMD_LICENSE_FILE. Listing PATH replaces the sandbox's minimal PATH with the host's.
+    sandbox_env: list[str] = []
+    # Subtasks (and their reviews) go to API models; a membership CLI only takes a subtask no
+    # API model can do. Planning may still use a CLI.
+    subtasks_prefer_api: bool = True
+    # Diagnose a task automatically when one of its nodes runs out of attempts.
+    auto_diagnose: bool = True
+    # Have another model check each node's result against its acceptance criteria.
+    review_nodes: bool = True
+    # Runs per node (first try plus retries) before it fails; retries go to the strongest model.
+    max_node_attempts: int = Field(default=3, ge=1, le=10)
+    # Times verification nodes may send work back for rework within one task.
+    max_rework_rounds: int = Field(default=2, ge=0, le=10)
+    # Upstream results longer than this reach downstream nodes as a summary.
+    handoff_max_chars: int = Field(default=4000, ge=500)
     api_base_url: str = "http://127.0.0.1:8000"
     # Host names the API answers to; any other Host header is refused to block DNS rebinding.
     allowed_hosts: list[str] = ["127.0.0.1", "localhost", "::1"]

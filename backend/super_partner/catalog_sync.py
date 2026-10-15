@@ -15,6 +15,7 @@ import httpx
 from .catalog import builtin_models
 from .db import Database
 from .models import ModelProfile, utcnow
+from .scoring import rescore
 from .secrets import PROVIDER_ENV
 
 PUBLIC_CATALOG_URL = "https://models.dev/api.json"
@@ -403,6 +404,9 @@ class CatalogSync:
             if self.benchmarks:
                 jobs.append(self.benchmarks.refresh(self.client))
             await asyncio.gather(*jobs)
+            if self.benchmarks:
+                # New AA results or newly listed models can change routing scores.
+                rescore(self.models, self.benchmarks, self.db)
             finished = utcnow()
             all_ok = all(state["public_status"] == "ok" for state in states.values())
             if self.benchmarks:

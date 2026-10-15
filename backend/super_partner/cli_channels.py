@@ -11,6 +11,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
+from . import environment
+from .attachments import path
+
 
 @dataclass(frozen=True)
 class CliSpec:
@@ -34,6 +37,51 @@ class CliStatus:
         return asdict(self)
 
 
+# Claude Code runs shell commands inside its own bubblewrap sandbox: writes only in the working
+# directory (and /tmp), no network, and no way to ask for an unsandboxed command. Sandboxed
+# commands need no approval, which a background run could never give; file edits are accepted.
+CLAUDE_SANDBOX_SETTINGS = json.dumps({"sandbox": {
+    "enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
+}})
+
+# Repairing the environment: Claude Code without its sandbox and without asking for approval.
+# The whole CLI runs under bubblewrap instead, which only blocks gaining root (see repair_command).
+CLAUDE_REPAIR_SETTINGS = json.dumps({"sandbox": {"enabled": False}})
+REPAIR_ARGS = {
+    "cli:claude": (
+        "-p", "--output-format", "json", "--permission-mode", "bypassPermissions",
+        "--settings", CLAUDE_REPAIR_SETTINGS, "--no-session-persistence",
+    ),
+    "cli:codex": (
+        "exec", "--ephemeral", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox",
+        "--color", "never", "-",
+    ),
+}
+
+
+def _failure_detail(stdout: bytes, stderr: bytes) -> str:
+    """Why a CLI exited with an error. Claude Code in JSON mode reports errors such as a usage
+    limit in the ``result`` of its stdout and leaves stderr empty."""
+    detail = stderr.decode(errors="replace").strip()
+    if not detail:
+        text = stdout.decode(errors="replace").strip()
+        try:
+            payload = json.loads(text)
+            text = str(payload.get("result") or payload.get("error") or text) if isinstance(payload, dict) else text
+        except json.JSONDecodeError:
+            pass
+        detail = text or "no output"
+    return detail[-500:]
+
+
+def repair_command(executable: str, args: list[str]) -> list[str]:
+    """Run a CLI on the host as the user, network included, but under no_new_privs (which
+    bubblewrap always sets), so sudo and other setuid programs cannot raise privileges."""
+    if not shutil.which("bwrap"):
+        raise RuntimeError("repairing the environment needs bubblewrap (bwrap), which blocks sudo")
+    return ["bwrap", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--die-with-parent", "--", executable, *args]
+
+
 CLI_SPECS = {
     "cli:codex": CliSpec(
         id="cli:codex", executable="codex", auth_command=("login", "status"),
@@ -42,7 +90,10 @@ CLI_SPECS = {
     ),
     "cli:claude": CliSpec(
         id="cli:claude", executable="claude", auth_command=("auth", "status"),
-        invoke_args=("-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--no-session-persistence"),
+        invoke_args=(
+            "-p", "--output-format", "json", "--permission-mode", "acceptEdits",
+            "--settings", CLAUDE_SANDBOX_SETTINGS, "--no-session-persistence",
+        ),
         fallback_model_id="anthropic:claude-sonnet-5",
     ),
     "cli:gemini": CliSpec(
@@ -65,6 +116,20 @@ async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
+def _with_attachments(model_id: str, args: list[str], attachments: list) -> list[str]:
+    """Let the CLI open attached files, which live outside its working directory."""
+    if not attachments:
+        return args
+    if model_id == "cli:codex":
+        # Codex reads the whole disk in its sandbox; images also go in as real image inputs.
+        # "--image=" keeps the value from swallowing the trailing "-" (prompt on stdin).
+        images = [f"--image={path(item)}" for item in attachments if item.kind == "image"]
+        return [args[0], *images, *args[1:]]
+    if model_id == "cli:claude":
+        return [*args, "--add-dir", *sorted({str(path(item).parent) for item in attachments})]
+    return args
+
+
 class CliChannelRegistry:
     def __init__(self) -> None:
         self._statuses: dict[str, CliStatus] = {}
@@ -84,13 +149,14 @@ class CliChannelRegistry:
         executable = shutil.which(spec.executable)
         if not executable:
             return CliStatus(id=spec.id, installed=False, authenticated=False)
+        # Generous limits: on a busy machine a Node CLI can take several seconds just to start.
         try:
             version_result = subprocess.run(
-                [executable, "--version"], capture_output=True, text=True, timeout=3, check=False,
+                [executable, "--version"], capture_output=True, text=True, timeout=15, check=False,
             )
             version = (version_result.stdout or version_result.stderr).strip().splitlines()[-1][:120]
             auth = subprocess.run(
-                [executable, *spec.auth_command], capture_output=True, text=True, timeout=5, check=False,
+                [executable, *spec.auth_command], capture_output=True, text=True, timeout=15, check=False,
             )
             output = (auth.stdout + auth.stderr).lower()
             authenticated = auth.returncode == 0 and not any(
@@ -110,19 +176,26 @@ class CliChannelRegistry:
         except (OSError, subprocess.SubprocessError) as exc:
             return CliStatus(id=spec.id, installed=True, authenticated=False, error=str(exc)[:200])
 
-    async def complete(self, model_id: str, prompt: str, cwd: Path, timeout: int = 900) -> str:
+    async def complete(
+        self, model_id: str, prompt: str, cwd: Path, timeout: int = 900, attachments=(), repair: bool = False,
+    ) -> str:
+        """Run a CLI in ``cwd``. With ``repair`` it leaves its sandbox to fix the environment."""
         spec = CLI_SPECS[model_id]
         executable = shutil.which(spec.executable)
         if not executable:
             raise RuntimeError(f"{spec.executable} is no longer installed")
-        args = list(spec.invoke_args)
+        args = list(REPAIR_ARGS.get(spec.id, spec.invoke_args) if repair else spec.invoke_args)
+        args = _with_attachments(spec.id, args, list(attachments))
         if spec.id in {"cli:gemini", "cli:qwen"}:
             args[1] = prompt
             stdin = None
         else:
             stdin = prompt.encode()
+        command = repair_command(executable, args) if repair else [executable, *args]
+        # Tools that environment repairs installed are on PATH for every CLI.
+        env = environment.command_env(dict(os.environ))
         spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
-            executable, *args, cwd=str(cwd), stdin=asyncio.subprocess.PIPE if stdin else None,
+            *command, cwd=str(cwd), env=env, stdin=asyncio.subprocess.PIPE if stdin else None,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         ))
@@ -141,7 +214,7 @@ class CliChannelRegistry:
             await _kill_process_group(process)
             raise
         if process.returncode:
-            raise RuntimeError(f"{spec.executable} failed: {stderr.decode(errors='replace')[-500:]}")
+            raise RuntimeError(f"{spec.executable} failed: {_failure_detail(stdout, stderr)}")
         text = stdout.decode(errors="replace").strip()
         if spec.id in {"cli:claude", "cli:gemini", "cli:qwen"}:
             try:

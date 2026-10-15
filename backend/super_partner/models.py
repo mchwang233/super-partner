@@ -4,11 +4,25 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# Task difficulty sets the minimum routing score (0-100) for the task's capability.
+DIFFICULTY_THRESHOLDS = {"easy": 70, "normal": 80, "hard": 90}
+
+
+def difficulty_for(threshold: float) -> str:
+    """Difficulty implied by a bare threshold, for plans saved before difficulty existed."""
+    return "hard" if threshold >= 88 else "normal" if threshold >= 78 else "easy"
+
+
+def to_percent_scale(value: float) -> float:
+    """Scores and thresholds are 0-100; records saved before that used 0-1."""
+    return round(value * 100, 1) if 0 < value <= 1 else value
 
 
 class RunStatus(str, Enum):
@@ -38,13 +52,16 @@ class RiskLevel(str, Enum):
 
 
 class CapabilityScore(BaseModel):
-    coding: float = 0.5
-    planning: float = 0.5
-    research: float = 0.5
-    chinese: float = 0.5
-    tool_use: float = 0.5
-    structured_output: float = 0.5
-    reliability: float = 0.5
+    """Routing scores on a 0-100 scale."""
+    coding: float = 50
+    planning: float = 50
+    research: float = 50
+    chinese: float = 50
+    tool_use: float = 50
+    structured_output: float = 50
+    reliability: float = 50
+
+    _upgrade_scale = field_validator("*")(to_percent_scale)
 
     def score_for(self, capability: str) -> float:
         return float(getattr(self, capability, self.reliability))
@@ -64,6 +81,10 @@ class ModelProfile(BaseModel):
     supports_reasoning: Optional[bool] = None
     supports_structured_output: Optional[bool] = None
     scores: Optional[CapabilityScore] = None
+    # "artificial_analysis" when derived from AA, "none" without AA results (not routed);
+    # the offline demo model keeps fixed scores and the source "demo".
+    scores_source: str = "none"
+    scores_basis: Optional[str] = None
     source_url: Optional[str] = None
     effective_at: datetime = Field(default_factory=utcnow)
     pricing_verified: bool = False
@@ -91,6 +112,24 @@ class ModelProfile(BaseModel):
         )
 
 
+class NodeAttempt(BaseModel):
+    """One run of a node: what model did it, and whether its result was accepted."""
+    model_id: Optional[str] = None
+    # passed | rejected (review failed) | error (model call failed) | verify_failed
+    outcome: str
+    reason: Optional[str] = None
+    reviewer_model_id: Optional[str] = None
+    cost_usd: float = 0.0
+    finished_at: datetime = Field(default_factory=utcnow)
+
+
+class NodeInput(BaseModel):
+    """What a node received from one upstream node."""
+    node_id: str
+    form: str  # full | summary | truncated
+    changed_files: int = 0
+
+
 class TaskNode(BaseModel):
     id: str
     title: str
@@ -99,13 +138,49 @@ class TaskNode(BaseModel):
     dependencies: list[str] = Field(default_factory=list)
     estimated_input_tokens: int = 1500
     estimated_output_tokens: int = 800
-    quality_threshold: float = 0.65
+    # Minimum routing score (0-100) for the node's capability. Normally set from difficulty;
+    # it can be lowered at planning time when no available model reaches it.
+    quality_threshold: float = 65
+    # easy/normal: cheapest qualifying model (membership CLIs first); hard: highest score.
+    difficulty: str = "normal"
     # True when the node must read or change files in the run's project directory.
     needs_workspace: bool = False
     model_id: Optional[str] = None
+    # Why the router chose model_id, for the plan view.
+    routing_note: Optional[str] = None
+    # When the current (or last) attempt started; attempts record when each one ended.
+    started_at: Optional[datetime] = None
     estimated_cost_usd: float = 0.0
     status: NodeStatus = NodeStatus.PENDING
     result: Optional[str] = None
+    # How a reviewer decides whether the result is acceptable.
+    acceptance_criteria: str = ""
+    # Upstream nodes this verification node checks; a failed verdict sends them back for rework.
+    verifies: list[str] = Field(default_factory=list)
+    attempts: list[NodeAttempt] = Field(default_factory=list)
+    # Failed attempts since the node was last (re)started; retries stop at max_node_attempts.
+    failed_attempts: int = 0
+    # Environment repairs after this node ran out of attempts; reset when the user resumes.
+    environment_fixes: int = 0
+    # What the next attempt must fix: a reviewer's or a verification node's findings.
+    feedback: Optional[str] = None
+    review_passed: Optional[bool] = None
+    review: Optional[str] = None
+    # Short form of a long result, handed to downstream nodes instead of the full text.
+    summary: Optional[str] = None
+    changed_files: list[str] = Field(default_factory=list)
+    inputs: list[NodeInput] = Field(default_factory=list)
+    # Rework invalidates in-flight results that were based on an older generation.
+    generation: int = 0
+
+    _upgrade_threshold = field_validator("quality_threshold")(to_percent_scale)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_difficulty(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "difficulty" not in data and "quality_threshold" in data:
+            data = {**data, "difficulty": difficulty_for(to_percent_scale(float(data["quality_threshold"])))}
+        return data
 
 
 class CostEstimate(BaseModel):
@@ -127,6 +202,37 @@ class TaskPlan(BaseModel):
     planning_note: Optional[str] = None
 
 
+class Attachment(BaseModel):
+    """A file the user attached to a task; ``kind`` is detected from its content."""
+    id: str
+    name: str
+    size: int
+    kind: str  # "image" (png/jpeg/gif/webp), "text" (UTF-8) or "file" (other binary)
+    media_type: str
+
+
+class Diagnosis(BaseModel):
+    """A strong model's analysis of why a task is stuck, with advice for the next attempt."""
+    id: str
+    trigger: str  # manual (the 诊断 button) or auto (a node ran out of attempts)
+    node_id: Optional[str] = None
+    model_id: Optional[str] = None
+    status: str = "running"  # running | done | failed
+    report: Optional[str] = None
+    # What the failed node's next attempt should do differently; resuming hands it over.
+    advice: Optional[str] = None
+    # Automatic diagnoses after a failed attempt: fixed (environment repaired, run again),
+    # retry (nothing outside the task is wrong), quota_exhausted (switch execution model),
+    # or blocked (the user must act).
+    verdict: Optional[str] = None
+    # A concrete human-only dependency is required before a BLOCKED diagnosis pauses a task.
+    user_action: Optional[str] = None
+    error: Optional[str] = None
+    cost_usd: float = 0.0
+    created_at: datetime = Field(default_factory=utcnow)
+    finished_at: Optional[datetime] = None
+
+
 class ExecutionRun(BaseModel):
     id: str
     prompt: str
@@ -135,6 +241,12 @@ class ExecutionRun(BaseModel):
     budget_usd: float
     use_cli: bool = True
     project_dir: Optional[str] = None
+    attachments: list[Attachment] = Field(default_factory=list)
+    # Times a verification node sent work back; capped by max_rework_rounds.
+    rework_rounds: int = 0
+    # Repository the output was last published to.
+    github_url: Optional[str] = None
+    diagnoses: list[Diagnosis] = Field(default_factory=list)
     actual_cost_usd: float = 0.0
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)

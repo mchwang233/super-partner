@@ -4,8 +4,58 @@ type MissionRecord = {
   id: string;
   status: string;
   actual_cost_usd: number;
-  plan: { summary: string };
+  created_at?: string;
+  project_dir?: string | null;
+  plan: { summary: string; nodes?: { status: string }[] };
 };
+
+/** Sidebar groups, most urgent first: what is running, what needs the user, what is done. */
+export const MISSION_GROUPS = [
+  { id: "active", label: "进行中", statuses: ["queued", "running"] },
+  { id: "attention", label: "需要处理", statuses: ["awaiting_confirmation", "paused", "failed"] },
+  { id: "done", label: "已结束", statuses: ["succeeded", "cancelled"] },
+] as const;
+
+export function needsAttention(status: string): boolean {
+  return (MISSION_GROUPS[1].statuses as readonly string[]).includes(status);
+}
+
+export function progressOf(mission: MissionRecord): { done: number; total: number } {
+  const nodes = mission.plan.nodes ?? [];
+  return { done: nodes.filter(node => node.status === "succeeded").length, total: nodes.length };
+}
+
+export function relativeTime(iso?: string, now = Date.now()): string {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  const minutes = Math.floor((now - then) / 60000);
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} 小时前`;
+  if (minutes < 7 * 24 * 60) return `${Math.floor(minutes / 1440)} 天前`;
+  return new Date(then).toLocaleDateString("zh-CN");
+}
+
+function folder(path?: string | null) { return path ? path.replace(/\/+$/, "").split("/").pop() : ""; }
+
+export const STATUS_LABELS: Record<string, string> = {
+  draft: "草稿", awaiting_confirmation: "待确认", queued: "排队中", running: "运行中",
+  paused: "已暂停", succeeded: "已完成", failed: "失败", cancelled: "已取消",
+  pending: "等待中", blocked: "已阻塞",
+};
+
+export function statusLabel(status: string): string {
+  return STATUS_LABELS[status] ?? status.replaceAll("_", " ");
+}
+
+/** Dollar amounts: tiny API charges stay readable without padding every value to 6 places. */
+export function formatUsd(value: number): string {
+  if (value === 0) return "$0";
+  if (value < 0.0001) return "<$0.0001";
+  if (value < 1) return `$${value.toFixed(4).replace(/0+$/, "")}`;
+  return `$${value.toFixed(2)}`;
+}
 
 export function canDeleteMission(status: string): boolean {
   return ["succeeded", "failed", "cancelled"].includes(status);
@@ -26,7 +76,7 @@ export function DeleteMissionButton<T extends MissionRecord>({ mission, deleting
   if (!canDeleteMission(mission.status)) return null;
   return <button
     type="button"
-    className={`danger ${compact ? "mission-delete-compact" : "confirm"}`}
+    className={compact ? "mission-delete-compact" : "danger mission-delete-full"}
     aria-label={`删除任务记录：${mission.plan.summary}`}
     title="删除任务记录、结果和日志；保留本地工程文件"
     disabled={deletingId !== null}
@@ -103,16 +153,35 @@ type HistoryProps<T extends MissionRecord> = {
   onDelete: (mission: T) => void;
 };
 
-export function MissionHistory<T extends MissionRecord>({ runs, selectedId, deletingId, error, onSelect, onDelete }: HistoryProps<T>) {
+export function MissionHistory<T extends MissionRecord>({ runs, selectedId, deletingId, error, onSelect, onDelete, collapsed = false, onToggle }: HistoryProps<T> & { collapsed?: boolean; onToggle?: () => void }) {
+  const groups = MISSION_GROUPS.map(group => ({ ...group, runs: runs.filter(run => (group.statuses as readonly string[]).includes(run.status)) })).filter(group => group.runs.length);
+  if (collapsed) return <section className="panel mission-history collapsed" aria-label="任务历史（已收起）">
+    <button type="button" className="history-toggle" onClick={onToggle} aria-expanded={false} title="展开任务栏">»<span>{runs.length}</span></button>
+    <div className="history-rail">{groups.map(group => <React.Fragment key={group.id}>
+      <span className="rail-divider" title={group.label} aria-hidden="true" />
+      {group.runs.map(run => <button type="button" key={run.id} className={`rail-run ${selectedId === run.id ? "active" : ""}`} aria-pressed={selectedId === run.id}
+        onClick={() => onSelect(run)} title={`${run.plan.summary} · ${statusLabel(run.status)}`} aria-label={run.plan.summary}><span className={`dot ${run.status}`} /></button>)}
+    </React.Fragment>)}</div>
+  </section>;
   return <section className="panel mission-history" aria-label="任务历史">
-    <div className="title"><h3>Recent missions</h3><span>{runs.length}</span></div>
+    <div className="title"><h3>任务</h3><span className="history-count">{runs.length}</span>{onToggle && <button type="button" className="history-toggle" onClick={onToggle} aria-expanded={true} title="收起任务栏">«</button>}</div>
     {error && <p className="mission-delete-error" role="alert">{error}</p>}
-    {runs.length === 0 ? <p className="empty">No missions yet.</p> : runs.map(run => <div className="run-entry" key={run.id}>
-      <button className={`run ${selectedId === run.id ? "active" : ""}`} aria-pressed={selectedId === run.id} onClick={() => onSelect(run)}>
-        <span className={`dot ${run.status}`} />
-        <span><b>{run.plan.summary}</b><small>{run.status.replaceAll("_", " ")} · ${run.actual_cost_usd.toFixed(6)}</small></span>
-      </button>
-      <DeleteMissionButton mission={run} deletingId={deletingId} onDelete={onDelete} compact />
-    </div>)}
+    {runs.length === 0 ? <p className="empty">还没有任务。点右上角的“＋ 新任务”开始。</p> : <div className="run-list">{groups.map(group => <div className={`run-group ${group.id}`} key={group.id}>
+      <p className="run-group-title">{group.label}<span>{group.runs.length}</span></p>
+      {group.runs.map(run => {
+        const { done, total } = progressOf(run);
+        return <div className={`run-entry ${selectedId === run.id ? "active" : ""}`} key={run.id}>
+          <button className={`run ${selectedId === run.id ? "active" : ""}`} aria-pressed={selectedId === run.id} onClick={() => onSelect(run)} title={run.plan.summary}>
+            <span className={`dot ${run.status}`} />
+            <span className="run-text"><b>{run.plan.summary}</b>
+              <small><span className={`run-status ${run.status}`}>{statusLabel(run.status)}</span>{total > 0 && <> · {done}/{total}</>} · {formatUsd(run.actual_cost_usd)}{run.created_at && <> · {relativeTime(run.created_at)}</>}</small>
+              {run.project_dir && <small className="run-project" title={run.project_dir}>📁 {folder(run.project_dir)}</small>}
+              {total > 0 && run.status !== "succeeded" && <span className="run-progress" aria-hidden="true"><i style={{ width: `${(done / total) * 100}%` }} /></span>}
+            </span>
+          </button>
+          <DeleteMissionButton mission={run} deletingId={deletingId} onDelete={onDelete} compact />
+        </div>;
+      })}
+    </div>)}</div>}
   </section>;
 }

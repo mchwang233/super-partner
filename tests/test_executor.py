@@ -11,8 +11,15 @@ from super_partner.db import Database
 from super_partner.executor import Executor
 from super_partner.models import ExecutionRun, NodeStatus, RunStatus, TaskNode, TaskPlan
 from super_partner.planner import heuristic_plan
-from super_partner.providers import ProviderError, ProviderRegistry, ProviderResult
+from super_partner.providers import ProviderRegistry, ProviderResult
+from super_partner.quota import ModelUnavailable
 from super_partner.routing import estimate, route_node
+
+
+@pytest.fixture(autouse=True)
+def execution_only(monkeypatch):
+    # Scheduler doubles do not supply reviewers; acceptance is tested in test_quality.py.
+    monkeypatch.setattr(settings, "review_nodes", False)
 
 
 @pytest.mark.asyncio
@@ -21,6 +28,8 @@ async def test_mock_execution_completes(tmp_path: Path):
     catalog = builtin_models()
     plan = heuristic_plan("Research and implement a small feature")
     for node in plan.nodes:
+        # As the API does, lower thresholds the only model (the demo, at 80) cannot reach.
+        node.quality_threshold = min(node.quality_threshold, 80)
         route_node(node, catalog, {"mock:local"})
     plan.estimate = estimate(plan.nodes, 1)
     run = ExecutionRun(id="demo", prompt="demo", status=RunStatus.QUEUED, plan=plan, budget_usd=1)
@@ -204,8 +213,9 @@ async def test_provider_gives_up_after_max_attempts(monkeypatch):
     providers = ProviderRegistry()
     providers.retry_base_delay = 0
     providers.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
-    with pytest.raises(ProviderError, match="500"):
+    with pytest.raises(ModelUnavailable, match="500"):
         await providers.complete("deepseek:deepseek-chat", "hello")
+    assert providers.quota.exhausted("deepseek:deepseek-chat")
     await providers.client.aclose()
 
 

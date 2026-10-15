@@ -31,3 +31,7 @@ secrets.json
 *.swo
 .agents/
 .codex/
+.claude/
+
+# Generated EDA tool output from local diagnostics
+/verdiLog/

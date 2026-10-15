@@ -57,7 +57,7 @@ function mission(id, status) {
   };
 }
 
-async function setup(t, records = [mission("finished-task", "succeeded"), mission("running-task", "running")]) {
+async function setup(t, records = [mission("finished-task", "succeeded"), mission("running-task", "running")], models = [], { openComposer = true } = {}) {
   const dom = new JSDOM('<div id="root"></div>', {
     url: "http://127.0.0.1:5173", runScripts: "outside-only", pretendToBeVisual: true,
   });
@@ -67,8 +67,8 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
     constructor() { super(); channels.push(this); }
   };
   const state = {
-    records,
-    deletes: [], cancels: [], nativeConfirms: 0, holdNextRead: false, releaseRead: null,
+    records, models, actions: [], resumes: [], publishes: [], uploads: [], attachmentDeletes: [], taskBodies: [],
+    deletes: [], cancels: [], confirms: [], taskPosts: 0, quota: [], quotaResets: [], nativePicker: true, pickerStarts: [], nativeConfirms: 0, holdNextRead: false, releaseRead: null,
   };
   const json = value => new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
   state.deleteResponse = async id => {
@@ -89,15 +89,72 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
   state.poll = () => [...polls.values()][0]();
   window.fetch = async (url, options = {}) => {
     const path = new URL(url).pathname;
+    if (path.startsWith("/api/models/quota")) {
+      if (options.method === "DELETE") {
+        const id = decodeURIComponent(path.slice("/api/models/quota/".length));
+        state.quotaResets.push(id);
+        state.quota = state.quota.filter(item => item.model_id !== id);
+      }
+      return json(state.quota);
+    }
     if (options.method === "POST" && path.endsWith("/cancel")) {
       const id = decodeURIComponent(path.slice("/api/tasks/".length, -"/cancel".length));
       state.cancels.push(id);
       return state.cancelResponse(id, options.signal);
     }
+    if (options.method === "POST" && (path.endsWith("/pause") || path.endsWith("/diagnose"))) {
+      const action = path.endsWith("/pause") ? "pause" : "diagnose";
+      const id = decodeURIComponent(path.split("/")[3]);
+      state.actions.push([action, id]);
+      const current = state.records.find(run => run.id === id);
+      const updated = action === "pause" ? { ...current, status: "paused" }
+        : { ...current, diagnoses: [...(current.diagnoses ?? []), { id: "d9", trigger: "manual", model_id: "cli:claude", status: "running", created_at: "2026-10-14T07:00:00Z" }] };
+      state.records = state.records.map(run => run.id === id ? updated : run);
+      return json(updated);
+    }
+    if (options.method === "POST" && path.endsWith("/resume")) {
+      const id = decodeURIComponent(path.slice("/api/tasks/".length, -"/resume".length));
+      const body = JSON.parse(options.body);
+      state.resumes.push({ id, ...body });
+      const updated = { ...state.records.find(run => run.id === id), status: "queued", budget_usd: body.budget_usd };
+      state.records = state.records.map(run => run.id === id ? updated : run);
+      return json(updated);
+    }
+    if (options.method === "POST" && path.endsWith("/confirm")) {
+      const id = decodeURIComponent(path.slice("/api/tasks/".length, -"/confirm".length));
+      const body = JSON.parse(options.body);
+      state.confirms.push({ id, ...body });
+      const updated = { ...state.records.find(run => run.id === id), status: "queued", budget_usd: body.budget_usd };
+      state.records = state.records.map(run => run.id === id ? updated : run);
+      return json(updated);
+    }
+    if (path === "/api/attachments" && options.method === "POST") {
+      const name = new URL(url).searchParams.get("name");
+      const id = `att${state.uploads.length + 1}`.padEnd(32, "0");
+      state.uploads.push(name);
+      return new Response(JSON.stringify({ id, name, size: options.body.size, kind: "image", media_type: "image/png" }), { status: 201 });
+    }
+    if (path.startsWith("/api/attachments/") && options.method === "DELETE") {
+      state.attachmentDeletes.push(path.split("/")[3]);
+      return new Response(null, { status: 204 });
+    }
     if (options.method === "DELETE") {
       const id = decodeURIComponent(path.slice("/api/tasks/".length));
       state.deletes.push(id);
       return state.deleteResponse(id, options.signal);
+    }
+    if (path === "/api/tasks" && options.method === "POST") { state.taskPosts++; state.taskBodies.push(JSON.parse(options.body)); return json(state.records[0]); }
+    if (path === "/api/projects/discover") return json({ projects: [{ name: "shop", path: "/home/me/prj/shop" }], truncated: false });
+    if (path === "/api/projects/inspect") {
+      const target = new URL(url).searchParams.get("path");
+      return target.startsWith("/home/me/")
+        ? json({ path: target, git: true, branch: "main", uncommitted_files: 2 })
+        : new Response(JSON.stringify({ detail: "Project directory must be inside an allowed root" }), { status: 400 });
+    }
+    if (path === "/api/projects/native-picker") {
+      if (options.method !== "POST") return json({ available: state.nativePicker });
+      state.pickerStarts.push(new URL(url).searchParams.get("start"));
+      return json({ path: "/home/me/prj/picked" });
     }
     if (path === "/api/tasks") {
       const response = json(state.records);
@@ -107,8 +164,21 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
       }
       return response;
     }
-    if (path === "/api/models" || path === "/api/providers") return json([]);
-    if (path === "/api/projects/native-picker") return json({ available: false });
+    if (path.endsWith("/timeline")) return json(state.timeline ?? []);
+    if (path.endsWith("/files/content")) {
+      const file = new URL(url).searchParams.get("path");
+      return json({ path: file, text: file.endsWith(".md") ? "## 玩法\n- 方向键移动" : `content of ${file}` });
+    }
+    if (path.endsWith("/files")) return json({ root: "/work/finished-task", in_project: false, files: [{ path: "tetris/index.html", size: 8423 }, { path: "tetris/game.js", size: 50291 }, { path: "tetris/README.md", size: 900 }], github_url: state.githubUrl ?? null });
+    if (path === "/api/github") return json({ token: state.githubToken ?? true, git: true });
+    if (path === "/api/github/token" && options.method === "PUT") { state.githubToken = true; return json({ stored: "keyring" }); }
+    if (path.endsWith("/github") && options.method === "POST") {
+      state.publishes.push(JSON.parse(options.body));
+      state.githubUrl = "https://github.com/me/tetris";
+      return json({ url: state.githubUrl });
+    }
+    if (path === "/api/models") return json(state.models);
+    if (path === "/api/providers") return json([]);
     throw new Error(`Unexpected request: ${path}`);
   };
   window.eval(browserCode);
@@ -127,6 +197,8 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
     await act(async () => { target.focus(); target.click(); });
   };
   const escape = () => act(async () => dialog().dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+  // The new-task form is folded behind the header button once tasks exist; most tests use it.
+  if (openComposer && !document.querySelector(".composer")) await click(document.querySelector("header .new-task"));
   return { state, window, document, act, dialog, button, click, escape };
 }
 
@@ -146,14 +218,14 @@ test("native dialogs unavailable: list/detail clicks open confirmation, cancel p
   assert.equal(dialog(), null);
   assert.deepEqual(state.deletes, []);
 
-  await click(document.querySelector(".run"));
+  await click([...document.querySelectorAll(".run")].find(run => run.title === "finished-task"));
   await click(button("删除任务记录", document.querySelector(".detail")));
   await click(button("确认删除", dialog()));
   assert.deepEqual(state.deletes, ["finished-task"]);
   assert.equal(dialog(), null);
   assert.equal(document.querySelectorAll(".run-entry").length, 1);
   assert.doesNotMatch(document.querySelector(".mission-history").textContent, /finished-task/);
-  assert.match(document.querySelector(".detail").textContent, /Select a mission/);
+  assert.match(document.querySelector(".detail").textContent, /在左侧选择一个任务/);
   assert.equal(state.nativeConfirms, 0);
 });
 
@@ -236,8 +308,8 @@ for (const status of ["awaiting_confirmation", "queued", "running", "paused"]) {
     const { state, document, dialog, button, click, escape } = await setup(t, [
       mission("finished-task", "succeeded"), mission("target-task", status),
     ]);
-    await click(document.querySelectorAll(".run")[1]);
-    const cancel = button("Cancel mission");
+    await click([...document.querySelectorAll(".run")].find(run => run.title === "target-task"));
+    const cancel = button("取消任务");
     await click(cancel);
     assert.match(dialog().textContent, /取消任务？/);
     assert.match(dialog().textContent, /target-task/);
@@ -259,11 +331,11 @@ for (const status of ["awaiting_confirmation", "queued", "running", "paused"]) {
     assert.equal(state.nativeConfirms, 0);
     assert.equal(dialog(), null);
     assert.equal(document.querySelectorAll(".run-entry").length, 2);
-    assert.match(document.querySelectorAll(".run-entry")[1].textContent, /cancelled/);
+    assert.match(document.querySelectorAll(".run-entry")[1].textContent, /已取消/);
     const detail = document.querySelector(".detail");
-    assert.equal(detail.querySelector(".pill").textContent, "cancelled");
+    assert.equal(detail.querySelector(".pill").textContent, "已取消");
     assert.ok(button("删除任务记录", detail));
-    assert.equal(button("Cancel mission"), undefined);
+    assert.equal(button("取消任务"), undefined);
     assert.equal(state.records[0].status, "succeeded");
   });
 }
@@ -273,8 +345,8 @@ test("pending cancellation blocks repeated clicks; server failure stays visible 
   const cancelResponse = state.cancelResponse;
   let complete;
   state.cancelResponse = () => new Promise(resolve => { complete = resolve; });
-  await click(document.querySelectorAll(".run")[1]);
-  await click(button("Cancel mission"));
+  await click([...document.querySelectorAll(".run")].find(run => run.title === "running-task"));
+  await click(button("取消任务"));
   await click(button("确认取消", dialog()));
   assert.equal(dialog().getAttribute("aria-busy"), "true");
   assert.match(dialog().textContent, /正在取消/);
@@ -285,51 +357,52 @@ test("pending cancellation blocks repeated clicks; server failure stays visible 
   assert.equal(state.cancels.length, 1);
   await act(async () => complete(new Response(JSON.stringify({ detail: "取消服务暂时不可用" }), { status: 503 })));
   assert.match(dialog().querySelector('[role="alert"]').textContent, /取消服务暂时不可用/);
-  assert.equal(document.querySelector(".detail .pill").textContent, "running");
+  assert.equal(document.querySelector(".detail .pill").textContent, "运行中");
   assert.ok(!button("确认取消", dialog()).disabled);
   state.cancelResponse = cancelResponse;
   await click(button("确认取消", dialog()));
   assert.equal(dialog(), null);
   assert.equal(state.cancels.length, 2);
-  assert.equal(document.querySelector(".detail .pill").textContent, "cancelled");
+  assert.equal(document.querySelector(".detail .pill").textContent, "已取消");
 });
 
 test("a poll started before cancellation cannot restore the running status", async t => {
   const { state, act, document, dialog, button, click } = await setup(t);
-  await click(document.querySelectorAll(".run")[1]);
+  await click([...document.querySelectorAll(".run")].find(run => run.title === "running-task"));
   state.holdNextRead = true;
   await act(async () => { state.poll(); });
   assert.equal(typeof state.releaseRead, "function");
-  await click(button("Cancel mission"));
+  await click(button("取消任务"));
   await click(button("确认取消", dialog()));
   await act(async () => state.releaseRead());
-  assert.equal(document.querySelector(".detail .pill").textContent, "cancelled");
-  assert.match(document.querySelectorAll(".run-entry")[1].textContent, /cancelled/);
+  assert.equal(document.querySelector(".detail .pill").textContent, "已取消");
+  assert.match(document.querySelectorAll(".run-entry")[1].textContent, /已取消/);
   await act(async () => state.poll());
-  assert.equal(document.querySelector(".detail .pill").textContent, "cancelled");
+  assert.equal(document.querySelector(".detail .pill").textContent, "已取消");
 });
 
 test("a task finishing while confirmation is open shows the server conflict without claiming cancellation", async t => {
   const { state, act, document, dialog, button, click } = await setup(t);
-  await click(document.querySelectorAll(".run")[1]);
-  await click(button("Cancel mission"));
+  await click([...document.querySelectorAll(".run")].find(run => run.title === "running-task"));
+  await click(button("取消任务"));
   state.records[1] = mission("running-task", "succeeded");
   await act(async () => state.poll());
   state.cancelResponse = async () => new Response(JSON.stringify({ detail: "Task has already finished" }), { status: 409 });
   await click(button("确认取消", dialog()));
   assert.match(dialog().querySelector('[role="alert"]').textContent, /Task has already finished/);
-  assert.equal(document.querySelector(".detail .pill").textContent, "succeeded");
-  assert.match(document.querySelector(".detail .result").textContent, /Completed output/);
+  assert.equal(document.querySelector(".detail .pill").textContent, "已完成");
+  // Finishing switches the task page to its result.
+  assert.match(document.querySelector(".detail .result-text").textContent, /Completed output/);
 });
 
 test("cancellation network failure is visible and preserves the task", async t => {
   const { state, window, document, dialog, button, click } = await setup(t);
   state.cancelResponse = async () => { throw new window.TypeError("Failed to fetch"); };
-  await click(document.querySelectorAll(".run")[1]);
-  await click(button("Cancel mission"));
+  await click([...document.querySelectorAll(".run")].find(run => run.title === "running-task"));
+  await click(button("取消任务"));
   await click(button("确认取消", dialog()));
   assert.match(dialog().querySelector('[role="alert"]').textContent, /Failed to fetch/);
-  assert.equal(document.querySelector(".detail .pill").textContent, "running");
+  assert.equal(document.querySelector(".detail .pill").textContent, "运行中");
   assert.ok(!button("确认取消", dialog()).disabled);
 });
 
@@ -344,11 +417,541 @@ test("cancellation timeout offers recovery and leaves the status unchanged until
   state.cancelResponse = (_, signal) => new Promise((resolve, reject) => {
     signal.addEventListener("abort", () => reject(new window.DOMException("Aborted", "AbortError")), { once: true });
   });
-  await click(document.querySelectorAll(".run")[1]);
-  await click(button("Cancel mission"));
+  await click([...document.querySelectorAll(".run")].find(run => run.title === "running-task"));
+  await click(button("取消任务"));
   await click(button("确认取消", dialog()));
   await act(async () => expire());
   assert.match(dialog().querySelector('[role="alert"]').textContent, /取消请求超时，请检查任务状态后重试/);
-  assert.equal(document.querySelector(".detail .pill").textContent, "running");
+  assert.equal(document.querySelector(".detail .pill").textContent, "运行中");
   assert.ok(!button("确认取消", dialog()).disabled);
+});
+
+test("the newest mission opens by default instead of an empty detail panel", async t => {
+  const { document } = await setup(t);
+  assert.equal(document.querySelector(".detail h3").textContent, "finished-task");
+  assert.equal(document.querySelector(".run.active").textContent.includes("finished-task"), true);
+});
+
+test("confirming uses the budget entered on the mission, not the new-task form", async t => {
+  const { state, window, document, act, button, click } = await setup(t, [mission("draft-task", "awaiting_confirmation")]);
+  const setValue = async (input, value) => act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set.call(input, value);
+    input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await setValue(document.querySelector(".composer .budget-field input"), "9");
+  await setValue(document.querySelector(".detail .budget-field input"), "5");
+  await click(button("确认并开始执行"));
+  assert.deepEqual(state.confirms, [{ id: "draft-task", budget_usd: 5 }]);
+  assert.equal(document.querySelector(".detail .pill").textContent, "排队中");
+});
+
+const settle = (act, ms) => act(() => new Promise(resolve => setTimeout(resolve, ms)));
+
+test("project field suggests local git projects and reports the chosen project's git state", async t => {
+  const { window, document, act, click } = await setup(t);
+  const input = document.querySelector('input[aria-label="项目目录"]');
+  await act(async () => { input.focus(); input.click(); });
+  await settle(act, 0);
+  const menu = document.querySelector(".project-menu");
+  assert.match(menu.textContent, /本机 git 项目/);
+  await click([...menu.querySelectorAll(".project-option")].find(node => node.textContent.includes("shop")));
+  assert.equal(input.value, "/home/me/prj/shop");
+  assert.equal(document.querySelector(".project-menu"), null);
+  await settle(act, 400);
+  assert.match(document.querySelector(".project-status").textContent, /分支 main.*2 个未提交改动/);
+});
+
+test("a path outside the allowed roots is flagged before the task is submitted", async t => {
+  const { window, document, act } = await setup(t);
+  const input = document.querySelector('input[aria-label="项目目录"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set.call(input, "/etc");
+    input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await settle(act, 400);
+  assert.match(document.querySelector(".project-status.bad").textContent, /allowed root/);
+});
+
+test("one browse button opens the desktop folder dialog at the current folder", async t => {
+  const { state, window, document, act, button, click } = await setup(t);
+  await settle(act, 0);
+  const input = document.querySelector('input[aria-label="项目目录"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set.call(input, "/home/me/prj/shop");
+    input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  assert.equal([...document.querySelectorAll(".project-field button")].filter(node => /浏览|系统/.test(node.textContent)).length, 1);
+  await click(button("浏览…"));
+  await settle(act, 0);
+  assert.deepEqual(state.pickerStarts, ["/home/me/prj/shop"]);
+  assert.equal(input.value, "/home/me/prj/picked");
+  assert.equal(state.taskPosts, 0);
+});
+
+test("the model list opens from the task form and closes on Escape or an outside click", async t => {
+  const { state, window, document, act, click } = await setup(t);
+  const fab = () => document.querySelector(".composer .fleet-trigger");
+  assert.equal(fab().getAttribute("aria-expanded"), "false");
+  assert.equal(document.querySelector(".fleet"), null);
+  assert.equal(document.querySelector(".grid .fleet"), null);
+  await click(fab());
+  assert.ok(document.querySelector('.fleet[role="dialog"]'));
+  await act(async () => window.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape" })));
+  assert.equal(document.querySelector(".fleet"), null);
+  await click(fab());
+  await act(async () => document.querySelector(".detail").dispatchEvent(new window.MouseEvent("mousedown", { bubbles: true })));
+  assert.equal(document.querySelector(".fleet"), null);
+  // Inside the task form, the list's own buttons must never submit a task.
+  await click(fab());
+  assert.ok([...document.querySelectorAll(".fleet button")].every(node => node.type === "button"));
+  await click(document.querySelector(".fleet-profiles-link"));
+  assert.equal(state.taskPosts, 0);
+});
+
+test("opening the model page is not remembered across reloads", async t => {
+  const { window, document, click } = await setup(t);
+  const nav = label => [...document.querySelectorAll(".app-nav button")].find(node => node.textContent.startsWith(label));
+  await click(nav("模型画像"));
+  assert.equal(nav("模型画像").getAttribute("aria-pressed"), "true");
+  assert.notEqual(window.location.hash, "#models");
+  assert.match(window.location.hash, /^#task=/);
+});
+
+test("the plan shows stages, dependencies, parallel work and each task's model", async t => {
+  const node = (id, deps, model_id = "cli:claude", difficulty = "normal") => ({
+    id, title: `Task ${id}`, instructions: "", capability: "coding", dependencies: deps,
+    model_id, status: "pending", estimated_cost_usd: 0, difficulty,
+    quality_threshold: { easy: 70, normal: 80, hard: 90 }[difficulty],
+  });
+  const run = mission("planned", "awaiting_confirmation");
+  run.plan.nodes = [node("a", [], "cli:claude", "hard"), node("b", ["a"]), node("c", ["a"], "kimi:k3"), node("d", ["b", "c"], "cli:claude", "easy")];
+  run.plan.nodes[2].routing_note = "子任务优先用 API 模型，在达标的 API 模型中选最便宜的。代码 88 ≥ 门槛 80。";
+  const scores = { coding: 96.7, planning: 96, research: 93.8, chinese: 97, tool_use: 97.6, structured_output: 96, reliability: 88.8 };
+  const models = [{ id: "cli:claude", provider: "anthropic", display_name: "Claude Code CLI", channel: "cli", enabled: true, configured: true, scores, scores_basis: "按 AA 换算" }];
+  const { document, click } = await setup(t, [run], models);
+
+  assert.match(document.querySelector(".plan-summary").textContent, /4 个子任务.*3 个阶段.*最多 2 项可并行/);
+  const stages = [...document.querySelectorAll(".plan-stage")];
+  assert.deepEqual(stages.map(stage => stage.querySelectorAll(".plan-node").length), [1, 2, 1]);
+  assert.match(stages[1].querySelector(".plan-stage-mode").textContent, /2 项并行/);
+  // Cards keep one status line; dependencies are drawn as lines and listed in the drawer.
+  assert.ok(document.querySelector(".plan-board svg.plan-links"));
+  assert.deepEqual([...document.querySelectorAll(".plan-node .plan-check")].map(line => line.textContent), ["可以开始", "等待 01", "等待 01", "等待 02、03"]);
+  assert.equal(document.querySelector(".plan-difficulty"), null);
+  await click(stages[2].querySelector(".plan-node-title"));
+  const drawer = document.querySelector(".node-progress.drawer");
+  assert.deepEqual([...drawer.querySelectorAll(".plan-deps i")].map(i => i.textContent), ["02", "03"]);
+  assert.match(drawer.querySelector(".node-progress-facts").textContent, /简单 · 门槛 70/);
+  await click(drawer.querySelector('[aria-label="关闭进行情况"]'));
+  // The model chip opens its capability chart; the profile link goes to the model page.
+  const chips = [...document.querySelectorAll(".plan-model")];
+  assert.equal(chips[0].textContent, "Claude Code CLI");
+  assert.equal(chips[2].textContent, "kimi:k3");
+  assert.ok(chips.every(chip => chip.type === "button"));
+  await click(chips[0]);
+  const dialog = document.querySelector(".model-capability-modal");
+  assert.ok(dialog.querySelector(".profile-radar svg"));
+  assert.match(dialog.querySelector(".capability-scores").textContent, /代码97/);
+  assert.match(dialog.querySelector(".selection-reason").textContent, /困难任务.*代码分最高.*代码 97 ≥ 门槛 90/);
+  assert.match(chips[2].title, /一般任务：子任务优先用 API 模型/);
+  await click(dialog.querySelector(".capability-profile-link"));
+  assert.equal(document.querySelector(".model-capability-modal"), null);
+  assert.equal([...document.querySelectorAll(".app-nav button")].find(b => b.textContent.startsWith("模型画像")).getAttribute("aria-pressed"), "true");
+});
+
+test("the budget accepts round amounts such as 2 and can be cleared while typing", async t => {
+  const { window, document, act } = await setup(t);
+  const input = document.querySelector(".composer .budget-field input");
+  const type = async value => act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set.call(input, value);
+    input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  for (const amount of ["2", "3", "0.3", "1.25", "10"]) {
+    await type(amount);
+    assert.equal(input.value, amount);
+    assert.ok(input.checkValidity(), `${amount} should be a valid budget`);
+  }
+  await type("");
+  assert.equal(input.value, "");
+  assert.ok(document.querySelector(".composer button.primary").disabled);
+  await type("2");
+  assert.equal(input.value, "2");
+  assert.ok(!document.querySelector(".composer button.primary").disabled);
+});
+
+test("files can be attached by picking, pasting or dropping, and are sent with the task", async t => {
+  const { state, window, document, act, click } = await setup(t);
+  const file = (name, type = "image/png") => new window.File([new Uint8Array([137, 80, 78, 71])], name, { type });
+  const settle = () => act(async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  const picker = document.querySelector('.composer input[type="file"]');
+  assert.ok(document.querySelector(".attach-button"));
+  await act(async () => {
+    Object.defineProperty(picker, "files", { configurable: true, value: [file("screen.png"), file("spec.md", "text/markdown")] });
+    picker.dispatchEvent(new window.Event("change", { bubbles: true }));
+  });
+  await settle();
+  const textarea = document.querySelector(".composer textarea");
+  const paste = new window.Event("paste", { bubbles: true, cancelable: true });
+  paste.clipboardData = { files: [file("")] };
+  await act(async () => textarea.dispatchEvent(paste));
+  const drop = new window.Event("drop", { bubbles: true, cancelable: true });
+  drop.dataTransfer = { files: [file("dropped.png")], types: ["Files"] };
+  await act(async () => document.querySelector(".composer form").dispatchEvent(drop));
+  await settle();
+
+  assert.deepEqual(state.uploads, ["screen.png", "spec.md", "粘贴的图片.png", "dropped.png"]);
+  const chips = () => [...document.querySelectorAll(".composer .attachment-chip")];
+  assert.equal(chips().length, 4);
+  assert.ok(chips().every(chip => chip.classList.contains("ready")));
+  await click(chips()[1].querySelector(".attachment-remove"));
+  assert.equal(chips().length, 3);
+  assert.equal(state.attachmentDeletes.length, 1);
+
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(textarea, "Fix the layout in the screenshot");
+    textarea.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await act(async () => document.querySelector(".composer form").requestSubmit());
+  await settle();
+  assert.equal(state.taskBodies.length, 1);
+  assert.equal(state.taskBodies[0].attachments.length, 3);
+  assert.equal(chips().length, 0);
+});
+
+test("each task shows its check result, and clicking it shows its progress", async t => {
+  const run = mission("checked", "running");
+  run.rework_rounds = 1;
+  run.plan.nodes = [
+    { id: "impl", title: "Implement", capability: "coding", dependencies: [], model_id: "cli:codex", status: "succeeded", estimated_cost_usd: 0,
+      acceptance_criteria: "login.py is changed", review_passed: true, review: "Change is in place.", changed_files: ["login.py", "tests/test_login.py"],
+      result: "Edited login.py",
+      attempts: [
+        { model_id: "cli:codex", outcome: "rejected", reason: "Only described the fix.", reviewer_model_id: "cli:claude", cost_usd: 0 },
+        { model_id: "cli:claude", outcome: "passed", reason: "Change is in place.", reviewer_model_id: "cli:codex", cost_usd: 0 },
+      ] },
+    { id: "check", title: "Verify", capability: "coding", dependencies: ["impl"], verifies: ["impl"], model_id: "cli:claude", status: "running", estimated_cost_usd: 0,
+      feedback: "tests still fail", inputs: [{ node_id: "impl", form: "summary", changed_files: 2 }], started_at: new Date(Date.now() - 65000).toISOString(),
+      attempts: [{ model_id: "cli:claude", outcome: "verify_failed", reason: "验证发现问题：tests still fail", cost_usd: 0 }] },
+  ];
+  const at = "2026-10-14T07:00:00Z";
+  const timeline = [
+    { id: 1, kind: "node.started", data: { node_id: "impl", model_id: "cli:codex", attempt: 1 }, created_at: at },
+    { id: 2, kind: "node.retry", data: { node_id: "impl", attempt: 2, model_id: "cli:claude", reason: "Only described the fix." }, created_at: at },
+    { id: 3, kind: "node.succeeded", data: { node_id: "impl", cost_usd: 0 }, created_at: at },
+    { id: 4, kind: "run.rework", data: { round: 1, verifier: "check", reopened: ["impl", "check"], problems: "tests still fail" }, created_at: at },
+    { id: 5, kind: "node.started", data: { node_id: "check", attempt: 2 }, created_at: at },
+  ];
+  const { state, document, click } = await setup(t, [run]);
+  state.timeline = timeline;
+  assert.match(document.querySelector(".plan-summary").textContent, /重试 1 次.*返工 1 轮/);
+  // Stages run left to right.
+  assert.deepEqual([...document.querySelectorAll(".plan-stage .plan-stage-head b")].map(b => b.textContent), ["阶段 1", "阶段 2"]);
+  const [impl, check] = [...document.querySelectorAll(".plan-node")];
+  assert.equal(impl.querySelector(".plan-check").textContent, "✓ 验收通过");
+  assert.match(check.querySelector(".plan-check").textContent, /↻ 第 2 次尝试中/);
+  assert.equal(document.querySelector(".node-progress"), null);
+
+  await click(impl.querySelector(".plan-node-title"));
+  let panel = document.querySelector(".node-progress");
+  assert.match(panel.querySelector("h4").textContent, /Implement/);
+  assert.match(panel.querySelector(".node-progress-now").textContent, /已完成/);
+  assert.deepEqual([...panel.querySelectorAll(".node-progress-timeline li span")].map(li => li.textContent), [
+    "开始第 1 次执行（cli:codex）", "未通过，准备第 2 次尝试（换用 cli:claude）：Only described the fix.", "完成 · $0",
+    "被 02 退回返工（第 1 轮）：tests still fail",
+  ]);
+  assert.match(panel.textContent, /login\.py is changed/);
+  assert.match(panel.textContent, /改动的文件（2）/);
+  assert.deepEqual([...panel.querySelectorAll(".plan-attempts b")].map(b => b.textContent), ["第 1 次 · 验收未通过", "第 2 次 · 通过"]);
+  assert.equal(panel.querySelector(".node-progress-output .markdown-body").textContent, "Edited login.py");
+
+  await click(check);
+  panel = document.querySelector(".node-progress");
+  assert.match(panel.querySelector(".node-progress-now").textContent, /第 2 次执行中 · 已运行 1 分/);
+  assert.match(panel.textContent, /01 的摘要（改动 2 个文件）/);
+  assert.deepEqual([...panel.querySelectorAll(".plan-verifies i")].map(i => i.textContent), ["01"]);
+  assert.match(panel.textContent, /需要修改tests still fail/);
+  assert.match(panel.querySelector(".node-progress-timeline").textContent, /验证未通过，第 1 轮返工/);
+  await click(panel.querySelector('[aria-label="关闭进行情况"]'));
+  assert.equal(document.querySelector(".node-progress"), null);
+});
+
+test("a failed task continues from the failed step with the budget entered there", async t => {
+  const run = mission("broken", "failed");
+  run.error = "1 个步骤失败：Verify（node --check needs approval）";
+  run.plan.nodes = [
+    { id: "a", title: "Implement", dependencies: [], model_id: "cli:codex", status: "succeeded", estimated_cost_usd: 0 },
+    { id: "b", title: "Verify", dependencies: ["a"], model_id: "cli:claude", status: "failed", estimated_cost_usd: 0 },
+  ];
+  const { state, window, document, act, click } = await setup(t, [run]);
+  const bar = document.querySelector(".resume-bar");
+  assert.match(bar.textContent, /「Verify」 失败.*已完成的 1 个步骤保留/);
+  const input = bar.querySelector("input");
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set.call(input, "3");
+    input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await click([...bar.querySelectorAll("button")].find(b => b.textContent === "从失败处继续"));
+  assert.deepEqual(state.resumes, [{ id: "broken", budget_usd: 3 }]);
+  assert.equal(document.querySelector(".resume-bar"), null);
+});
+
+test("a finished task opens on its result tab with files, ZIP download and GitHub upload", async t => {
+  const { state, window, document, act, click } = await setup(t);
+  const tab = label => [...document.querySelectorAll(".task-tabs button")].find(b => b.textContent === label);
+  assert.equal(tab("结果").getAttribute("aria-pressed"), "true");
+  const page = document.querySelector(".detail .result-page.embedded");
+  assert.ok(page);
+  assert.match(page.querySelector(".result-text").textContent, /Completed output/);
+  const zip = [...page.querySelectorAll("a")].find(a => a.textContent.includes("另存为 ZIP"));
+  assert.ok(zip.getAttribute("href").endsWith("/api/tasks/finished-task/archive") && zip.hasAttribute("download"));
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  assert.match(page.querySelector(".result-location").textContent, /\/work\/finished-task/);
+
+  await click([...page.querySelectorAll(".result-tabs button")].find(b => b.textContent.startsWith("文件")));
+  assert.match(page.querySelector(".result-tabs").textContent, /文件（3）/);
+  await click([...page.querySelectorAll(".result-file-list button")][1]);
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  assert.equal(page.querySelector(".result-file-view pre").textContent, "content of tetris/game.js");
+
+  await click([...page.querySelectorAll("button")].find(b => b.textContent === "上传到 GitHub"));
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  const dialog = document.querySelector(".github-modal");
+  const name = dialog.querySelector('[aria-label="仓库名"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set.call(name, "tetris");
+    name.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  const submit = [...dialog.querySelectorAll("button")].find(b => b.textContent === "创建私有仓库并上传");
+  await click(submit);
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  assert.deepEqual(state.publishes, [{ name: "tetris", private: true, description: "finished-task" }]);
+  assert.match(document.querySelector(".github-done").textContent, /github\.com\/me\/tetris/);
+  await click([...document.querySelectorAll(".github-done button")][0]);
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  assert.match(document.querySelector(".result-published").textContent, /github\.com\/me\/tetris/);
+
+  await click(tab("进度"));
+  assert.equal(document.querySelector(".result-page"), null);
+  assert.ok(document.querySelector(".detail .plan-graph") || document.querySelector(".detail .task-tabs"));
+  await click([...document.querySelectorAll(".task-actions button")].find(b => b.textContent === "查看结果"));
+  assert.ok(document.querySelector(".detail .result-page"));
+});
+
+test("without a saved token the GitHub dialog asks for one or for an existing repository", async t => {
+  const { state, window, document, act, click } = await setup(t);
+  state.githubToken = false;
+  await click([...document.querySelectorAll(".result-page button")].find(b => b.textContent === "上传到 GitHub"));
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  const dialog = document.querySelector(".github-modal");
+  assert.ok(dialog.querySelector('[aria-label="GitHub 令牌"]'));
+  assert.ok([...dialog.querySelectorAll("button")].find(b => b.textContent.includes("创建")).disabled);
+  await click([...dialog.querySelectorAll("label")].find(l => l.textContent.includes("已建好的空仓库")).querySelector("input"));
+  const remote = dialog.querySelector('[aria-label="仓库地址"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set.call(remote, "git@github.com:me/empty.git");
+    remote.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await click([...dialog.querySelectorAll("button")].find(b => b.textContent === "推送"));
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  assert.deepEqual(state.publishes, [{ remote: "git@github.com:me/empty.git" }]);
+});
+
+test("the sidebar groups tasks by what they need and folds into a rail it remembers", async t => {
+  const withNodes = (run, statuses) => { run.plan.nodes = statuses.map((status, index) => ({ id: `n${index}`, title: `N${index}`, dependencies: [], model_id: "cli:codex", status, estimated_cost_usd: 0 })); return run; };
+  const { window, document, click } = await setup(t, [
+    withNodes(mission("build-task", "running"), ["succeeded", "running"]), mission("plan-task", "awaiting_confirmation"),
+    mission("broken-task", "failed"), mission("finished-task", "succeeded"),
+  ], [], { openComposer: false });
+  const groups = [...document.querySelectorAll(".run-group")];
+  assert.deepEqual(groups.map(group => group.querySelector(".run-group-title").textContent), ["进行中1", "需要处理2", "已结束1"]);
+  assert.match(groups[0].querySelector(".run small").textContent, /运行中 · 1\/2/);
+  assert.equal(window.document.title, "● (2) Super Partner");
+
+  await click(document.querySelector('.mission-history [title="收起任务栏"]'));
+  assert.ok(document.querySelector(".workbench").classList.contains("history-collapsed"));
+  const dots = [...document.querySelectorAll(".history-rail .rail-run")];
+  assert.equal(dots.length, 4);
+  assert.match(dots[2].title, /broken-task · 失败/);
+  await click(dots[2]);
+  assert.match(document.querySelector(".detail h3").textContent, /broken-task/);
+  assert.equal(window.localStorage.getItem("super-partner.history"), "collapsed");
+  await click(document.querySelector('.mission-history [title="展开任务栏"]'));
+  assert.ok(document.querySelector(".mission-history .run-list"));
+  assert.equal(window.localStorage.getItem("super-partner.history"), "open");
+});
+
+test("the new-task form stays folded behind the header button once tasks exist", async t => {
+  const { document, click } = await setup(t, undefined, [], { openComposer: false });
+  assert.equal(document.querySelector(".composer"), null);
+  const open = document.querySelector("header .new-task");
+  await click(open);
+  assert.ok(document.querySelector(".composer textarea"));
+  await click(document.querySelector('.composer [aria-label="收起新任务"]'));
+  assert.equal(document.querySelector(".composer"), null);
+});
+
+test("with no tasks the new-task form is open and cannot be folded away", async t => {
+  const { document } = await setup(t, [], [], { openComposer: false });
+  assert.ok(document.querySelector(".composer textarea"));
+  assert.equal(document.querySelector('.composer [aria-label="收起新任务"]'), null);
+});
+
+test("the task page shows its phase, progress and spend, and notices tell when a task finishes", async t => {
+  const run = mission("build-task", "running");
+  run.budget_usd = 2; run.actual_cost_usd = 0.5;
+  run.plan.nodes = [
+    { id: "a", title: "A", dependencies: [], model_id: "cli:codex", status: "succeeded", estimated_cost_usd: 0, started_at: new Date(Date.now() - 120000).toISOString() },
+    { id: "b", title: "B", dependencies: ["a"], model_id: "cli:codex", status: "running", estimated_cost_usd: 0 },
+  ];
+  const { state, window, document, act, click } = await setup(t, [run, mission("other-task", "succeeded")], [], { openComposer: false });
+  const steps = [...document.querySelectorAll(".task-steps li")];
+  assert.deepEqual(steps.map(step => step.className), ["done", "done", "current", "todo"]);
+  const metrics = document.querySelector(".task-metrics").textContent;
+  assert.match(metrics, /进度1 \/ 2/);
+  assert.match(metrics, /用时2 分/);
+  assert.match(metrics, /\$0\.5 \/ \$2\.00/);
+  assert.ok([...document.querySelectorAll(".task-actions button")].some(b => b.textContent === "取消任务"));
+
+  await click([...document.querySelectorAll(".run")].find(b => b.title === "other-task"));
+  state.records[0] = { ...run, status: "succeeded", final_result: "Built it" };
+  await act(async () => state.poll());
+  const toast = document.querySelector(".toast");
+  assert.match(toast.textContent, /「build-task」已完成/);
+  await click([...toast.querySelectorAll("button")].find(b => b.textContent === "查看"));
+  assert.match(document.querySelector(".detail h3").textContent, /build-task/);
+  assert.equal(document.querySelector(".toast"), null);
+  assert.equal(window.document.title, "Super Partner");
+});
+
+test("Markdown in results and .md files is previewed safely, with the source one click away", async t => {
+  const run = mission("doc-task", "succeeded");
+  run.final_result = "# 交付说明\n- 已完成 **全部** 功能\n- [ ] 待补充\n\n| 文件 | 行数 |\n|---|---|\n| game.js | 1365 |\n\n<script>window.hacked = true</script><b>raw</b>\n[危险链接](javascript:alert(1)) [文档](https://example.com/doc) [说明](tetris/README.md) [绝对路径](/work/finished-task/tetris/game.js)\n第一行\n第二行";
+  const { window, document, act, click } = await setup(t, [run], [], { openComposer: false });
+  const view = document.querySelector(".result-text");
+  const body = view.querySelector(".markdown-body");
+  assert.equal(body.querySelector("h1").textContent, "交付说明");
+  assert.equal(body.querySelector("li strong").textContent, "全部");
+  assert.ok(body.querySelector('li input[type="checkbox"]'));
+  assert.deepEqual([...body.querySelectorAll("td")].map(td => td.textContent), ["game.js", "1365"]);
+  assert.equal(body.querySelector("script"), null);
+  assert.equal(body.querySelector("b"), null);
+  assert.equal(window.hacked, undefined);
+  const links = [...body.querySelectorAll("a")];
+  assert.ok(links.every(link => !link.getAttribute("href")?.startsWith("javascript")));
+  assert.equal(links.find(link => link.textContent === "文档").getAttribute("target"), "_blank");
+  assert.ok(body.querySelector("br"), "single line breaks are kept");
+  // Links to the task's own files open them in the files tab.
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  await click(links.find(link => link.textContent === "绝对路径"));
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  assert.equal(document.querySelector(".result-file-name").textContent, "tetris/game.js");
+  await click([...document.querySelectorAll(".result-tabs button")].find(b => b.textContent === "最终结果"));
+  await click([...document.querySelector(".result-text").querySelectorAll("a")].find(link => link.textContent === "说明"));
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  assert.equal(document.querySelector(".result-file-name").textContent, "tetris/README.md");
+  await click([...document.querySelectorAll(".result-tabs button")].find(b => b.textContent === "最终结果"));
+  await click([...document.querySelector(".result-text").querySelectorAll(".markdown-toggle button")].find(b => b.textContent === "源码"));
+  assert.match(document.querySelector(".result-text pre").textContent, /^# 交付说明/);
+
+  const page = document.querySelector(".result-page");
+  await click([...page.querySelectorAll(".result-tabs button")].find(b => b.textContent.startsWith("文件")));
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  const file = name => [...page.querySelectorAll(".result-file-list button")].find(b => b.textContent.startsWith(name));
+  await click(file("tetris/README.md"));
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  assert.equal(page.querySelector(".result-file-view .markdown-body h2").textContent, "玩法");
+  await click(file("tetris/game.js"));
+  await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 0)); });
+  assert.equal(page.querySelector(".result-file-view .markdown-body"), null);
+  assert.equal(page.querySelector(".result-file-view pre").textContent, "content of tetris/game.js");
+});
+
+test("a running task can be paused and diagnosed, and the report shows its advice", async t => {
+  const run = mission("build-task", "running");
+  run.plan.nodes = [{ id: "a", title: "Check", dependencies: [], model_id: "cli:codex", status: "running", estimated_cost_usd: 0,
+    attempts: [{ model_id: "cli:codex", outcome: "error", reason: "node missing", cost_usd: 0 }] }];
+  const models = [{ id: "cli:claude", provider: "anthropic", display_name: "Claude Code CLI", channel: "cli", enabled: true, configured: true, scores: null }];
+  const { state, document, act, click } = await setup(t, [run], models, { openComposer: false });
+  const action = label => [...document.querySelectorAll(".task-actions button")].find(b => b.textContent === label);
+
+  await click(action("暂停"));
+  assert.deepEqual(state.actions, [["pause", "build-task"]]);
+  assert.equal(document.querySelector(".detail .pill").textContent, "已暂停");
+  assert.match(document.querySelector(".action-bar").textContent, /正在运行的 1 个步骤会跑完/);
+  assert.equal(action("暂停"), undefined);
+
+  await click(action("诊断"));
+  assert.deepEqual(state.actions[1], ["diagnose", "build-task"]);
+  assert.ok(action("诊断中…").disabled);
+  assert.match(document.querySelector(".diagnosis-card").textContent, /正在由 Claude Code CLI 分析/);
+
+  state.records[0] = { ...state.records[0], status: "failed", diagnoses: [
+    { id: "d1", trigger: "auto", node_id: "a", model_id: "cli:claude", status: "done", report: "## 根本原因\n缺少 node", advice: "先确认 node 可用", created_at: "2026-10-14T06:00:00Z" },
+    { id: "d2", trigger: "manual", model_id: "cli:claude", status: "failed", error: "CLI timed out", created_at: "2026-10-14T07:00:00Z" },
+  ] };
+  await act(async () => state.poll());
+  const card = () => document.querySelector(".diagnosis-card");
+  assert.match(card().textContent, /诊断没有完成：CLI timed out/);
+  await click(card().querySelector('[aria-label="上一次诊断"]'));
+  assert.match(card().textContent, /自动诊断 · Check/);
+  assert.equal(card().querySelector(".markdown-body h2").textContent, "根本原因");
+  assert.match(card().querySelector(".diagnosis-advice").textContent, /先确认 node 可用.*从失败处继续/);
+
+  // The environment could not be repaired: the task pauses with the report.
+  state.records[0] = { ...state.records[0], status: "paused", error: "步骤「Check」遇到需要你处理的问题，任务已暂停。", diagnoses: [
+    { id: "d3", trigger: "auto", node_id: "a", model_id: "cli:claude", status: "done", report: "缺少 node", advice: "先安装 node", verdict: "blocked", created_at: "2026-10-14T08:00:00Z" },
+  ] };
+  state.records[0].plan.nodes[0].status = "failed";
+  await act(async () => state.poll());
+  assert.match(card().querySelector(".diagnosis-verdict.warn").textContent, /Claude Code CLI 判断需要你先处理/);
+  assert.match(card().querySelector(".diagnosis-advice").textContent, /先安装 node.*按此预算继续/);
+  assert.match(document.querySelector(".action-bar").textContent, /遇到需要你处理的问题/);
+});
+
+
+test("models out of quota are listed until they reset, and can be put back by hand", async t => {
+  const models = [{ id: "cli:claude", provider: "anthropic", display_name: "Claude Code CLI", channel: "cli", enabled: true, configured: true, scores: null }];
+  const { state, document, act, click } = await setup(t, [mission("build-task", "running")], models, { openComposer: false });
+  assert.equal(document.querySelector(".quota-banner"), null);
+
+  state.quota = [{ model_id: "cli:claude", until: "2026-10-15T07:00:00Z", reason: "Claude AI usage limit reached" }];
+  await act(async () => state.poll());
+  const banner = document.querySelector(".quota-banner");
+  assert.match(banner.textContent, /模型暂不可用.*Claude Code CLI（额度用完），.*后重试.*自动换用其它可用模型/);
+
+  await click([...banner.querySelectorAll("button")].find(b => b.textContent === "恢复使用"));
+  assert.deepEqual(state.quotaResets, ["cli:claude"]);
+  assert.equal(document.querySelector(".quota-banner"), null);
+});
+
+test("service failures are distinguished from quota exhaustion", async t => {
+  const models = [{ id: "deepseek:deepseek-flash", provider: "deepseek", display_name: "DeepSeek", channel: "api", enabled: true, configured: true, scores: null }];
+  const { state, document, act } = await setup(t, [mission("build-task", "running")], models, { openComposer: false });
+  state.quota = [{ model_id: "deepseek:deepseek-flash", kind: "unavailable", until: "2026-10-15T07:00:00Z", reason: "deepseek returned 503" }];
+  await act(async () => state.poll());
+  const banner = document.querySelector(".quota-banner");
+  assert.match(banner.textContent, /DeepSeek（服务故障）.*后重试/);
+  assert.doesNotMatch(banner.textContent, /额度用完/);
+});
+
+test("a failed task with a running repair can be cancelled but cannot be resumed concurrently", async t => {
+  const run = mission("repair-task", "failed");
+  run.diagnoses = [{ id: "d1", trigger: "manual", node_id: "a", status: "running", created_at: "2026-10-15T03:00:00Z" }];
+  const { state, document, click } = await setup(t, [run], [], { openComposer: false });
+  const resume = [...document.querySelectorAll(".resume-bar button")].find(b => b.textContent === "从失败处继续");
+  assert.ok(resume.disabled);
+  await click([...document.querySelectorAll(".task-actions button")].find(b => b.textContent === "取消任务"));
+  await click([...document.querySelectorAll('[role="alertdialog"] button')].find(b => b.textContent === "确认取消"));
+  assert.deepEqual(state.cancels, ["repair-task"]);
+  assert.equal(document.querySelector(".detail .pill").textContent, "已取消");
+});
+
+test("unverified nodes show the missing verification instead of a pass", async t => {
+  const run = mission("unverified-task", "failed");
+  run.plan.nodes = [{ id: "v", title: "Verify", dependencies: [], verifies: ["a"], model_id: "x:judge", status: "failed",
+    estimated_cost_usd: 0, review_passed: null, review: "验证没有给出 VERDICT，尚未验证。",
+    attempts: [{ outcome: "unverified", cost_usd: .01 }] }];
+  const { document } = await setup(t, [run], [], { openComposer: false });
+  assert.equal(document.querySelector(".plan-check").textContent, "✗ 尚未验证");
+  assert.doesNotMatch(document.querySelector(".plan-node").textContent, /✓ 验证通过/);
 });

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from super_partner.catalog import builtin_models
+from conftest import scored_models
 from super_partner.db import Database
 from super_partner.executor import Executor
 from super_partner.models import ExecutionRun, NodeStatus, RunStatus, TaskNode, TaskPlan
@@ -48,7 +48,7 @@ async def test_startup_pauses_interrupted_runs_instead_of_resuming(task_api, mon
 
 
 def fallback_executor(tmp_path: Path, **overrides):
-    catalog = {model.id: model for model in builtin_models()}
+    catalog = {model.id: model for model in scored_models()}
     for model_id, enabled in overrides.items():
         catalog[model_id].enabled = enabled
     return Executor(Database(tmp_path / "test.db"), None, catalog)

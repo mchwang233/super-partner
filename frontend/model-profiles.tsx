@@ -11,11 +11,11 @@ export const CAPABILITIES = [
   { key: "chinese", label: "中文", description: "中文理解与表达" },
   { key: "tool_use", label: "工具使用", description: "选择工具与组织工具调用" },
   { key: "structured_output", label: "结构化输出", description: "按指定格式生成可处理的结果" },
-  { key: "reliability", label: "可靠性", description: "预设的稳定性评价，不是实测成功率" },
+  { key: "reliability", label: "可靠性", description: "由 AA 非幻觉率换算，不是实测成功率" },
 ] as const;
 
-type CapabilityKey = typeof CAPABILITIES[number]["key"];
-type ChannelFilter = "all" | "cli" | "api" | "demo";
+export type CapabilityKey = typeof CAPABILITIES[number]["key"];
+type ChannelFilter = "all" | "cli" | "api";
 type ScoreSource = BenchmarkSource | "preset";
 type SortBy = CapabilityKey | "latest" | "name";
 
@@ -33,6 +33,8 @@ export type Model = {
   pricing_verified: boolean;
   scores: Record<CapabilityKey, number> | null;
   routing_ready: boolean;
+  scores_source?: string;
+  scores_basis?: string | null;
   catalog_source: string;
   catalog_status: string;
   catalog_checked_at?: string | null;
@@ -59,9 +61,9 @@ type Props = {
   apiBase: string;
 };
 
-function score(model: Model, key: CapabilityKey): number | null {
+export function score(model: Model, key: CapabilityKey): number | null {
   const value = model.scores?.[key];
-  return typeof value === "number" && Number.isFinite(value) ? Math.round(Math.min(1, Math.max(0, value)) * 100) : null;
+  return typeof value === "number" && Number.isFinite(value) ? Math.round(Math.min(100, Math.max(0, value))) : null;
 }
 
 function channelLabel(model: Model): string {
@@ -72,7 +74,7 @@ function availability(model: Model, source: ScoreSource = DEFAULT_BENCHMARK_SOUR
   if (model.catalog_status === "retired") return "已退役";
   if (model.catalog_status === "deprecated") return "来源标记弃用";
   if (model.available_via_api === false) return "官方接口未列出";
-  if (!model.scores) return source === "preset" ? "暂无调度预设" : resultsForSource(model.benchmarks, source).length ? `已收录 ${BENCHMARK_SOURCES[source].shortName} 成绩` : `暂无 ${BENCHMARK_SOURCES[source].shortName} 成绩`;
+  if (!model.scores) return source === "preset" ? "暂无调度评分" : resultsForSource(model.benchmarks, source).length ? `已收录 ${BENCHMARK_SOURCES[source].shortName} 成绩` : `暂无 ${BENCHMARK_SOURCES[source].shortName} 成绩`;
   if (!model.routing_ready) return "规格待补全";
   if (!model.enabled) return "已停用";
   if (model.provider === "mock") return "演示模式";
@@ -80,7 +82,7 @@ function availability(model: Model, source: ScoreSource = DEFAULT_BENCHMARK_SOUR
   return model.channel === "cli" ? "未检测到" : "未配置密钥";
 }
 
-function Radar({ model }: { model: Model }) {
+export function Radar({ model }: { model: Model }) {
   const titleId = useId();
   const descriptionId = useId();
   const point = (index: number, radius: number) => {
@@ -92,7 +94,7 @@ function Radar({ model }: { model: Model }) {
   return <figure className="profile-radar">
     <svg viewBox="0 0 400 350" role="img" aria-labelledby={`${titleId} ${descriptionId}`}>
       <title id={titleId}>{`${model.display_name} 的能力雷达图`}</title>
-      <desc id={descriptionId}>各轴均为 0–100 分的预设评分。{CAPABILITIES.map(({ key, label }) => `${label} ${score(model, key) ?? "暂无"}`).join("，")}</desc>
+      <desc id={descriptionId}>各轴均为 0–100 分的调度评分。{CAPABILITIES.map(({ key, label }) => `${label} ${score(model, key) ?? "暂无"}`).join("，")}</desc>
       {[25, 50, 75, 100].map(level => <polygon key={level} points={ring(level)} className="radar-ring" />)}
       {CAPABILITIES.map(({ key }, index) => {
         const [x, y] = point(index, 100);
@@ -111,7 +113,7 @@ function Radar({ model }: { model: Model }) {
         </g>;
       })}
     </svg>
-    <figcaption>统一 0–100 刻度 · {!model.scores ? "尚无能力评分" : model.provider === "mock" ? "模拟画像" : "预设画像"}</figcaption>
+    <figcaption>统一 0–100 刻度 · {!model.scores ? "尚无能力评分" : model.provider === "mock" ? "模拟画像" : "调度画像"}</figcaption>
   </figure>;
 }
 
@@ -137,20 +139,21 @@ function ModelDetail({ model, source, onToggle, onConfigure }: Pick<Props, "onTo
       </div>
     </div>
     {model.description && <p className="profile-description">{model.description}</p>}
-    {!model.scores && <p className="profile-footnote">调度预设尚未配置，暂不自动参与任务。公开成绩用于能力对比，并保留各榜单的测试条件。</p>}
+    {!model.scores && <p className="profile-footnote">暂无 Artificial Analysis 成绩，暂不参与任务调度。</p>}
+    {model.scores && <p className="profile-footnote profile-score-origin">{model.provider === "mock" ? <><b>演示模型使用固定分数</b>，仅用于离线演示。</> : <><b>调度评分来自 Artificial Analysis。</b>{model.scores_basis}</>}</p>}
     {source !== "preset" ? <PublicBenchmarks results={model.benchmarks ?? []} source={source} /> : <>
-    <p className="profile-pending-note">项目调度预设 · 以下数值用于任务调度，不是公开评测成绩。</p>
+    <p className="profile-pending-note">调度评分 · {model.provider === "mock" ? "演示用固定分数" : "由 Artificial Analysis 成绩按排名换算"}，用于任务调度，不是公开评测原始分。</p>
     {isDemo ? <p className="profile-demo-note">演示模型只返回模拟结果。以下数值用于演示流程，不代表真实模型能力。</p>
       : <div className="profile-strengths"><span>画像侧重</span>{strengths.map(({ key, label }) => <span className="strength-chip" key={key}>{label}<b>{score(model, key)}</b></span>)}</div>}
     <div className="profile-visuals">
       <Radar model={model} />
       <div className="profile-score-list" aria-label="七项能力的具体评分">
-        <div className="profile-score-heading"><span>能力维度</span><span>预设分 / 100</span></div>
+        <div className="profile-score-heading"><span>能力维度</span><span>调度分 / 100</span></div>
         {CAPABILITIES.map(({ key, label, description }) => {
           const value = score(model, key);
           return <div className="profile-score" key={key}>
             <div className="profile-score-label"><span title={description}>{label}</span><b>{value ?? "—"}</b></div>
-            <div className="profile-score-track" role={value === null ? undefined : "meter"} aria-label={`${label}预设评分`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={value ?? undefined} aria-valuetext={value === null ? "暂无评分" : `${value} / 100`} title={description}><span style={{ width: `${value ?? 0}%` }} /></div>
+            <div className="profile-score-track" role={value === null ? undefined : "meter"} aria-label={`${label}调度评分`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={value ?? undefined} aria-valuetext={value === null ? "暂无评分" : `${value} / 100`} title={description}><span style={{ width: `${value ?? 0}%` }} /></div>
           </div>;
         })}
       </div>
@@ -180,13 +183,12 @@ export function ModelProfiles({ models, selectedId, onSelect, onToggle, onConfig
   const [sortBy, setSortBy] = useState<SortBy>("latest");
   const presetView = source === "preset";
   const benchmarkSource = source === "preset" ? DEFAULT_BENCHMARK_SOURCE : source;
-  const sourceLabel = source === "preset" ? "调度预设" : BENCHMARK_SOURCES[source].shortName;
+  const sourceLabel = source === "preset" ? "调度评分" : BENCHMARK_SOURCES[source].shortName;
   const hasScores = (model: Model) => source === "preset" ? !!model.scores : resultsForSource(model.benchmarks, source).length > 0;
   const detailRef = useRef<HTMLDivElement>(null);
   const search = query.trim().toLowerCase();
   const filtered = models.filter(model => {
-    const category = model.provider === "mock" ? "demo" : model.channel;
-    return (channel === "all" || category === channel)
+    return (channel === "all" || model.channel === channel)
       && (provider === "all" || (provider === "cli" ? model.channel === "cli" : model.provider === provider))
       && (!onlyBenchmarked || hasScores(model))
       && `${model.display_name} ${model.id} ${model.provider}`.toLowerCase().includes(search);
@@ -203,13 +205,13 @@ export function ModelProfiles({ models, selectedId, onSelect, onToggle, onConfig
   return <section className="model-profiles" aria-labelledby="model-profiles-title">
     <div className="profiles-intro"><div><p className="eyebrow">MODEL PROFILES</p><h2 id="model-profiles-title">模型画像<span>了解每一个执行伙伴。</span></h2></div><span className="profiles-total">{models.length} 个接入条目 · {models.filter(hasScores).length} 个有{sourceLabel}{presetView ? "" : "成绩"}</span></div>
     <CatalogStatus apiBase={apiBase} benchmarkSource={benchmarkSource} />
-    <div className="profile-provenance"><label className="benchmark-source-picker"><span className="profile-preset-label">评分依据</span><select value={source} onChange={event => { setSource(event.target.value as ScoreSource); setSortBy("latest"); }}>{Object.entries(BENCHMARK_SOURCES).map(([id, value]) => <option value={id} key={id}>{value.name}{id === DEFAULT_BENCHMARK_SOURCE ? "（默认）" : ""}</option>)}<option value="preset">项目调度预设（高级）</option></select></label><p>{presetView ? "调度预设用于当前任务分配，数值不代表公开评测结果。" : `当前仅采用 ${BENCHMARK_SOURCES[benchmarkSource].name}。画像、能力图、筛选和对比使用同一来源；没有成绩的型号保持空缺。`}</p></div>
+    <div className="profile-provenance"><label className="benchmark-source-picker"><span className="profile-preset-label">评分依据</span><select value={source} onChange={event => { setSource(event.target.value as ScoreSource); setSortBy("latest"); }}>{Object.entries(BENCHMARK_SOURCES).map(([id, value]) => <option value={id} key={id}>{value.name}{id === DEFAULT_BENCHMARK_SOURCE ? "（默认）" : ""}</option>)}<option value="preset">调度评分（高级）</option></select></label><p>{presetView ? "调度评分用于任务分配，全部由 Artificial Analysis 成绩按排名换算；CLI 沿用同厂商 AA 成绩最好的模型；没有 AA 成绩的模型不参与调度。" : `当前仅采用 ${BENCHMARK_SOURCES[benchmarkSource].name}。画像、能力图、筛选和对比使用同一来源；没有成绩的型号保持空缺。`}</p></div>
     <div className="profiles-toolbar">
       <label className="profile-search"><span>搜索模型</span><input type="search" placeholder="模型名称或服务商…" value={query} onChange={event => setQuery(event.target.value)} /></label>
-      <div className="profile-filters" aria-label="按接入方式筛选">{([ ["all", "全部"], ["cli", "CLI"], ["api", "API"], ["demo", "演示"] ] as const).map(([value, label]) => <button key={value} aria-pressed={channel === value} onClick={() => setChannel(value)}>{label}</button>)}</div>
+      <div className="profile-filters" aria-label="按接入方式筛选">{([ ["all", "全部"], ["cli", "CLI"], ["api", "API"] ] as const).map(([value, label]) => <button key={value} aria-pressed={channel === value} onClick={() => setChannel(value)}>{label}</button>)}</div>
       <label className="benchmark-only-filter"><input type="checkbox" checked={onlyBenchmarked} onChange={event => setOnlyBenchmarked(event.target.checked)} />仅有{sourceLabel}{presetView ? "" : "成绩"}</label>
-      <label className="profile-sort"><span>服务商</span><select value={provider} onChange={event => setProvider(event.target.value)}><option value="all">全部服务商</option>{Object.entries(PROVIDER_NAMES).map(([id, name]) => <option value={id} key={id}>{name}</option>)}<option value="cli">CLI 通道</option><option value="mock">演示</option></select></label>
-      <label className="profile-sort"><span>排序</span><select value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)}><option value="latest">最新发布优先</option><option value="name">模型名称</option>{presetView && CAPABILITIES.map(({ key, label }) => <option value={key} key={key}>调度预设 · {label}从高到低</option>)}</select></label>
+      <label className="profile-sort"><span>服务商</span><select value={provider} onChange={event => setProvider(event.target.value)}><option value="all">全部服务商</option>{Object.entries(PROVIDER_NAMES).map(([id, name]) => <option value={id} key={id}>{name}</option>)}<option value="cli">CLI 通道</option></select></label>
+      <label className="profile-sort"><span>排序</span><select value={sortBy} onChange={event => setSortBy(event.target.value as SortBy)}><option value="latest">最新发布优先</option><option value="name">模型名称</option>{presetView && CAPABILITIES.map(({ key, label }) => <option value={key} key={key}>调度评分 · {label}从高到低</option>)}</select></label>
     </div>
     {selected ? <>
       <div className="profiles-layout">
@@ -220,9 +222,9 @@ export function ModelProfiles({ models, selectedId, onSelect, onToggle, onConfig
         <div ref={detailRef} className="profile-detail" tabIndex={-1}><ModelDetail key={`${selected.id}:${source}`} model={selected} source={source} onToggle={onToggle} onConfigure={onConfigure} /></div>
       </div>
       {!presetView ? <BenchmarkComparison key={source} models={filtered} source={benchmarkSource} onSelect={selectFromTable} /> : <section className="profile-comparison" aria-labelledby="profile-comparison-title">
-        <div className="profile-comparison-heading"><div><h3 id="profile-comparison-title">项目调度预设</h3><p>当前调度使用的七项预设分数。没有预设的维度显示 —；公开成绩需在评分依据中切换查看。</p></div><span>预设分 / 100</span></div>
+        <div className="profile-comparison-heading"><div><h3 id="profile-comparison-title">调度评分</h3><p>当前调度使用的七项分数，均由 AA 成绩按排名换算。没有分数的维度显示 —。</p></div><span>调度分 / 100</span></div>
         <div className="profile-table-scroll" role="region" aria-label="可横向滚动的模型能力对比表" tabIndex={0}>
-          <table><caption className="profile-sr-only">各模型七项预设能力评分，0–100 分；演示模型数值仅供演示。</caption><thead><tr><th scope="col">模型</th>{CAPABILITIES.map(({ key, label, description }) => <th scope="col" key={key} title={description}>{label}</th>)}</tr></thead><tbody>{filtered.map(model => <tr key={model.id} className={`${selected.id === model.id ? "is-selected" : ""} ${model.provider === "mock" ? "is-demo" : ""}`}><th scope="row"><button onClick={() => selectFromTable(model.id)} aria-label={`查看 ${model.display_name} 的完整画像`}>{model.display_name}<span>{channelLabel(model)} · {availability(model, source)}</span></button></th>{CAPABILITIES.map(({ key }) => {
+          <table><caption className="profile-sr-only">各模型七项调度评分，0–100 分；演示模型数值仅供演示。</caption><thead><tr><th scope="col">模型</th>{CAPABILITIES.map(({ key, label, description }) => <th scope="col" key={key} title={description}>{label}</th>)}</tr></thead><tbody>{filtered.map(model => <tr key={model.id} className={`${selected.id === model.id ? "is-selected" : ""} ${model.provider === "mock" ? "is-demo" : ""}`}><th scope="row"><button onClick={() => selectFromTable(model.id)} aria-label={`查看 ${model.display_name} 的完整画像`}>{model.display_name}<span>{channelLabel(model)} · {availability(model, source)}</span></button></th>{CAPABILITIES.map(({ key }) => {
             const value = score(model, key);
             return <td key={key}><span className={`comparison-value ${(value ?? 0) >= 90 ? "score-high" : ""}`}>{value ?? "—"}<span className="comparison-track" aria-hidden="true"><span style={{ width: `${value ?? 0}%` }} /></span></span></td>;
           })}</tr>)}</tbody></table>

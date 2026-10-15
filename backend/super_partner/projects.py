@@ -6,12 +6,21 @@ import os
 import shutil
 import signal
 import subprocess
+import time
+from collections import deque
 from pathlib import Path
 
 from .config import settings
 
 MAX_CONTEXT_ENTRIES = 60
-MAX_BROWSE_ENTRIES = 500
+MAX_DISCOVERED = 300
+DISCOVER_DEPTH = 4
+DISCOVER_SECONDS = 3.0
+# Dependency, build, and OS folders that hold no projects of their own but are slow to walk.
+SKIP_DISCOVERY = {
+    "node_modules", "__pycache__", "venv", "site-packages", "vendor", "dist", "build", "target",
+    "snap", "Library", "Applications", "Pictures", "Music", "Videos", "Downloads",
+}
 
 
 class ProjectDirError(ValueError):
@@ -34,14 +43,22 @@ def native_picker_status() -> dict:
     return {"available": True, "reason": None}
 
 
-async def native_pick_directory() -> Path | None:
+def _picker_start(start: str | None) -> Path:
+    """Open the dialog at the requested folder when it is allowed, else at the first root."""
+    if start:
+        with contextlib.suppress(ProjectDirError):
+            return resolve_project_dir(start)
+    return allowed_roots()[0]
+
+
+async def native_pick_directory(start: str | None = None) -> Path | None:
     """Open the desktop folder dialog; returns None when the user cancels it."""
     status = native_picker_status()
     if not status["available"]:
         raise NativePickerError(status["reason"])
     process = await asyncio.create_subprocess_exec(
-        "zenity", "--file-selection", "--directory", "--title=Choose a project folder",
-        f"--filename={allowed_roots()[0]}/",
+        "zenity", "--file-selection", "--directory", "--title=选择项目目录",
+        f"--filename={_picker_start(start)}/",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True,
     )
     try:
@@ -88,34 +105,6 @@ def resolve_project_dir(raw: str) -> Path:
     return path
 
 
-def browse_directories(raw: str | None = None, show_hidden: bool = False) -> dict:
-    """List subdirectories for the web console's folder picker, confined to the allowed roots."""
-    roots = allowed_roots()
-    path = _existing_dir_in_roots(raw) if raw else roots[0]
-    data_dir = settings.data_dir.resolve()
-    entries = []
-    try:
-        children = sorted(path.iterdir(), key=lambda entry: entry.name.lower())
-    except PermissionError as exc:
-        raise ProjectDirError(f"Permission denied: {path}") from exc
-    for child in children:
-        if (child.name.startswith(".") and not show_hidden) or not child.is_dir():
-            continue
-        resolved = child.resolve()
-        # Skip symlinks that leave the allowed roots and the Super Partner data directory.
-        if not any(_is_within(resolved, root) for root in roots) or _is_within(resolved, data_dir):
-            continue
-        entries.append({"name": child.name, "path": str(resolved), "git": (child / ".git").exists()})
-        if len(entries) >= MAX_BROWSE_ENTRIES:
-            break
-    parent = path.parent if path not in roots and any(_is_within(path.parent, r) for r in roots) else None
-    return {
-        "path": str(path), "parent": str(parent) if parent else None,
-        "git": (path / ".git").exists(), "roots": [str(root) for root in roots],
-        "entries": entries, "truncated": len(entries) >= MAX_BROWSE_ENTRIES,
-    }
-
-
 def _git(path: Path, *args: str) -> str | None:
     try:
         result = subprocess.run(
@@ -153,3 +142,58 @@ def project_context(path: Path) -> str:
         if snapshot["git"] else "not a git repository"
     )
     return f"Target project: {path} ({git_line})\nTop-level entries: {', '.join(names) or '(empty)'}"
+
+
+def _git_marker_time(path: Path) -> float:
+    """Recent work touches the git index or HEAD, so their mtime ranks active projects first."""
+    times = []
+    for name in ("index", "HEAD"):
+        with contextlib.suppress(OSError):
+            times.append((path / ".git" / name).stat().st_mtime)
+    if not times:
+        with contextlib.suppress(OSError):
+            times.append((path / ".git").stat().st_mtime)
+    return max(times, default=0.0)
+
+
+def discover_projects(
+    max_depth: int = DISCOVER_DEPTH, limit: int = MAX_DISCOVERED, seconds: float = DISCOVER_SECONDS,
+) -> dict:
+    """Find git checkouts under the allowed roots, most recently active first.
+
+    The walk is breadth-first, skips hidden and dependency folders, never follows symlinks out
+    of the roots, stops descending at a repository, and gives up after a time budget.
+    """
+    deadline = time.monotonic() + seconds
+    data_dir = settings.data_dir.resolve()
+    queue = deque((root, 0) for root in allowed_roots())
+    found: list[dict] = []
+    truncated = False
+    while queue:
+        if len(found) >= limit or time.monotonic() > deadline:
+            truncated = True
+            break
+        path, depth = queue.popleft()
+        try:
+            children = sorted(os.scandir(path), key=lambda entry: entry.name.lower())
+        except OSError:
+            continue
+        if any(child.name == ".git" for child in children):
+            found.append({"name": path.name, "path": str(path), "active_at": _git_marker_time(path)})
+            continue
+        if depth >= max_depth:
+            continue
+        for child in children:
+            if child.name.startswith(".") or child.name in SKIP_DISCOVERY:
+                continue
+            with contextlib.suppress(OSError):
+                if child.is_dir(follow_symlinks=False) and not _is_within(Path(child.path), data_dir):
+                    queue.append((Path(child.path), depth + 1))
+    found.sort(key=lambda entry: entry["active_at"], reverse=True)
+    return {"projects": found, "truncated": truncated}
+
+
+def inspect_project(raw: str) -> dict:
+    """Validate a project directory and describe its git state for the web console."""
+    path = resolve_project_dir(raw)
+    return {"path": str(path), **git_snapshot(path)}

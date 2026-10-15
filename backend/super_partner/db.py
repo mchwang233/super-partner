@@ -38,6 +38,12 @@ class Database:
                 CREATE TABLE IF NOT EXISTS benchmark_cache (
                     source TEXT PRIMARY KEY, body TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS recovery_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1), body TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS shared_repairs (
+                    id TEXT PRIMARY KEY, body TEXT NOT NULL, created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -83,6 +89,32 @@ class Database:
         with self.lock:
             rows = self.connection.execute("SELECT body FROM models ORDER BY id").fetchall()
         return [ModelProfile.model_validate_json(row["body"]) for row in rows]
+
+    def load_recovery_state(self) -> dict:
+        with self.lock:
+            row = self.connection.execute("SELECT body FROM recovery_state WHERE id = 1").fetchone()
+        return json.loads(row["body"]) if row else {}
+
+    def save_recovery_state(self, state: dict) -> None:
+        with self.lock, self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO recovery_state(id, body) VALUES (1, ?)",
+                (json.dumps(state, ensure_ascii=False),),
+            )
+
+    def save_shared_repair(self, repair: dict) -> None:
+        with self.lock, self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO shared_repairs(id, body, created_at) VALUES (?, ?, ?)",
+                (repair["id"], json.dumps(repair, ensure_ascii=False), repair["created_at"]),
+            )
+
+    def shared_repairs(self, limit: int = 10) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT body FROM shared_repairs ORDER BY created_at DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [json.loads(row["body"]) for row in rows]
 
     def save_run(self, run: ExecutionRun) -> None:
         with self.lock, self.connection:

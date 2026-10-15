@@ -92,7 +92,7 @@ export function PublicBenchmarks({ results, source = DEFAULT_BENCHMARK_SOURCE }:
     <div className="public-benchmark-meta"><span>榜单版本：{selected.version}</span><span>发布 / 更新日期：{selected.published_at ?? "来源未提供"}</span><span>同步时间：{dateLabel(selected.fetched_at)}</span><span>匹配依据：{selected.matched_by === "model_id" ? "型号标识" : "同服务商唯一名称"}</span></div>
     {selected.source === "artificial_analysis" && <p className="profile-footnote">能力图使用 AA 公开页面中的同型号、同档位分项：通过率 / 正确率由 0–1 换算为 0–100；综合智能指数独立展示。非幻觉率采用 AA-Omniscience 的定义。缺失项保持空白。<a href="https://artificialanalysis.ai/methodology/intelligence-benchmarking" target="_blank" rel="noreferrer">查看评测方法 ↗</a></p>}
     {selected.collection_method === "public_page" && <p className="profile-footnote">综合指数沿用公开榜单的显示精度，分项取自页面图表数据。榜单未注明的版本和评测日期不以同步时间代替。</p>}
-    <p className="profile-footnote">成绩对应上述测试配置。滚动模型别名可能随服务商更新而变化；各榜单量表独立展示，公开评测不会覆盖项目的调度预设分。</p>
+    <p className="profile-footnote">成绩对应上述测试配置。滚动模型别名可能随服务商更新而变化；各榜单量表独立展示，调度评分由 Artificial Analysis 成绩换算，其余榜单仅供参考。</p>
     <div className="public-source-links"><a href={selected.source_url} target="_blank" rel="noreferrer">来源：{selected.source_name} ↗</a><a href={selected.data_url} target="_blank" rel="noreferrer">查看原始数据 ↗</a></div>
   </section>;
 }
