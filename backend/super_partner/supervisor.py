@@ -139,7 +139,9 @@ async def ask(providers, models: list[ModelProfile], configured: set[str], run: 
 # --- deciding what to do after a failed attempt -------------------------------------------------
 
 ACTIONS = ("retry", "switch_model", "accept", "unable", "ask_user", "repair_environment", "repair_platform",
-           "rework")
+           "rework", "replan", "done")
+# What the lead may answer when every step has finished.
+FINAL_ACTIONS = ("done", "rework", "replan")
 ACTION_RULES = {
     "rework": "- rework: send the verified steps listed in targets back to be redone, with instructions "
               "saying exactly what to change. Only for real problems the task needs fixed; not for new "
@@ -159,19 +161,35 @@ ACTION_RULES = {
                           "fixes it, then the step runs again.\n",
     "repair_platform": "- repair_platform: Super Partner itself (its scheduler, tools or sandbox) is at fault; say "
                        "what and where. A source repair is made, checked and applied, then the task continues.\n",
+    "replan": "- replan: change the plan in \"plan\": add steps, remove steps that have not finished, or rewrite "
+              "the instructions of steps that have not finished (splitting a step that is too big, adding a "
+              "missing prerequisite, dropping one the task does not need). Finished steps stay as they are.\n",
+    "done": "- done: the result does what the request asked; the task ends.\n",
 }
+PLAN_FORMAT = (
+    '"plan": {"add": [{"key": "new1", "title": "...", "instructions": "...", "acceptance_criteria": "...", '
+    '"capability": "coding | planning | research | chinese | tool_use | structured_output", '
+    '"difficulty": "easy | normal | hard", "dependencies": ["ids of existing steps or keys of added ones"], '
+    '"verifies": ["optional: ids or keys of steps this one verifies"]}], '
+    '"remove": ["ids of steps that have not finished"], '
+    '"update": [{"id": "...", "title": "optional", "instructions": "optional", "acceptance_criteria": "optional", '
+    '"dependencies": ["optional: the full new list"]}]}'
+)
 
 
-def decision_format(rework: bool = False) -> str:
-    """How to answer; a failed verification may also send steps back (``rework``)."""
-    actions = [action for action in ACTIONS if rework or action != "rework"]
+def decision_format(rework: bool = False, final: bool = False) -> str:
+    """How to answer; a failed verification may also send steps back (``rework``), and when
+    every step has finished (``final``) the lead says whether the task is done."""
+    actions = list(FINAL_ACTIONS) if final else [
+        action for action in ACTIONS if action != "done" and (rework or action != "rework")]
     return (
         "Reply with only a JSON object:\n"
         f'{{"action": "{" | ".join(actions)}", '
         '"reason": "one or two sentences in Chinese, shown to the user", '
         '"instructions": "for retry / switch_model / rework: exactly what must be done differently; '
         'for repair_*: what to repair", "model_id": "switch_model only: one of the models listed", '
-        + ('"targets": ["rework only: ids of the verified steps to redo"], ' if rework else "")
+        + ('"targets": ["rework only: ids of the steps to redo"], ' if rework or final else "")
+        + (PLAN_FORMAT + ", " if "replan" in actions else "")
         + '"question": "ask_user only, in Chinese", "options": ["ask_user only: up to 4 answers"], '
         '"user_action": "unable only: what the user could do to make it possible"}\n'
         + "".join(ACTION_RULES[action] for action in actions)
@@ -250,6 +268,28 @@ def verification_message(run: ExecutionRun, verifier, verdict, choices: list[Mod
     return "\n".join(lines)
 
 
+def final_message(run: ExecutionRun, left: int) -> str:
+    """Every step has finished: the lead checks the result as a whole against the request."""
+    lines = [
+        ("EVENT: every step has finished. Before the task ends, check the result as a whole against "
+         "the request: does it really do what was asked, and do the pieces fit together?"),
+        f"Request:\n{run.prompt}",
+        f"Working directory: {run.project_dir or settings.workspace_root / run.folder_id}",
+        "The steps and their results:",
+    ]
+    for node in run.plan.nodes:
+        lines.append(f"- [{node.id}] {node.title} (by {node.model_id}): {(node.review or '')[:200]}")
+        lines.append(f"  result: {(node.summary or node.result or '')[:800]}")
+    lines += [
+        f"Decisions left for the task: {left}.",
+        "",
+        ("You may look at the files first. If something the request asked for is missing or wrong, "
+         "rework the steps that should fix it, or replan to add what is missing."),
+        decision_format(final=True),
+    ]
+    return "\n".join(lines)
+
+
 def chat_message(text: str) -> str:
     """The user writing to the lead directly, not answering one of its questions."""
     return (
@@ -273,9 +313,11 @@ def answer_message(node, question: str, answer: str, rework: bool = False) -> st
     ])
 
 
-def parse_decision(text: str, model_ids: set[str], targets: Optional[set[str]] = None) -> Optional[dict]:
+def parse_decision(text: str, model_ids: set[str], targets: Optional[set[str]] = None,
+                   final: bool = False) -> Optional[dict]:
     """The decision in the lead's reply, or None if there is no valid one. ``targets`` are the
-    steps a failed verification may send back; without them, rework is not a valid answer."""
+    steps rework may send back; without them, rework is not a valid answer. ``final``: every step
+    has finished, and only done, rework and replan are."""
     start, end = (text or "").find("{"), (text or "").rfind("}")
     if start < 0 or end <= start:
         return None
@@ -283,7 +325,8 @@ def parse_decision(text: str, model_ids: set[str], targets: Optional[set[str]] =
         payload = json.loads(text[start:end + 1])
     except json.JSONDecodeError:
         return None
-    if not isinstance(payload, dict) or payload.get("action") not in ACTIONS:
+    allowed = FINAL_ACTIONS if final else tuple(action for action in ACTIONS if action != "done")
+    if not isinstance(payload, dict) or payload.get("action") not in allowed:
         return None
     clean = {key: str(payload[key]).strip() for key in ("action", "reason", "instructions", "model_id",
                                                          "question", "user_action") if payload.get(key)}
@@ -298,4 +341,9 @@ def parse_decision(text: str, model_ids: set[str], targets: Optional[set[str]] =
         if not targets or not isinstance(chosen, list) or not set(map(str, chosen)) <= targets:
             return None
         clean["targets"] = [str(item) for item in chosen]
+    if clean["action"] == "replan":
+        plan = payload.get("plan")
+        if not isinstance(plan, dict) or not any(plan.get(key) for key in ("add", "remove", "update")):
+            return None
+        clean["plan"] = plan
     return clean

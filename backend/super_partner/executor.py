@@ -107,50 +107,56 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         running: dict[asyncio.Task, str] = {}
         try:
             while True:
+                while True:
+                    run = self.db.get_run(run_id)
+                    if not run:
+                        return
+                    if run.status in {RunStatus.CANCELLED, RunStatus.PAUSED}:
+                        # Let in-flight nodes finish so their results and costs are recorded.
+                        if not running:
+                            return
+                    else:
+                        if self.platform_pending:
+                            self._hold_for_platform(run)
+                            if not running:
+                                return
+                            dispatched_for_budget = False
+                        else:
+                            dispatched_for_budget = self._dispatch(run, running)
+                        if not running:
+                            if dispatched_for_budget:
+                                self._pause_for_budget(run)
+                                return
+                            break
+                    done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        running.pop(task)
+                        if not task.cancelled():
+                            task.result()
                 run = self.db.get_run(run_id)
                 if not run:
                     return
-                if run.status in {RunStatus.CANCELLED, RunStatus.PAUSED}:
-                    # Let in-flight nodes finish so their results and costs are recorded.
-                    if not running:
-                        return
-                else:
-                    if self.platform_pending:
-                        self._hold_for_platform(run)
-                        if not running:
-                            return
-                        dispatched_for_budget = False
-                    else:
-                        dispatched_for_budget = self._dispatch(run, running)
-                    if not running:
-                        if dispatched_for_budget:
-                            self._pause_for_budget(run)
-                            return
-                        break
-                done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    running.pop(task)
-                    if not task.cancelled():
-                        task.result()
-            run = self.db.get_run(run_id)
-            if not run:
+                failed = [node for node in run.plan.nodes if node.status == NodeStatus.FAILED]
+                if failed:
+                    raise RuntimeError(f"{len(failed)} 个步骤失败：" + "；".join(
+                        f"{node.title}（{(node.review or (node.attempts[-1].reason if node.attempts else '') or '未知原因')[:160]}）"
+                        for node in failed
+                    ))
+                unable = [node for node in run.plan.nodes if node.status == NodeStatus.UNABLE]
+                if unable:
+                    self._end_incomplete(run, unable)
+                    return
+                if any(node.status != NodeStatus.SUCCEEDED for node in run.plan.nodes):
+                    raise RuntimeError("Task graph is blocked by failed or cyclic dependencies")
+                # The lead checks the whole result first; steps it reworks or adds run before the end.
+                if await self._final_review(run_id):
+                    continue
+                run = self.db.get_run(run_id)
+                run.status = RunStatus.SUCCEEDED
+                run.final_result = self._final_result(run)
+                self._save(run)
+                self.emit(run.id, "run.succeeded", actual_cost_usd=run.actual_cost_usd)
                 return
-            failed = [node for node in run.plan.nodes if node.status == NodeStatus.FAILED]
-            if failed:
-                raise RuntimeError(f"{len(failed)} 个步骤失败：" + "；".join(
-                    f"{node.title}（{(node.review or (node.attempts[-1].reason if node.attempts else '') or '未知原因')[:160]}）"
-                    for node in failed
-                ))
-            unable = [node for node in run.plan.nodes if node.status == NodeStatus.UNABLE]
-            if unable:
-                self._end_incomplete(run, unable)
-                return
-            if any(node.status != NodeStatus.SUCCEEDED for node in run.plan.nodes):
-                raise RuntimeError("Task graph is blocked by failed or cyclic dependencies")
-            run.status = RunStatus.SUCCEEDED
-            run.final_result = self._final_result(run)
-            self._save(run)
-            self.emit(run.id, "run.succeeded", actual_cost_usd=run.actual_cost_usd)
         except asyncio.CancelledError:
             await self._stop_nodes(running)
             run = self.db.get_run(run_id)
@@ -499,6 +505,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
 
 
     def _retry_or_fail(self, run: ExecutionRun, node, verdict: quality.Verdict, outcome: str) -> None:
+        """The fallback without a lead's decision: count the failure, then retry or fail."""
         node.failed_attempts += 1
         problem = verdict.reason + (f"\n应修改：{verdict.fix}" if verdict.fix else "")
         if node.failed_attempts >= settings.max_node_attempts:

@@ -1,6 +1,6 @@
 # 设计：任务负责人（Supervisor）
 
-状态：已确认，分阶段实现中（第 1 到 3 阶段已完成）
+状态：已实现（4 个阶段均已完成）
 范围：调度层（`executor.py`、`diagnosing.py`、`recovery.py`、`review.py`、`planner.py`）
 
 ## 1. 为什么要改
@@ -158,3 +158,12 @@
 2. 步骤验收通过就接受，不需要负责人确认。
 3. 决策次数上限：每个步骤 5 次，整个任务 25 次。
 4. 负责人调整计划时直接执行，在时间线上写明理由。
+
+## 11. 实现情况
+
+- 第 1 阶段：`supervisor.py`（会话、交接、裁剪），`ProviderRegistry.converse`、`CliChannelRegistry.converse`，规划在负责人会话里完成（`planner._plan_as_lead`）。
+- 第 2 阶段：`leading.py` 的 `_decide` / `_apply_decision`，负责人提问复用诊断的问答界面，回答交回负责人。
+- 第 3 阶段：验证不通过交给负责人，`rework` 可以只打回部分步骤并附上要求。
+- 第 4 阶段：`replan.py`（增删改步骤，校验依赖不成环、已完成和正在运行的步骤不动），全部步骤完成后的 `_final_review`（`done` / `rework` / `replan`），界面上的"负责人"面板。
+
+与第 7 节的差异：旧规则没有删除，而是保留为**兜底**。负责人不可用、连续两次回答格式不对，或者关闭了 `lead_decisions` 时，仍按原来的诊断、`recovery.py`、失败次数和返工轮数运行，任务不会因为负责人出问题而卡住。代码和配置注释里都标明了这一点。

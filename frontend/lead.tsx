@@ -16,7 +16,7 @@ type RunLike = {
 type ModelLike = { id: string; display_name: string };
 export type AskLead = (text: string) => Promise<string | null>;
 
-const EVENTS: Record<string, string> = { attempt_failed: "尝试失败", verify_failed: "验证没通过", user_answer: "你的回答" };
+const EVENTS: Record<string, string> = { attempt_failed: "尝试失败", verify_failed: "验证没通过", user_answer: "你的回答", all_done: "全部步骤完成后检查" };
 const TONES: Record<string, string> = { unable: "warn", ask_user: "warn", fallback: "bad" };
 
 function actionLabel(item: Decision, title: (id: string) => string, model: (id?: string | null) => string) {
@@ -24,6 +24,7 @@ function actionLabel(item: Decision, title: (id: string) => string, model: (id?:
     retry: "按要求重试", switch_model: `换成 ${model(item.model_id)}`, accept: "接受结果", unable: "判定无法完成",
     ask_user: "问你", repair_environment: "修复环境", repair_platform: "修复 Super Partner",
     rework: `返工 ${(item.targets ?? []).map(title).join("、")}`, fallback: "交给诊断处理",
+    replan: "调整计划", done: "确认完成",
   };
   return labels[item.action] ?? item.action;
 }

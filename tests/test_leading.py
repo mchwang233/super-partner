@@ -4,16 +4,12 @@ import json
 import pytest
 from super_partner import quality
 from super_partner.config import settings
-from super_partner.db import Database
 from super_partner.executor import Executor
 from super_partner.models import (
     DiagnosisMessage,
-    ExecutionRun,
     NodeStatus,
     RunStatus,
-    SupervisorSession,
     TaskNode,
-    TaskPlan,
 )
 from super_partner.providers import ProviderResult
 from test_turns import model
@@ -50,22 +46,6 @@ class Team:
         if len(self.work) <= self.fails:
             raise RuntimeError("tests failed: 3 errors")
         return ProviderResult("做完了", 0, 0, model_id)
-
-
-@pytest.fixture
-def database(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "workspace_root", tmp_path / "workspaces")
-    monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
-    monkeypatch.setattr(settings, "review_nodes", False)
-    monkeypatch.setattr(settings, "auto_diagnose", True)
-    monkeypatch.setattr(settings, "lead_decisions", True)
-    database = Database(tmp_path / "test.db")
-    node = TaskNode(id="a", title="实现", instructions="写代码", capability="coding", model_id="x:api")
-    database.save_run(ExecutionRun(
-        id="r", prompt="写一个工具", status=RunStatus.QUEUED, budget_usd=1,
-        supervisor=SupervisorSession(model_id="cli:claude", session_id="lead-1", cwd=str(tmp_path / "lead")),
-        plan=TaskPlan(summary="s", nodes=[node])))
-    return database
 
 
 async def run(database, team):
@@ -138,7 +118,9 @@ async def test_without_a_valid_decision_the_usual_diagnosis_takes_over(database)
     team = Team(["我觉得还行", "嗯"])
     _, result = await run(database, team)
     assert [item.action for item in result.decisions] == ["fallback"]
-    assert len(team.lead) == 2 and len(team.diagnoses) == 1 and result.status == RunStatus.SUCCEEDED
+    assert len(team.diagnoses) == 1 and result.status == RunStatus.SUCCEEDED
+    # Asked twice about the failure; then, with every step done, asked to check the whole result.
+    assert "EVENT: an attempt failed" in team.lead[0] and "EVENT: every step has finished" in team.lead[2]
 
 
 async def test_past_the_decision_limit_the_task_pauses_for_the_user(database, monkeypatch):
@@ -166,6 +148,7 @@ class Checked(Team):
 
 @pytest.fixture
 def checked(database):
+
     current = database.get_run("r")
     current.plan.nodes.append(TaskNode(id="v", title="验证", instructions="跑测试", capability="coding",
                                        model_id="x:api", dependencies=["a"], verifies=["a"]))

@@ -1,5 +1,7 @@
-"""What happens after an attempt of a step fails: which model tries next, and what a diagnosis
-means for the step. Decisions only; executor.py carries them out."""
+"""What happens after an attempt of a step fails when the task's lead does not decide (no lead
+is available, or it sent a diagnosis to repair something): which model tries next, and what a
+diagnosis means for the step. Decisions only; executor.py carries them out. With a lead, its
+decisions (leading.py) take the place of these rules."""
 
 from __future__ import annotations
 

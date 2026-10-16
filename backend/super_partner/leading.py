@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-from . import quality, supervisor
+from . import quality, replan, supervisor
 from .budget import BudgetExceeded
 from .config import settings
 from .models import (
@@ -89,30 +89,99 @@ class Leading:
         """The steps a verification may send back: those it checks."""
         return {item for item in node.verifies if any(other.id == item for other in run.plan.nodes)}
 
-    async def _ask_for_decision(self, run_id: str, node_id: str, prompt: str, model_ids: set[str],
-                                targets: Optional[set[str]] = None):
+    async def _ask_for_decision(self, run_id: str, node_id: Optional[str], prompt: str, model_ids: set[str],
+                                targets: Optional[set[str]] = None, final: bool = False):
         """The lead's decision; None when no lead can give a valid one, or "budget" when the task
-        has run out of budget for asking (it is then paused). ``targets``: a failed verification's
-        steps, which rework may send back."""
+        has run out of budget for asking (it is then paused). ``targets``: the steps rework may
+        send back; ``final``: every step has finished."""
+        def read(reply: str):
+            decision = supervisor.parse_decision(reply, model_ids, targets, final)
+            if decision and decision["action"] == "replan":
+                problem = self._plan_problem(run_id, decision["plan"], node_id)
+                if problem:
+                    return None, f"That plan change cannot be made: {problem}"
+            return decision, "That was not a valid decision."
+
         try:
-            decision = supervisor.parse_decision(await self.ask_lead(run_id, prompt), model_ids, targets)
+            decision, problem = read(await self.ask_lead(run_id, prompt))
             if decision is None:
                 # Same conversation: it only has to say what it decided in the asked form.
-                decision = supervisor.parse_decision(await self.ask_lead(
-                    run_id, "That was not a valid decision.\n" + supervisor.decision_format(bool(targets))),
-                    model_ids, targets)
+                decision, _ = read(await self.ask_lead(
+                    run_id, f"{problem}\n" + supervisor.decision_format(bool(targets), final)))
             return decision
         except asyncio.CancelledError:
             raise
         except BudgetExceeded:
             async with self.locks.setdefault(run_id, asyncio.Lock()):
                 run = self.db.get_run(run_id)
-                next(item for item in run.plan.nodes if item.id == node_id).status = NodeStatus.PENDING
+                for item in run.plan.nodes:
+                    if item.id == node_id:
+                        item.status = NodeStatus.PENDING
                 self._pause_for_budget(run)
                 self._save(run)
             return "budget"
         except Exception:
             return None
+
+    def _change_plan(self, run, change: dict, deciding: Optional[str]) -> dict:
+        return replan.change_plan(run, change, list(self.model_lookup.values()), self._configured(run),
+                                  any(item.kind == "image" for item in run.attachments), deciding)
+
+    def _plan_problem(self, run_id: str, change: dict, deciding: Optional[str]) -> Optional[str]:
+        """Why a plan change cannot be made, tried on a copy of the task; None if it can."""
+        try:
+            self._change_plan(self.db.get_run(run_id).model_copy(deep=True), change, deciding)
+        except (replan.PlanError, AttributeError, TypeError, KeyError) as exc:
+            # A malformed change (not the shape asked for) is as unusable as an impossible one.
+            return str(exc) or type(exc).__name__
+        return None
+
+    def _reopen(self, run, targets: set[str], note: str) -> list[str]:
+        """Send finished steps back to be redone with ``note``, and everything built on them."""
+        reopened = targets | quality.descendants(run, targets)
+        for node in run.plan.nodes:
+            if node.id not in reopened:
+                continue
+            node.generation += 1
+            node.status, node.failed_attempts = NodeStatus.PENDING, 0
+            node.feedback = f"负责人检查整体结果后要求返工：{note}" if node.id in targets else None
+        return sorted(reopened)
+
+    async def _final_review(self, run_id: str) -> bool:
+        """Every step has finished: the lead checks the whole result against the request. True if
+        it sent work back or changed the plan, so the task goes on; False to finish it."""
+        run = self.db.get_run(run_id)
+        if not self._can_lead() or not (run.supervisor and run.supervisor.model_id):
+            return False
+        counted = [item for item in run.decisions if item.action != "fallback"
+                   and (run.decisions_since is None or item.created_at >= run.decisions_since)]
+        left = settings.max_run_decisions - len(counted)
+        if left <= 0:
+            return False
+        targets = {node.id for node in run.plan.nodes}
+        decision = await self._ask_for_decision(run_id, None, supervisor.final_message(run, left), set(),
+                                                targets, final=True)
+        if decision == "budget":
+            return True
+        if decision is None:
+            return False
+        action, reason = decision["action"], decision.get("reason", "")
+        async with self.locks.setdefault(run_id, asyncio.Lock()):
+            run = self.db.get_run(run_id)
+            run.decisions.append(Decision(event="all_done", action=action, reason=reason,
+                                          instructions=decision.get("instructions"), targets=decision.get("targets", []),
+                                          lead_model_id=run.supervisor.model_id))
+            changes = None
+            if action == "rework":
+                self._reopen(run, set(decision["targets"]), decision.get("instructions") or reason)
+            elif action == "replan":
+                changes = self._change_plan(run, decision["plan"], None)
+            self._save(run)
+        self.emit(run_id, "run.decision", action=action, reason=reason, targets=decision.get("targets"),
+                  event="all_done")
+        if changes:
+            self.emit(run_id, "run.plan_changed", **changes)
+        return action != "done"
 
     async def _record_fallback(self, run_id: str, node_id: str) -> None:
         async with self.locks.setdefault(run_id, asyncio.Lock()):
@@ -128,7 +197,7 @@ class Leading:
         """Do what the lead decided for the step, and record it with its reason."""
         action, reason = decision["action"], decision.get("reason", "")
         instructions = decision.get("instructions")
-        repair = None
+        repair = changes = None
         async with self.locks.setdefault(run_id, asyncio.Lock()):
             run = self.db.get_run(run_id)
             node = next(item for item in run.plan.nodes if item.id == node_id)
@@ -150,6 +219,13 @@ class Leading:
                           attempt=len(node.attempts) + 1)
             elif action == "rework":
                 self._send_back(run, node, verdict, set(decision["targets"]), instructions, limited=False)
+            elif action == "replan":
+                changes = self._change_plan(run, decision["plan"], node_id)
+                current = next((item for item in run.plan.nodes if item.id == node_id), None)
+                if current is not None:
+                    # The step stays in the plan: it runs again, after any steps added before it.
+                    current.status = NodeStatus.PENDING
+                    current.feedback = quality.retry_feedback(current.feedback, "\n".join(filter(None, [verdict.reason, asked])))
             elif action == "accept":
                 node.status, node.feedback = NodeStatus.SUCCEEDED, None
                 node.review = f"负责人接受：{reason}"
@@ -181,6 +257,8 @@ class Leading:
             self._save(run)
         self.emit(run_id, "run.decision", node_id=node_id, action=action, reason=reason,
                   model_id=decision.get("model_id"), targets=decision.get("targets"), event=event)
+        if changes:
+            self.emit(run_id, "run.plan_changed", **changes)
         if repair:
             await self._repair(run_id, node_id, repair[0], outcome, brief=repair[1])
 

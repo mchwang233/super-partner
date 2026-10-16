@@ -63,3 +63,24 @@ async def task_api(tmp_path, monkeypatch):
         await api.catalog_sync.close()
         await api.providers.client.aclose()
         database.connection.close()
+
+
+@pytest.fixture
+def database(tmp_path, monkeypatch):
+    """A one-step task with a lead (test_leading.py, test_replan.py): failures go to the lead."""
+    from super_partner.config import settings
+    from super_partner.db import Database
+    from super_partner.models import ExecutionRun, RunStatus, SupervisorSession, TaskNode, TaskPlan
+
+    monkeypatch.setattr(settings, "workspace_root", tmp_path / "workspaces")
+    monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
+    monkeypatch.setattr(settings, "review_nodes", False)
+    monkeypatch.setattr(settings, "auto_diagnose", True)
+    monkeypatch.setattr(settings, "lead_decisions", True)
+    database = Database(tmp_path / "test.db")
+    node = TaskNode(id="a", title="实现", instructions="写代码", capability="coding", model_id="x:api")
+    database.save_run(ExecutionRun(
+        id="r", prompt="写一个工具", status=RunStatus.QUEUED, budget_usd=1,
+        supervisor=SupervisorSession(model_id="cli:claude", session_id="lead-1", cwd=str(tmp_path / "lead")),
+        plan=TaskPlan(summary="s", nodes=[node])))
+    return database

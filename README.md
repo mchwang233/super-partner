@@ -254,7 +254,14 @@ new diagnosis each time. It answers with one decision and a reason, shown as `ru
 lead before anything is sent back: it judges whether the findings are real problems, new
 requirements the task never asked for, or mistakes of the verification, then reworks the steps
 it chooses with what to change (`rework`), accepts, or reruns the verification. Without a lead,
-the findings send all verified steps back, up to `SUPER_PARTNER_MAX_REWORK_ROUNDS`. Without a lead able to
+the findings send all verified steps back, up to `SUPER_PARTNER_MAX_REWORK_ROUNDS`.
+
+The lead may also change the plan (`replan`): add steps, remove or rewrite steps that have not
+finished (finished and running steps stay; dependencies must stay acyclic; new steps are routed
+like planned ones), shown as `run.plan_changed`. When every step has finished, the lead checks the
+whole result against the request before the task ends: `done`, `rework` of any steps with what
+to change, or `replan` to add what is missing. The older rules (attempt counts, rework rounds,
+a diagnosis per failure) remain as the fallback when no lead can decide. Without a lead able to
 decide, the diagnosis below handles the failure. `SUPER_PARTNER_LEAD_DECISIONS=false` turns this
 off.
 

@@ -54,7 +54,8 @@ class Settings(BaseSettings):
     # Subtasks (and their reviews) go to API models; a membership CLI only takes a subtask no
     # API model can do. Planning may still use a CLI.
     subtasks_prefer_api: bool = True
-    # Diagnose a task automatically when one of its nodes runs out of attempts.
+    # Handle a failed attempt instead of only retrying it: the task's lead decides (lead_decisions),
+    # or, without a lead able to, a diagnosis looks for what blocks it.
     auto_diagnose: bool = True
     # Diagnose and repair this application's source, separately from task workspaces.
     platform_self_repair: bool = True
@@ -62,9 +63,10 @@ class Settings(BaseSettings):
     platform_repair_attempts: int = Field(default=2, ge=1, le=3)
     # Have another model check each node's result against its acceptance criteria.
     review_nodes: bool = True
-    # Runs per node (first try plus retries) before it fails; retries go to the strongest model.
+    # Without a lead deciding (the fallback): runs per node (first try plus retries) before it
+    # fails, retries going to the strongest model, and times verification nodes may send work back
+    # within one task. With a lead, max_node_decisions and max_run_decisions bound it instead.
     max_node_attempts: int = Field(default=3, ge=1, le=10)
-    # Times verification nodes may send work back for rework within one task.
     max_rework_rounds: int = Field(default=2, ge=0, le=10)
     # Upstream results longer than this reach downstream nodes as a summary.
     handoff_max_chars: int = Field(default=4000, ge=500)
