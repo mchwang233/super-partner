@@ -122,6 +122,10 @@ async def lifespan(_: FastAPI):
             run.status = RunStatus.PAUSED
             db.save_run(run)
             db.add_event(Event(run_id=run.id, kind="approval.required", data={"reason": "interrupted"}))
+        if run.lead_thinking:
+            # The restart cut the lead off mid-decision.
+            run.lead_thinking = None
+            db.save_run(run)
         interrupted = [item for item in run.diagnoses if item.status == "running"]
         for item in interrupted:
             item.status, item.error = "failed", "服务重启打断了诊断。"

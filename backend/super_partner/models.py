@@ -285,8 +285,11 @@ class DiagnosisMessage(BaseModel):
 class Diagnosis(BaseModel):
     """A strong model's analysis of why a task is stuck, with advice for the next attempt."""
     id: str
-    trigger: str  # manual (the 诊断 button) or auto (a node ran out of attempts)
+    # manual (the 诊断 button), auto (a node ran out of attempts), lead (the lead's question to
+    # the user) or lead_repair (a repair the lead asked for, under its decision ``decision_id``)
+    trigger: str
     node_id: Optional[str] = None
+    decision_id: Optional[str] = None
     model_id: Optional[str] = None
     status: str = "running"  # running | done | failed
     report: Optional[str] = None
@@ -314,7 +317,7 @@ class Decision(BaseModel):
     """What the task's lead decided, why, and about what (supervisor.py)."""
     id: str = Field(default_factory=lambda: uuid4().hex[:8])
     node_id: Optional[str] = None
-    # What it decided on: attempt_failed | user_answer.
+    # What it decided on: attempt_failed | verify_failed | user_answer | repair_done | all_done.
     event: str
     # retry | switch_model | accept | unable | ask_user | repair_environment | repair_platform,
     # or fallback when no lead could decide and the usual diagnosis took over.
@@ -326,6 +329,14 @@ class Decision(BaseModel):
     targets: list[str] = Field(default_factory=list)
     lead_model_id: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class LeadThinking(BaseModel):
+    """The lead is deciding something right now, shown until its decision arrives."""
+    # attempt_failed | verify_failed | user_answer | repair_done | overrun | all_done
+    event: str
+    node_id: Optional[str] = None
+    started_at: datetime = Field(default_factory=utcnow)
 
 
 class LeadMessage(BaseModel):
@@ -372,6 +383,7 @@ class ExecutionRun(BaseModel):
     supervisor: Optional[SupervisorSession] = None
     decisions: list[Decision] = Field(default_factory=list)
     lead_messages: list[LeadMessage] = Field(default_factory=list)
+    lead_thinking: Optional[LeadThinking] = None
     # Decisions counted against the limits only from here: the user continuing a task resets them.
     decisions_since: Optional[datetime] = None
     # Only tasks deliberately held for an application repair may resume after its restart.

@@ -202,3 +202,36 @@ async def test_the_user_talks_with_the_lead_in_its_conversation(database):
     asked, answered = database.get_run("r").lead_messages
     assert asked.text == "记得要处理空文件" and answered.status == "done" and "空文件" in answered.text
     assert "MESSAGE from the user" in team.lead[0] and "记得要处理空文件" in team.lead[0]
+
+
+async def test_the_panel_shows_the_lead_deciding_until_it_has(database):
+    seen = []
+
+    class Watched(Team):
+        async def converse(self, session, prompt, spend_ok=None, timeout=600):
+            seen.append(database.get_run("r").lead_thinking)
+            return await super().converse(session, prompt, spend_ok, timeout)
+
+    _, result = await run(database, Watched([decision("retry", instructions="再试")]))
+    assert (seen[0].event, seen[0].node_id) == ("attempt_failed", "a")
+    assert result.lead_thinking is None
+    assert any(event.kind == "run.lead_thinking" for event in database.events("r"))
+
+
+async def test_a_repair_that_did_not_work_goes_back_to_the_lead_before_the_step_runs(database):
+    class Failing(Team):
+        async def complete(self, model_id, prompt, workspace=None, **kwargs):
+            if kwargs.get("repair"):
+                self.diagnoses.append(prompt)
+                return ProviderResult("## 修复内容\n没找到可用的 SSH 私钥\nSTATUS: RETRY", 0, 0, model_id)
+            return await super().complete(model_id, prompt, workspace, **kwargs)
+
+    team = Failing([decision("repair_environment", instructions="把私钥放进工作目录"),
+                    decision("unable", user_action="提供服务器登录凭据")], fails=10)
+    _, result = await run(database, team)
+    repair = result.diagnoses[-1]
+    assert (repair.trigger, repair.decision_id) == ("lead_repair", result.decisions[0].id)
+    assert "EVENT: the repair you asked for" in team.lead[-1] and "没找到可用的 SSH 私钥" in team.lead[-1]
+    # The step was not sent back to meet the same wall: the lead ended it.
+    assert len(team.work) == 1 and result.plan.nodes[0].status == NodeStatus.UNABLE
+    assert [item.event for item in result.decisions] == ["attempt_failed", "repair_done"]

@@ -5,6 +5,7 @@ into executor.Executor."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
@@ -17,6 +18,7 @@ from .models import (
     Diagnosis,
     DiagnosisStatus,
     LeadMessage,
+    LeadThinking,
     NodeStatus,
     Outcome,
     RunStatus,
@@ -69,7 +71,9 @@ class Leading:
         targets = self._targets(run, node) if verifying else None
         prompt = (supervisor.verification_message(run, node, verdict, choices, left) if verifying
                   else supervisor.failure_message(run, node, node.attempts[-1], verdict, choices, left))
-        decision = await self._ask_for_decision(run_id, node_id, prompt, {item.id for item in choices}, targets)
+        event = "verify_failed" if verifying else "attempt_failed"
+        decision = await self._ask_for_decision(run_id, node_id, prompt, {item.id for item in choices}, targets,
+                                                event=event)
         if decision is None:
             await self._record_fallback(run_id, node_id)
             if verifying:
@@ -81,19 +85,41 @@ class Leading:
             else:
                 await self._repair(run_id, node_id, verdict, outcome)
         elif decision != "budget":
-            await self._apply_decision(run_id, node_id, decision, verdict, outcome,
-                                       "verify_failed" if verifying else "attempt_failed")
+            await self._apply_decision(run_id, node_id, decision, verdict, outcome, event)
 
     @staticmethod
     def _targets(run, node) -> set[str]:
         """The steps a verification may send back: those it checks."""
         return {item for item in node.verifies if any(other.id == item for other in run.plan.nodes)}
 
+    @contextlib.asynccontextmanager
+    async def _thinking(self, run_id: str, event: str, node_id: Optional[str]):
+        """Shows that the lead is deciding ``event`` (the panel and the timeline) until it is done."""
+        async def show(thinking: Optional[LeadThinking]):
+            async with self.locks.setdefault(run_id, asyncio.Lock()):
+                run = self.db.get_run(run_id)
+                if run:
+                    run.lead_thinking = thinking
+                    self._save(run)
+
+        await show(LeadThinking(event=event, node_id=node_id))
+        self.emit(run_id, "run.lead_thinking", event=event, node_id=node_id)
+        try:
+            yield
+        finally:
+            await asyncio.shield(show(None))
+
     async def _ask_for_decision(self, run_id: str, node_id: Optional[str], prompt: str, model_ids: set[str],
-                                targets: Optional[set[str]] = None, final: bool = False):
+                                targets: Optional[set[str]] = None, final: bool = False,
+                                event: str = "attempt_failed"):
         """The lead's decision; None when no lead can give a valid one, or "budget" when the task
         has run out of budget for asking (it is then paused). ``targets``: the steps rework may
-        send back; ``final``: every step has finished."""
+        send back; ``final``: every step has finished; ``event``: what it decides on."""
+        async with self._thinking(run_id, event, node_id):
+            return await self._decision(run_id, node_id, prompt, model_ids, targets, final)
+
+    async def _decision(self, run_id: str, node_id: Optional[str], prompt: str, model_ids: set[str],
+                        targets: Optional[set[str]], final: bool):
         def read(reply: str):
             decision = supervisor.parse_decision(reply, model_ids, targets, final)
             if decision and decision["action"] == "replan":
@@ -160,7 +186,7 @@ class Leading:
             return False
         targets = {node.id for node in run.plan.nodes}
         decision = await self._ask_for_decision(run_id, None, supervisor.final_message(run, left), set(),
-                                                targets, final=True)
+                                                targets, final=True, event="all_done")
         if decision == "budget":
             return True
         if decision is None:
@@ -203,11 +229,12 @@ class Leading:
             node = next(item for item in run.plan.nodes if item.id == node_id)
             if run.status == RunStatus.CANCELLED or node.status not in {NodeStatus.RUNNING, NodeStatus.PENDING}:
                 return
-            run.decisions.append(Decision(
+            made = Decision(
                 node_id=node_id, event=event, action=action, reason=reason, instructions=instructions,
                 model_id=decision.get("model_id"), targets=decision.get("targets", []),
                 lead_model_id=run.supervisor.model_id if run.supervisor else None,
-            ))
+            )
+            run.decisions.append(made)
             asked = f"负责人要求：{instructions}" if instructions else ""
             if action in {"retry", "switch_model"}:
                 if action == "switch_model":
@@ -248,8 +275,8 @@ class Leading:
                 self.emit(run_id, "run.diagnosis_question", diagnosis_id=question.id,
                           question=question.question, choices=question.choices)
             else:
-                # A repair session with access to this machine (or a platform source repair)
-                # does the work; the diagnosis flow then runs the step again or pauses.
+                # A repair session with access to this machine (or a platform source repair) does
+                # the work; its outcome comes back to the lead (_after_repair) before the step runs.
                 node.status = NodeStatus.RUNNING
                 what = ("Super Partner itself is at fault; make a platform repair (STATUS: PLATFORM_REPAIR)"
                         if action == "repair_platform" else "the environment needs a repair")
@@ -260,7 +287,28 @@ class Leading:
         if changes:
             self.emit(run_id, "run.plan_changed", **changes)
         if repair:
-            await self._repair(run_id, node_id, repair[0], outcome, brief=repair[1])
+            await self._repair(run_id, node_id, repair[0], outcome, brief=repair[1], decision_id=made.id)
+
+    async def _after_repair(self, run_id: str, node_id: str, diagnosis_id: str, verdict: quality.Verdict,
+                            outcome: str) -> bool:
+        """A repair the lead asked for has ended: the lead sees how, and decides what happens to
+        the step, so a repair that did not work does not send the step back into the same wall.
+        False when no lead could decide; the usual handling of a repair then applies."""
+        run = self.db.get_run(run_id)
+        node = next(item for item in run.plan.nodes if item.id == node_id)
+        diagnosis = next(item for item in run.diagnoses if item.id == diagnosis_id)
+        left = self._decisions_left(run, node)
+        if min(left) <= 0:
+            return False
+        choices = self._choices(run, node)
+        decision = await self._ask_for_decision(
+            run_id, node_id, supervisor.repair_message(run, node, diagnosis, choices, left),
+            {item.id for item in choices}, event="repair_done")
+        if decision is None:
+            return False
+        if decision != "budget":
+            await self._apply_decision(run_id, node_id, decision, verdict, outcome, "repair_done")
+        return True
 
     def start_lead_chat(self, run_id: str, text: str) -> bool:
         """The user writes to the lead: the message and a pending reply are saved at once, and the
@@ -312,7 +360,7 @@ class Leading:
             targets = self._targets(run, node) or None
             decision = await self._ask_for_decision(
                 run_id, node.id, supervisor.answer_message(node, question.question, answer, bool(targets)),
-                {m.id for m in choices}, targets)
+                {m.id for m in choices}, targets, event="user_answer")
             if decision == "budget":
                 return
             if decision is None:

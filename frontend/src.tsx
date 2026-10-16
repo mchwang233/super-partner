@@ -6,13 +6,13 @@ import { PlanGraph, type PlanNode } from "./plan-graph";
 import { ResultPage, type ChangeOptions } from "./result-page";
 import { MarkdownView } from "./markdown";
 import { DiagnosisPanel, type Diagnosis } from "./diagnosis";
-import { LeadPanel, hasLead, type AskLead, type Decision, type LeadMessage } from "./lead";
+import { LeadPanel, hasLead, leadRepairIds, type AskLead, type Decision, type LeadMessage, type LeadThinking } from "./lead";
 import { ProjectField, rememberProject } from "./project-picker";
 import { canCancelMission, canDeleteMission, CancelMissionDialog, DeleteMissionButton, DeleteMissionDialog, formatUsd, MissionHistory, needsAttention, statusLabel } from "./mission-history";
 import "./style.css";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
-type Run = {id:string;status:string;prompt?:string;created_at?:string;updated_at?:string;diagnoses?:Diagnosis[];supervisor?:{model_id?:string|null;calls?:number}|null;decisions?:Decision[];lead_messages?:LeadMessage[];maintenance_id?:string|null;waiting_diagnosis_id?:string|null;parent_run_id?:string|null;budget_usd:number;use_cli:boolean;allow_network?:boolean;project_dir?:string|null;attachments?:Attachment[];rework_rounds?:number;actual_cost_usd:number;final_result?:string;error?:string;plan:{summary:string;nodes:PlanNode[];planning_method:string;planner_model_id?:string;planning_note?:string;planning_cost_usd:number;estimate:{low_usd:number;high_usd:number}}};
+type Run = {id:string;status:string;prompt?:string;created_at?:string;updated_at?:string;diagnoses?:Diagnosis[];supervisor?:{model_id?:string|null;calls?:number}|null;decisions?:Decision[];lead_messages?:LeadMessage[];lead_thinking?:LeadThinking|null;maintenance_id?:string|null;waiting_diagnosis_id?:string|null;parent_run_id?:string|null;budget_usd:number;use_cli:boolean;allow_network?:boolean;project_dir?:string|null;attachments?:Attachment[];rework_rounds?:number;actual_cost_usd:number;final_result?:string;error?:string;plan:{summary:string;nodes:PlanNode[];planning_method:string;planner_model_id?:string;planning_note?:string;planning_cost_usd:number;estimate:{low_usd:number;high_usd:number}}};
 type ReplyToDiagnosis = (run:Run, diagnosisId:string, body:{text:string;choice?:string})=>Promise<string|null>;
 type Provider = {id:string;name:string;configured:boolean};
 // The task list polls often; the model catalog is large and changes rarely.
@@ -149,6 +149,7 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "run.recovered":data=>data.reason==="lead"?"负责人已处理你的回答，任务继续":"诊断已处理阻碍，任务自动继续",
   "run.decision":(data,title)=>`负责人决定${data.node_id?`（${title(data.node_id)}）`:""}：${({retry:"按要求重试",switch_model:`换成 ${data.model_id??"其它模型"}`,accept:"接受当前结果",unable:"判定无法完成",ask_user:"需要问你",repair_environment:"修复环境",repair_platform:"修复 Super Partner",rework:`返工 ${(data.targets??[]).map(title).join("、")}`,replan:"调整计划",done:"确认任务完成",fallback:"暂时无法决策，交给诊断"} as Record<string,string>)[data.action]??data.action}${data.reason?` · ${data.reason}`:""}`,
   "run.plan_changed":data=>`负责人调整了计划：${[data.added?.length?`新增 ${data.added.join("、")}`:"",data.removed?.length?`删除 ${data.removed.join("、")}`:"",data.updated?.length?`修改 ${data.updated.join("、")}`:""].filter(Boolean).join("；")}`,
+  "run.lead_thinking":(data,title)=>`负责人开始判断${data.node_id?`（${title(data.node_id)}）`:""}：${({attempt_failed:"尝试失败后怎么处理",verify_failed:"验证没通过是否返工",user_answer:"根据你的回答下一步做什么",all_done:"整体结果是否满足需求",repair_done:"修复是否真的生效",overrun:"超出预计轮数是否继续"} as Record<string,string>)[data.event]??data.event}`,
   "run.lead_changed":data=>`负责人换成 ${data.model_id}${data.previous_model_id?`（原为 ${data.previous_model_id}）`:""}`,
   "node.succeeded":(data,title)=>`${title(data.node_id)}：完成`,
   "node.overrun_check":(data,title)=>data.stop?`${title(data.node_id)}：已用 ${data.turns} 轮（预计 ${data.expected} 轮），负责人停止了这次尝试（${data.reason??""}）`:`${title(data.node_id)}：已用 ${data.turns} 轮（预计 ${data.expected} 轮），负责人判断仍在推进，继续执行`,
@@ -281,7 +282,7 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
     {run.error&&<div className="error">{run.error}</div>}
     {hasLead(run)&&<LeadPanel run={run} models={models} onReply={(id,body)=>onReply(run,id,body)} onAsk={(text=>onAsk(run,text)) satisfies AskLead}/>}
     {/* Diagnoses that run when no lead decides, or that the lead sends to repair something. */}
-    <DiagnosisPanel run={{...run,diagnoses:(run.diagnoses??[]).filter(item=>item.trigger!=="lead")}} models={models} onReply={(id,body)=>onReply(run,id,body)}/>
+    <DiagnosisPanel run={{...run,diagnoses:(run.diagnoses??[]).filter(item=>item.trigger!=="lead"&&!leadRepairIds(run.diagnoses).has(item.id))}} models={models} onReply={(id,body)=>onReply(run,id,body)}/>
     <nav className="task-tabs" aria-label="任务内容">{([["progress","进度"],["result","结果"],["details","详情"]] as const).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}</button>)}</nav>
     {tab==="progress"&&<PlanGraph apiBase={API} runId={run.id} runStatus={run.status} nodes={nodes} inProject={!!run.project_dir} models={models} onOpenProfile={onOpenModel} reworkRounds={run.rework_rounds}/>}
     {tab==="result"&&<ResultPage apiBase={API} run={run} embedded onChange={(prompt,budget,options)=>onChange(run,prompt,budget,options)}/>}

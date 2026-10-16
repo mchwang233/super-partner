@@ -41,7 +41,7 @@ class Diagnosing:
     _mark_unable, _route_after_unavailable) and self-repair (_fix_platform)."""
 
     async def _repair(self, run_id: str, node_id: str, verdict: quality.Verdict, outcome: str,
-                      diagnosis_id: Optional[str] = None, brief: str = "") -> None:
+                      diagnosis_id: Optional[str] = None, brief: str = "", decision_id: Optional[str] = None) -> None:
         """After a failed attempt, a strong model (a membership CLI when possible) looks for
         what blocks the node outside the task (missing software, sandbox or machine limits,
         configuration) and repairs it. Its status decides the rest (see _repair_done).
@@ -61,8 +61,9 @@ class Diagnosing:
                 busy = self.diagnosing.get(run_id)
                 if not busy or busy.done():
                     node = next(item for item in run.plan.nodes if item.id == node_id)
-                    diagnosis_id = self.begin_diagnosis(run, "auto", node_id)
+                    diagnosis_id = self.begin_diagnosis(run, "lead_repair" if decision_id else "auto", node_id)
                     diagnosis = run.diagnoses[-1]
+                    diagnosis.decision_id = decision_id
                     if diagnosis_id:
                         self.diagnosing[run_id] = asyncio.current_task()
                     self._save(run)
@@ -187,8 +188,11 @@ class Diagnosing:
                           next_model_id=following, error=str(exc)[:300])
 
     async def _repair_done(self, run_id: str, node_id: str, diagnosis_id: str, text, error, cost: float,
-                           verdict: quality.Verdict, outcome: str, shared_files: Optional[list[str]] = None) -> None:
-        """Act on the diagnosis of a failed attempt; recovery.after_diagnosis decides what to do."""
+                           verdict: quality.Verdict, outcome: str, shared_files: Optional[list[str]] = None,
+                           consult: bool = True) -> None:
+        """Act on the diagnosis of a failed attempt: a repair the lead asked for goes back to the
+        lead (``consult``); otherwise recovery.after_diagnosis decides what to do."""
+        handover = False
         async with self.locks.setdefault(run_id, asyncio.Lock()):
             run = self.db.get_run(run_id)
             if not run:
@@ -224,9 +228,14 @@ class Diagnosing:
                 self._save(run)
                 return
             status = diagnosis.verdict if diagnosis.status == "done" else None
-            action = after_diagnosis(outcome, status, has_model=bool(node.model_id),
-                                     environment_fixes=node.environment_fixes)
-            if action == "hold_for_platform":
+            # A repair the lead asked for goes back to it, unless it needs the user or a platform repair.
+            handover = (consult and bool(diagnosis.decision_id) and self._can_lead()
+                        and status not in {DiagnosisStatus.PLATFORM_PENDING, DiagnosisStatus.NEEDS_INPUT})
+            action = "lead" if handover else after_diagnosis(outcome, status, has_model=bool(node.model_id),
+                                                             environment_fixes=node.environment_fixes)
+            if action == "lead":
+                pass
+            elif action == "hold_for_platform":
                 node.status = NodeStatus.PENDING
                 node.environment_fixes += 1
                 self._hold_for_platform(run, force=diagnosis.trigger == "manual")
@@ -287,6 +296,9 @@ class Diagnosing:
                         f"（诊断没有完成：{diagnosis.error or '没有可用的诊断模型'}）" if diagnosis.status != "done" else "")
                     self._pause_for_diagnosis(run, node, diagnosis, why)
             self._save(run)
+        if handover and not await self._after_repair(run_id, node_id, diagnosis_id, verdict, outcome):
+            await self._repair_done(run_id, node_id, diagnosis_id, None, None, 0.0, verdict, outcome,
+                                    shared_files, consult=False)
 
     def _pause_for_diagnosis(self, run: ExecutionRun, node, diagnosis: Diagnosis, why: str) -> None:
         run.error = f"步骤「{node.title}」{why}，任务已暂停。请查看诊断报告，处理后点“按此预算继续”。"

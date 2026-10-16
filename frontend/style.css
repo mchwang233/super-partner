@@ -540,3 +540,8 @@ pre.result-text{max-height:none}
 .lead-instructions{margin-top:6px;font-size:12.5px}
 .lead-instructions summary{cursor:pointer;color:var(--accent)}
 .lead-instructions p{margin:6px 0 0;padding:8px 10px;border-radius:8px;background:var(--bg);line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
+.lead-repair{margin-top:8px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2);font-size:12.5px}
+.lead-repair-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.lead-repair-next{margin:6px 0 0;font-size:12px}
+.lead-thinking .diagnosis-running{margin:0}
+.node-scope p{margin:2px 0;font-size:12.5px;overflow-wrap:anywhere}

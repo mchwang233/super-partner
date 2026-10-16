@@ -1234,3 +1234,23 @@ test("the lead panel shows its decisions and questions, takes replies, and lets 
   assert.match(panel().querySelector(".markdown-body").textContent, /0 秒/);
   assert.equal(document.querySelector('[aria-label="给负责人的消息"]').closest("fieldset").disabled, false);
 });
+
+test("the lead panel shows the lead deciding, and the repair it asked for under its decision", async t => {
+  const run = mission("thinking-task", "running");
+  run.plan.nodes = [{ id: "d", title: "发布", dependencies: [], status: "running", estimated_cost_usd: 0, attempts: [] }];
+  run.supervisor = { model_id: "cli:codex", calls: 2 };
+  run.lead_thinking = { event: "attempt_failed", node_id: "d", started_at: new Date(Date.now() - 45_000).toISOString() };
+  run.decisions = [{ id: "d1", node_id: "d", event: "attempt_failed", action: "repair_environment",
+    reason: "部署只差 SSH 凭据。", instructions: "把私钥临时放进工作目录", created_at: "2026-10-16T07:19:00Z" }];
+  run.diagnoses = [{ id: "r1", trigger: "lead_repair", decision_id: "d1", node_id: "d", model_id: "cli:codex",
+    status: "done", verdict: "retry", report: "没找到可读的私钥。", created_at: "2026-10-16T07:19:05Z" }];
+  const models = [{ id: "cli:codex", provider: "openai", display_name: "Codex CLI", channel: "cli", enabled: true, configured: true, scores: null }];
+  const { document } = await setup(t, [run], models, { openComposer: false });
+  const panel = document.querySelector(".lead-panel");
+  assert.match(panel.textContent, /判断中/);
+  assert.match(panel.querySelector(".lead-thinking").textContent, /尝试失败了，正在判断怎么处理：「发布」 · 已 4\d 秒/);
+  const repair = panel.querySelector(".lead-decision .lead-repair");
+  assert.match(repair.textContent, /修复Codex CLI未发现环境问题.*修复报告.*结果已交回负责人/s);
+  // Its repair is not shown again in the separate diagnosis panel.
+  assert.equal(document.querySelectorAll(".diagnosis-card").length, 1);
+});

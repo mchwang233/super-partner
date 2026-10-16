@@ -319,6 +319,28 @@ def chat_message(text: str) -> str:
     )
 
 
+MAX_REPAIR_REPORT = 3000
+
+
+def repair_message(run: ExecutionRun, node, diagnosis, choices: list[ModelProfile], left: tuple[int, int]) -> str:
+    """The repair the lead asked for has ended: hand it its outcome before the step runs again."""
+    outcome = (f"It ended with status {diagnosis.verdict or 'none'}." if diagnosis.status == "done"
+               else f"It did not finish: {diagnosis.error or 'no reason given'}.")
+    return "\n".join([
+        f"EVENT: the repair you asked for step [{node.id}] {node.title} has ended. {outcome}",
+        f"Its report:\n{(diagnosis.report or '(none)')[:MAX_REPAIR_REPORT]}",
+        "Where the steps stand:", *_steps(run),
+        "Models that can take this step:", *_models(choices, node),
+        f"Decisions left: {left[0]} for this step, {left[1]} for the task; after that the task pauses for the user.",
+        "",
+        ("Decide what to do with the step now. Run it again only if the report shows the obstacle was "
+         "removed and checked (for example a login or command that now works); if the repair did not "
+         "do that, do not send the step back to meet the same obstacle: repair again differently, ask "
+         "the user, or mark it unable."),
+        DECISION_FORMAT,
+    ])
+
+
 def answer_message(node, question: str, answer: str, rework: bool = False) -> str:
     """Hand the user's answer to the lead's question back to it."""
     return "\n".join([

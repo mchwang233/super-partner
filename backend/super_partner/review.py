@@ -136,7 +136,8 @@ class Reviewing:
         async def check(evidence: str) -> Optional[str]:
             turns = int(evidence.split(" ", 1)[0]) if evidence[:1].isdigit() else 0
             try:
-                reply = await self.ask_lead(run.id, supervisor.overrun_message(node, turns, expected, evidence))
+                async with self._thinking(run.id, "overrun", node.id):
+                    reply = await self.ask_lead(run.id, supervisor.overrun_message(node, turns, expected, evidence))
                 reason = progress.parse(reply)
             except (asyncio.CancelledError, BudgetExceeded):
                 raise
