@@ -67,7 +67,7 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
     constructor() { super(); channels.push(this); }
   };
   const state = {
-    records, models, actions: [], resumes: [], publishes: [], uploads: [], attachmentDeletes: [], taskBodies: [], diagnosisReplies: [], followups: [], network: [],
+    records, models, actions: [], resumes: [], publishes: [], uploads: [], attachmentDeletes: [], taskBodies: [], diagnosisReplies: [], leadMessages: [], followups: [], network: [],
     deletes: [], cancels: [], confirms: [], taskPosts: 0, quota: [], quotaResets: [], nativePicker: true, pickerStarts: [], nativeConfirms: 0, holdNextRead: false, releaseRead: null,
   };
   const json = value => new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
@@ -126,6 +126,17 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
       const id = decodeURIComponent(path.slice("/api/tasks/".length, -"/cancel".length));
       state.cancels.push(id);
       return state.cancelResponse(id, options.signal);
+    }
+    if (options.method === "POST" && path.endsWith("/lead")) {
+      const id = decodeURIComponent(path.split("/")[3]);
+      const { message } = JSON.parse(options.body);
+      state.leadMessages.push({ id, message });
+      const current = state.records.find(run => run.id === id);
+      const updated = { ...current, lead_messages: [...(current.lead_messages ?? []),
+        { id: "m1", role: "user", text: message, status: "done", created_at: "2026-10-16T04:00:00Z" },
+        { id: "m2", role: "lead", text: "", status: "pending", created_at: "2026-10-16T04:00:01Z" }] };
+      state.records = state.records.map(run => run.id === id ? updated : run);
+      return json(updated, 202);
     }
     if (options.method === "POST" && path.endsWith("/reply")) {
       const id = decodeURIComponent(path.split("/")[3]);
@@ -1179,4 +1190,47 @@ test("a requirement change starts with the earlier task's network and CLI settin
   await click(button("生成变更计划"));
   assert.equal(state.followups[0].allow_network, false);
   assert.equal(state.followups[0].use_cli, true);
+});
+
+test("the lead panel shows its decisions and questions, takes replies, and lets you write to it", async t => {
+  const run = mission("led-task", "paused");
+  run.plan.nodes = [{ id: "a", title: "实现", dependencies: [], status: "succeeded", estimated_cost_usd: 0, attempts: [] },
+    { id: "v", title: "验证", dependencies: ["a"], status: "pending", estimated_cost_usd: 0, attempts: [] }];
+  run.supervisor = { model_id: "cli:codex", calls: 3 };
+  run.decisions = [{ id: "d1", node_id: "v", event: "verify_failed", action: "rework", targets: ["a"],
+    reason: "这是原有要求中的真实缺陷。", instructions: "到期时按完成结算", created_at: "2026-10-16T03:31:09Z" }];
+  run.waiting_diagnosis_id = "q1";
+  run.diagnoses = [{ id: "q1", trigger: "lead", node_id: "v", model_id: "cli:codex", status: "done", verdict: "needs_input",
+    report: "两种做法都可以。", question: "数据用 SQLite 还是 JSON？", choices: ["SQLite", "JSON"], created_at: "2026-10-16T03:40:00Z" }];
+  const models = [{ id: "cli:codex", provider: "openai", display_name: "Codex CLI", channel: "cli", enabled: true, configured: true, scores: null }];
+  const context = await setup(t, [run], models, { openComposer: false });
+  const { document, state, act, click, button } = context;
+  const panel = () => document.querySelector(".lead-panel");
+  assert.match(panel().textContent, /负责人Codex CLI.*等你回复/);
+  assert.match(panel().textContent, /验证没通过 · 验证.*返工 实现.*这是原有要求中的真实缺陷/);
+  assert.match(panel().querySelector(".lead-instructions").textContent, /到期时按完成结算/);
+  // The lead's question is answered here, not in a separate diagnosis panel.
+  assert.equal(document.querySelectorAll(".diagnosis-card").length, 1);
+  assert.match(panel().textContent, /数据用 SQLite 还是 JSON/);
+  await click(panel().querySelector('input[value="SQLite"]'));
+  await click(button("回复负责人"));
+  assert.deepEqual(state.diagnosisReplies, [{ id: "led-task", diagnosisId: "q1", choice: "SQLite", text: "" }]);
+
+  // With nothing to answer, you can write to it; its answer arrives with a later poll.
+  state.records[0] = { ...state.records[0], waiting_diagnosis_id: null };
+  await act(async () => state.poll());
+  const box = document.querySelector('[aria-label="给负责人的消息"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(context.window.HTMLTextAreaElement.prototype, "value").set.call(box, "为什么要返工？");
+    box.dispatchEvent(new context.window.Event("input", { bubbles: true }));
+  });
+  await click(button("发送"));
+  assert.deepEqual(state.leadMessages, [{ id: "led-task", message: "为什么要返工？" }]);
+  assert.match(panel().textContent, /为什么要返工？.*负责人正在看任务的情况/s);
+  assert.ok(document.querySelector('[aria-label="给负责人的消息"]').closest("fieldset").disabled);
+  state.records[0] = { ...state.records[0], lead_messages: [state.records[0].lead_messages[0],
+    { ...state.records[0].lead_messages[1], status: "done", text: "因为写出的 **0 秒** 会让数据读不回来。" }] };
+  await act(async () => state.poll());
+  assert.match(panel().querySelector(".markdown-body").textContent, /0 秒/);
+  assert.equal(document.querySelector('[aria-label="给负责人的消息"]').closest("fieldset").disabled, false);
 });

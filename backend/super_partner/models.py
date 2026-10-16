@@ -315,7 +315,18 @@ class Decision(BaseModel):
     reason: str = ""
     instructions: Optional[str] = None
     model_id: Optional[str] = None
+    # Steps a rework sent back.
+    targets: list[str] = Field(default_factory=list)
     lead_model_id: Optional[str] = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class LeadMessage(BaseModel):
+    """The user talking with the task's lead outside its decisions."""
+    id: str = Field(default_factory=lambda: uuid4().hex[:8])
+    role: str  # user | lead
+    text: str = ""
+    status: str = "done"  # pending (the lead is answering) | done | failed
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -353,6 +364,7 @@ class ExecutionRun(BaseModel):
     diagnoses: list[Diagnosis] = Field(default_factory=list)
     supervisor: Optional[SupervisorSession] = None
     decisions: list[Decision] = Field(default_factory=list)
+    lead_messages: list[LeadMessage] = Field(default_factory=list)
     # Decisions counted against the limits only from here: the user continuing a task resets them.
     decisions_since: Optional[datetime] = None
     # Only tasks deliberately held for an application repair may resume after its restart.

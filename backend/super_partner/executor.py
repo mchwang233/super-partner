@@ -44,6 +44,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         self.locks: dict[str, asyncio.Lock] = {}
         # One message at a time in each task's conversation with its lead.
         self.lead_locks: dict[str, asyncio.Lock] = {}
+        # The user's messages to each task's lead, answered in the background.
+        self.lead_tasks: dict[str, asyncio.Task] = {}
         self.project_locks: dict[str, asyncio.Lock] = {}
         self.node_tasks: dict[tuple[str, str], asyncio.Task] = {}
         # Tool calls of each node's attempt in progress, written onto the attempt when it ends.

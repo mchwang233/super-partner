@@ -30,7 +30,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Model choice | `routing.py` | `route_node` (first pick), `strongest_for` (retry), `stronger_than` (escalation), `pick_reviewer`, `diagnosers` |
 | Scheduling, attempts, step outcomes | `executor.py` | `Executor`; see "Executor" below |
 | Reviewing a result | `review.py` (mixed into `Executor`) | `_check`, `_reviewer`, `MAX_BACKUPS` |
-| The lead's decisions after a failed attempt, and its questions to the user | `leading.py` (mixed into `Executor`) | `_decide`, `_apply_decision`, `_decisions_left`, `start_lead_answer`; prompts in `supervisor.failure_message`, `parse_decision` |
+| The lead's decisions after a failed attempt, and its questions to the user | `leading.py` (mixed into `Executor`) | `_decide`, `_apply_decision`, `_decisions_left`, `start_lead_answer`, `start_lead_chat`; prompts in `supervisor.failure_message`, `parse_decision` |
 | Diagnosing failures and acting on them (when no lead decides; repairs the lead asks for) | `diagnosing.py` (mixed into `Executor`) | `_repair`, `_diagnose_with`, `_repair_done`, `begin_diagnosis`, `_run_diagnosis` |
 | Repairing Super Partner itself (flow) | `self_repair.py` (mixed into `Executor`) | `_fix_platform`, `_activate_platform`, `_hold_for_platform`, `restore_platform` |
 | What happens after a failure (retry model, meaning of a diagnosis) | `recovery.py` | `retry_model`, `failed_models`, `after_diagnosis`, `turns_for`, `MODEL_FAILURES` |
@@ -93,6 +93,6 @@ about 35 s), `cd frontend && npm test` and `npm run build` (only when the fronte
 
 ## Frontend (`frontend/`)
 
-`src.tsx` (app shell, task creation, actions), `result-page.tsx` (results, requirement change),
+`src.tsx` (app shell, task creation, actions), `lead.tsx` (the lead's decisions, questions and messages), `result-page.tsx` (results, requirement change),
 `plan-graph.tsx` (steps and attempts), `diagnosis.tsx` (diagnosis chat), `mission-history.tsx`
 (task list), `model-profiles.tsx` (models), `style.css` (tokens and styles).

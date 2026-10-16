@@ -6,12 +6,13 @@ import { PlanGraph, type PlanNode } from "./plan-graph";
 import { ResultPage, type ChangeOptions } from "./result-page";
 import { MarkdownView } from "./markdown";
 import { DiagnosisPanel, type Diagnosis } from "./diagnosis";
+import { LeadPanel, hasLead, type AskLead, type Decision, type LeadMessage } from "./lead";
 import { ProjectField, rememberProject } from "./project-picker";
 import { canCancelMission, canDeleteMission, CancelMissionDialog, DeleteMissionButton, DeleteMissionDialog, formatUsd, MissionHistory, needsAttention, statusLabel } from "./mission-history";
 import "./style.css";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
-type Run = {id:string;status:string;prompt?:string;created_at?:string;updated_at?:string;diagnoses?:Diagnosis[];maintenance_id?:string|null;waiting_diagnosis_id?:string|null;parent_run_id?:string|null;budget_usd:number;use_cli:boolean;allow_network?:boolean;project_dir?:string|null;attachments?:Attachment[];rework_rounds?:number;actual_cost_usd:number;final_result?:string;error?:string;plan:{summary:string;nodes:PlanNode[];planning_method:string;planner_model_id?:string;planning_note?:string;planning_cost_usd:number;estimate:{low_usd:number;high_usd:number}}};
+type Run = {id:string;status:string;prompt?:string;created_at?:string;updated_at?:string;diagnoses?:Diagnosis[];supervisor?:{model_id?:string|null;calls?:number}|null;decisions?:Decision[];lead_messages?:LeadMessage[];maintenance_id?:string|null;waiting_diagnosis_id?:string|null;parent_run_id?:string|null;budget_usd:number;use_cli:boolean;allow_network?:boolean;project_dir?:string|null;attachments?:Attachment[];rework_rounds?:number;actual_cost_usd:number;final_result?:string;error?:string;plan:{summary:string;nodes:PlanNode[];planning_method:string;planner_model_id?:string;planning_note?:string;planning_cost_usd:number;estimate:{low_usd:number;high_usd:number}}};
 type ReplyToDiagnosis = (run:Run, diagnosisId:string, body:{text:string;choice?:string})=>Promise<string|null>;
 type Provider = {id:string;name:string;configured:boolean};
 // The task list polls often; the model catalog is large and changes rarely.
@@ -217,7 +218,7 @@ function QuotaBanner({quota,models,onReset}:{quota:Quota[];models:Model[];onRese
 
 type SetNetwork=(run:Run,allow:boolean)=>Promise<string|null>;
 
-function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,onCancel,onDelete,onOpenModel,onPause,onDiagnose,onReply,onChange,onNetwork,parent,onOpenRun}:{onNetwork:SetNetwork;onChange:(run:Run,prompt:string,budget:number,options:ChangeOptions)=>Promise<string|null>;parent?:Run;onOpenRun:(run:Run)=>void;run:Run|null;models:Model[];onOpenModel:(model:Model)=>void;onPause:(run:Run)=>Promise<string|null>;onDiagnose:(run:Run)=>Promise<string|null>;onReply:ReplyToDiagnosis;deletingId:string|null;cancellingId:string|null;onConfirm:(run:Run,budget:number)=>Promise<string|null>;onResume:(run:Run,budget:number)=>Promise<string|null>;onCancel:(run:Run)=>void;onDelete:(run:Run)=>void}) {
+function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,onCancel,onDelete,onOpenModel,onPause,onDiagnose,onReply,onAsk,onChange,onNetwork,parent,onOpenRun}:{onAsk:(run:Run,text:string)=>Promise<string|null>;onNetwork:SetNetwork;onChange:(run:Run,prompt:string,budget:number,options:ChangeOptions)=>Promise<string|null>;parent?:Run;onOpenRun:(run:Run)=>void;run:Run|null;models:Model[];onOpenModel:(model:Model)=>void;onPause:(run:Run)=>Promise<string|null>;onDiagnose:(run:Run)=>Promise<string|null>;onReply:ReplyToDiagnosis;deletingId:string|null;cancellingId:string|null;onConfirm:(run:Run,budget:number)=>Promise<string|null>;onResume:(run:Run,budget:number)=>Promise<string|null>;onCancel:(run:Run)=>void;onDelete:(run:Run)=>void}) {
   const [budget,setBudget]=useState(run?.budget_usd??2),[error,setError]=useState(""),[busy,setBusy]=useState(false);
   const [tab,setTab]=useState<Tab>(defaultTab(run?.status??"")),picked=useRef(false),[now,setNow]=useState(()=>Date.now());
   useEffect(()=>{setBudget(run?.budget_usd??2);setError("");picked.current=false;setTab(defaultTab(run?.status??""))},[run?.id]);
@@ -276,7 +277,9 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
     </div>}
     {error&&<div className="error" role="alert">{error}</div>}
     {run.error&&<div className="error">{run.error}</div>}
-    <DiagnosisPanel run={run} models={models} onReply={(id,body)=>onReply(run,id,body)}/>
+    {hasLead(run)&&<LeadPanel run={run} models={models} onReply={(id,body)=>onReply(run,id,body)} onAsk={(text=>onAsk(run,text)) satisfies AskLead}/>}
+    {/* Diagnoses that run when no lead decides, or that the lead sends to repair something. */}
+    <DiagnosisPanel run={{...run,diagnoses:(run.diagnoses??[]).filter(item=>item.trigger!=="lead")}} models={models} onReply={(id,body)=>onReply(run,id,body)}/>
     <nav className="task-tabs" aria-label="任务内容">{([["progress","进度"],["result","结果"],["details","详情"]] as const).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}</button>)}</nav>
     {tab==="progress"&&<PlanGraph apiBase={API} runId={run.id} runStatus={run.status} nodes={nodes} inProject={!!run.project_dir} models={models} onOpenProfile={onOpenModel} reworkRounds={run.rework_rounds}/>}
     {tab==="result"&&<ResultPage apiBase={API} run={run} embedded onChange={(prompt,budget,options)=>onChange(run,prompt,budget,options)}/>}
@@ -366,6 +369,17 @@ function App() {
       return null;
     }catch(error){return errorText(error)}
   }
+  async function askLead(run:Run,text:string){
+    try{
+      const response=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/lead`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({message:text})});
+      const updated=await response.json().catch(()=>({}));
+      if(!response.ok)return updated.detail||`发送失败（${response.status}）`;
+      loadRevision.current++;
+      setRuns(current=>current.map(item=>item.id===run.id?updated:item));
+      setSelected(current=>current?.id===run.id?updated:current);
+      return null;
+    }catch(error){return errorText(error)}
+  }
   async function resumeRun(run:Run,runBudget:number){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/resume`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({budget_usd:runBudget})});if(!r.ok){const body=await r.json().catch(()=>({}));return body.detail||`继续失败（${r.status}）`}await load(false);return null}catch(e){return errorText(e)}}
   function requestCancelRun(run:Run){
     if(cancellingRunId||!canCancelRun(run))return;
@@ -432,7 +446,7 @@ function App() {
       <ProjectField apiBase={API} value={projectDir} onChange={setProjectDir} usedProjects={usedProjects}/>
       <div className="formbar"><div className="controls"><AttachButton onFiles={attachments.add}/><label className="budget-field" title="执行花费达到上限时任务会自动暂停">预算上限 <span>$</span><BudgetInput value={budget} onChange={setBudget} required/></label><label className="switch" title="关闭后本任务只使用按量计费的 API 模型"><input type="checkbox" checked={useCli} onChange={e=>setUseCli(e.target.checked)}/><span/>允许使用会员 CLI</label><label className="switch" title={NETWORK_HINT}><input type="checkbox" checked={allowNetwork} onChange={e=>setAllowNetwork(e.target.checked)}/><span/>允许联网</label><ModelFleet models={models} onOpenAll={()=>setView("models")} onOpen={openModelProfile} onToggle={toggleModel} onConfigure={configureModel}/></div><div className="submit-group"><small>Ctrl + Enter</small><button className="primary" disabled={busy||attachments.uploading||!(budget>0)}>{busy?"正在生成计划…":attachments.uploading?"附件上传中…":"生成执行计划 →"}</button></div></div>
     </form>{formError&&<p className="form-error" role="alert">{formError}</p>}</section>}
-      <MissionDetail run={selected} models={models} onOpenModel={openModelProfile} deletingId={deletingRunId} cancellingId={cancellingRunId} onConfirm={confirmRun} onResume={resumeRun} onPause={run=>postAction(run,"pause","暂停")} onDiagnose={run=>postAction(run,"diagnose","诊断")} onReply={replyToDiagnosis} onChange={changeRequirement} onNetwork={setNetwork} parent={selected?.parent_run_id?runs.find(item=>item.id===selected.parent_run_id):undefined} onOpenRun={run=>{autoSelected.current=true;setSelected(run)}} onCancel={requestCancelRun} onDelete={requestDeleteRun}/>
+      <MissionDetail run={selected} models={models} onOpenModel={openModelProfile} deletingId={deletingRunId} cancellingId={cancellingRunId} onConfirm={confirmRun} onResume={resumeRun} onPause={run=>postAction(run,"pause","暂停")} onDiagnose={run=>postAction(run,"diagnose","诊断")} onReply={replyToDiagnosis} onAsk={askLead} onChange={changeRequirement} onNetwork={setNetwork} parent={selected?.parent_run_id?runs.find(item=>item.id===selected.parent_run_id):undefined} onOpenRun={run=>{autoSelected.current=true;setSelected(run)}} onCancel={requestCancelRun} onDelete={requestDeleteRun}/>
     </div>
     </div>
     </>}

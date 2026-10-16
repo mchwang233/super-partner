@@ -238,7 +238,10 @@ is preferred, read-only; otherwise the best API planner, whose history is stored
 and sent again on each message. The conversation is saved on the task (`supervisor`), so it
 continues after a restart. A lost conversation is rebuilt from the task record with the same
 model; an unavailable model hands the task to the next lead (`run.lead_changed`).
-`POST /api/tasks/{id}/lead` asks the lead a question in that conversation.
+In the task view, the **负责人** panel shows every decision of the lead with its reason and
+instructions, its questions (answered there), and a box to write to it; `POST /api/tasks/{id}/lead`
+saves the message at once and the lead's answer follows in `lead_messages`. The diagnosis panel
+below it shows only diagnoses that run without the lead or that it sent to repair something.
 
 A failed attempt goes to the lead with the evidence (why it failed, the step's answer and tool
 calls, earlier attempts, where all steps stand, the models that can take the step), instead of a

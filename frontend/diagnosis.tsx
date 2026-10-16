@@ -48,7 +48,7 @@ function conversations(list: Diagnosis[]): Diagnosis[][] {
   return [...groups.values()];
 }
 
-function when(iso: string) {
+export function when(iso: string) {
   return new Date(iso).toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
@@ -94,7 +94,7 @@ function AssistantMessage({ item, model, node, run }: { item: Diagnosis; model: 
   </article>;
 }
 
-function UserMessage({ message }: { message: DiagnosisMessage }) {
+export function UserMessage({ message }: { message: DiagnosisMessage }) {
   return <div className="dx-msg dx-user" aria-label="你的诊断回复">
     {message.choice && <span className="dx-choice-tag">✓ {message.choice}</span>}
     {message.text && <p>{message.text}</p>}
@@ -102,7 +102,9 @@ function UserMessage({ message }: { message: DiagnosisMessage }) {
   </div>;
 }
 
-function Composer({ item, waiting, disabled, onReply }: { item: Diagnosis; waiting: boolean; disabled: boolean; onReply: SendReply }) {
+export function Composer({ item, waiting, disabled, onReply, sendLabel = "发送并继续诊断", placeholder }: {
+  item: Diagnosis; waiting: boolean; disabled: boolean; onReply: SendReply; sendLabel?: string; placeholder?: string;
+}) {
   const [text, setText] = useState(""), [choice, setChoice] = useState(""), [busy, setBusy] = useState(false), [error, setError] = useState("");
   const submitting = useRef(false), form = useRef<HTMLFormElement>(null), box = useRef<HTMLTextAreaElement>(null);
   const choices = item.choices ?? [], asking = !!item.question || choices.length > 0;
@@ -136,11 +138,11 @@ function Composer({ item, waiting, disabled, onReply }: { item: Diagnosis; waiti
       <div className="dx-input">
         <textarea ref={box} aria-label="补充你的想法" rows={asking ? 2 : 1} maxLength={6000} value={text}
           onChange={event => setText(event.target.value)} onKeyDown={keys}
-          placeholder={choices.length ? "补充说明（可选）：限制条件、你的方案，或纠正诊断的判断" : "告诉诊断你的想法：补充信息、你已经做了什么，或纠正它的判断"} />
+          placeholder={placeholder ?? (choices.length ? "补充说明（可选）：限制条件、你的方案，或纠正诊断的判断" : "告诉诊断你的想法：补充信息、你已经做了什么，或纠正它的判断")} />
         <div className="dx-input-bar">
           <small className="dx-hint">{disabled ? "当前诊断或平台修复完成后，可以继续回复。"
             : choice ? `已选「${choice}」，再点一次可取消 · Ctrl+Enter 发送` : "可以只选方案、只写文字，或两者都给 · Ctrl+Enter 发送"}</small>
-          <button type="submit" className="primary" disabled={!text.trim() && !choice}>{busy ? "发送中…" : "发送并继续诊断"}</button>
+          <button type="submit" className="primary" disabled={!text.trim() && !choice}>{busy ? "发送中…" : sendLabel}</button>
         </div>
       </div>
     </fieldset>

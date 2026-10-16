@@ -250,6 +250,17 @@ def verification_message(run: ExecutionRun, verifier, verdict, choices: list[Mod
     return "\n".join(lines)
 
 
+def chat_message(text: str) -> str:
+    """The user writing to the lead directly, not answering one of its questions."""
+    return (
+        "MESSAGE from the user (they can see the task, its steps and your decisions):\n"
+        f"{text}\n\n"
+        "Answer in Chinese, in a few sentences, as yourself: the lead who has followed this task. "
+        "No decision JSON is needed here. If they ask for a change (to a step, the plan, or how you "
+        "decide), say what you will do; you will act on it at your next decisions."
+    )
+
+
 def answer_message(node, question: str, answer: str, rework: bool = False) -> str:
     """Hand the user's answer to the lead's question back to it."""
     return "\n".join([

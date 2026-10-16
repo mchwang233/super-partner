@@ -647,16 +647,14 @@ async def set_network_access(run_id: str, body: NetworkAccess):
     return run
 
 
-@app.post("/api/tasks/{run_id}/lead")
+@app.post("/api/tasks/{run_id}/lead", response_model=ExecutionRun, status_code=202)
 async def ask_lead(run_id: str, body: LeadQuestion):
-    """Ask the task's lead, in the conversation it keeps for this task (supervisor.py)."""
+    """Write to the task's lead, in the conversation it keeps for this task (supervisor.py). The
+    message is saved at once; the lead's answer follows in ``lead_messages``."""
     get_task(run_id)
-    try:
-        reply = await executor.ask_lead(run_id, body.message)
-    except ProviderError as exc:
-        raise HTTPException(503, str(exc)) from exc
-    run = get_task(run_id)
-    return {"reply": reply, "model_id": run.supervisor.model_id if run.supervisor else None}
+    if not executor.start_lead_chat(run_id, body.message.strip()):
+        raise HTTPException(409, "负责人还在回答上一条消息，请稍候。")
+    return get_task(run_id)
 
 
 @app.post("/api/tasks/{run_id}/diagnoses/{diagnosis_id}/reply", response_model=ExecutionRun)

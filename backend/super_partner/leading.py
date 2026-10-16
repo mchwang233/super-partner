@@ -12,7 +12,15 @@ from uuid import uuid4
 from . import quality, supervisor
 from .budget import BudgetExceeded
 from .config import settings
-from .models import Decision, Diagnosis, DiagnosisStatus, NodeStatus, Outcome, RunStatus
+from .models import (
+    Decision,
+    Diagnosis,
+    DiagnosisStatus,
+    LeadMessage,
+    NodeStatus,
+    Outcome,
+    RunStatus,
+)
 from .routing import eligible_for_node, node_cost
 
 
@@ -128,7 +136,8 @@ class Leading:
                 return
             run.decisions.append(Decision(
                 node_id=node_id, event=event, action=action, reason=reason, instructions=instructions,
-                model_id=decision.get("model_id"), lead_model_id=run.supervisor.model_id if run.supervisor else None,
+                model_id=decision.get("model_id"), targets=decision.get("targets", []),
+                lead_model_id=run.supervisor.model_id if run.supervisor else None,
             ))
             asked = f"负责人要求：{instructions}" if instructions else ""
             if action in {"retry", "switch_model"}:
@@ -174,6 +183,41 @@ class Leading:
                   model_id=decision.get("model_id"), targets=decision.get("targets"), event=event)
         if repair:
             await self._repair(run_id, node_id, repair[0], outcome, brief=repair[1])
+
+    def start_lead_chat(self, run_id: str, text: str) -> bool:
+        """The user writes to the lead: the message and a pending reply are saved at once, and the
+        lead answers in the background. False if it is still answering an earlier message."""
+        task = self.lead_tasks.get(run_id)
+        if task and not task.done():
+            return False
+        run = self.db.get_run(run_id)
+        for message in run.lead_messages:
+            if message.status == "pending":
+                # Its answer was lost (a restart while the lead was answering, say).
+                message.status, message.text = "failed", "这条回复被中断了，请重新提问。"
+        run.lead_messages += [LeadMessage(role="user", text=text), LeadMessage(role="lead", status="pending")]
+        reply_id = run.lead_messages[-1].id
+        self._save(run)
+        self.emit(run_id, "run.lead_message", role="user", text=text)
+        self.lead_tasks[run_id] = asyncio.create_task(self._lead_chat(run_id, text, reply_id))
+        return True
+
+    async def _lead_chat(self, run_id: str, text: str, reply_id: str) -> None:
+        try:
+            answer, status = await self.ask_lead(run_id, supervisor.chat_message(text)), "done"
+        except asyncio.CancelledError:
+            answer, status = "这条回复被中断了，请重新提问。", "failed"
+            raise
+        except Exception as exc:
+            answer, status = f"负责人暂时无法回答：{str(exc)[:300]}", "failed"
+        finally:
+            async with self.locks.setdefault(run_id, asyncio.Lock()):
+                run = self.db.get_run(run_id)
+                reply = next((item for item in run.lead_messages if item.id == reply_id), None) if run else None
+                if reply:
+                    reply.text, reply.status = answer, status
+                    self._save(run)
+        self.emit(run_id, "run.lead_message", role="lead", status=status)
 
     def start_lead_answer(self, run_id: str, question_id: str) -> None:
         """The user answered the lead's question: it decides what to do with the step."""

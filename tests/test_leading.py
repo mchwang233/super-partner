@@ -205,3 +205,17 @@ async def test_without_a_decision_a_failed_verification_sends_the_work_back_as_b
     _, result = await run(checked, team)
     assert [item.action for item in result.decisions] == ["fallback"]
     assert result.status == RunStatus.SUCCEEDED and result.rework_rounds == 1 and len(team.work) == 2
+
+
+async def test_the_user_talks_with_the_lead_in_its_conversation(database):
+    team = Team(["空文件的处理我会在下一次决策时要求补上。"])
+    executor = Executor(database, team, MODELS)
+    assert executor.start_lead_chat("r", "记得要处理空文件")
+    # One message at a time: the lead is still answering.
+    assert not executor.start_lead_chat("r", "还有别的吗")
+    pending = database.get_run("r").lead_messages
+    assert [(m.role, m.status) for m in pending] == [("user", "done"), ("lead", "pending")]
+    await executor.lead_tasks["r"]
+    asked, answered = database.get_run("r").lead_messages
+    assert asked.text == "记得要处理空文件" and answered.status == "done" and "空文件" in answered.text
+    assert "MESSAGE from the user" in team.lead[0] and "记得要处理空文件" in team.lead[0]
