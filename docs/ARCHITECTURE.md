@@ -37,6 +37,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | API model calls, output caps, tool loop | `providers.py` | `ProviderRegistry.complete`, `_send`, `output_ceiling`, `_loop` |
 | CLI model calls and their sandboxes | `cli_channels.py` | `CliChannelRegistry.complete`, `_with_network`, `repair_command` |
 | Tools and sandbox for API models | `agent.py` | `Workspace`, `sandbox_args`, `network_prefix` |
+| Checking long attempts instead of turn limits and timeouts | `progress.py` | `check_prompt`, `parse`, `api_evidence`, `cli_evidence`, `Stopped`; the check itself is `Executor._progress_watch` (review.py) |
 | Per-request budget reservations | `budget.py` | `RequestBudget.reserve` |
 | Quota / outage detection and cooldown | `quota.py` | `QuotaTracker.classify`, `mark`, `exhausted` |
 | Shared machine fixes (tools dir, env) | `environment.py` | `tools_dir`, `command_env` |
@@ -72,6 +73,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Unable steps | `test_unable.py` |
 | Network, sandbox, tools | `test_network.py`, `test_agent.py`, `test_safety.py` |
 | Providers, output caps | `test_providers.py`, `test_quota.py` |
+| Progress checks | `test_progress.py` |
 | Review prompts and evidence | `test_quality.py`, `test_review_evidence.py` |
 | Platform self-repair | `test_platform_repair.py` |
 | Catalog and benchmarks | `test_catalog_sync.py`, `test_benchmarks.py`, `test_scoring.py` |

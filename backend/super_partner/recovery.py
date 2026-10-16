@@ -20,7 +20,10 @@ SWITCH_AFTER = 2
 MAX_ENVIRONMENT_FIXES = 2
 
 
-def turns_for(node: TaskNode) -> int:
+def turns_for(node: TaskNode) -> Optional[int]:
+    """Turns of tool calls for an attempt, or None without a limit (the default)."""
+    if not settings.api_agent_max_turns:
+        return None
     return max(1, round(settings.api_agent_max_turns * TURNS_BY_DIFFICULTY.get(node.difficulty, 1.0)))
 
 

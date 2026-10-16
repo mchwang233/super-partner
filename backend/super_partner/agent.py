@@ -102,12 +102,12 @@ NETWORK_NOTE = (
     "access to this machine's local services{ports}; this task allows the internet, so commands may "
     "download packages and call external services"
 )
-TURN_NOTE = (
-    "\n\nYou have at most {limit} turns of tool calls. A turn may hold several tool calls, so batch "
-    "independent ones: read all the files you need at once, write several files at once, and write "
-    "each file whole in a single write_file call instead of in pieces. Do not re-check work that "
-    "already passed."
+BATCH_NOTE = (
+    "A turn may hold several tool calls, so batch independent ones: read all the files you need at "
+    "once, write several files at once, and write each file whole in a single write_file call "
+    "instead of in pieces. Do not re-check work that already passed."
 )
+TURN_NOTE = "\n\nYou have at most {limit} turns of tool calls. " + BATCH_NOTE
 REVIEW_INSTRUCTIONS = (
     "You have read-only access to the project workspace through list_dir and read_file. "
     "Paths are relative to that workspace. Read relevant code and tests when excerpts are "
@@ -139,7 +139,7 @@ def sandbox_ports() -> list[int]:
 def agent_instructions(max_turns: int | None = None, network: bool = False) -> str:
     ports = sandbox_ports()
     note = f", except to local ports {', '.join(map(str, ports))} (host services such as a license server)" if ports else ""
-    text = AGENT_INSTRUCTIONS.format(ports=note, turns=TURN_NOTE.format(limit=max_turns) if max_turns else "")
+    text = AGENT_INSTRUCTIONS.format(ports=note, turns=TURN_NOTE.format(limit=max_turns) if max_turns else "\n\n" + BATCH_NOTE)
     return text.replace(f"network access{note}", NETWORK_NOTE.format(ports=note)) if network else text
 
 
@@ -215,6 +215,8 @@ class Workspace:
         self.network = network
         # Turns of tool calls the model gets, and where each call is recorded (see providers._loop).
         self.max_turns, self.log = max_turns, log
+        # Checks a long attempt instead of a turn limit (progress.Watch); set by the caller.
+        self.watch = None
         # Host mode, for repairing the environment: commands leave the sandbox (network, any
         # folder the user can write) but still cannot gain root.
         self.host = host and not read_only

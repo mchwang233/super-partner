@@ -147,6 +147,7 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "node.superseded":(data,title)=>`${title(data.node_id)}：上游已返工，旧结果失效，将重新执行`,
   "run.recovered":()=>"诊断已处理阻碍，任务自动继续",
   "node.succeeded":(data,title)=>`${title(data.node_id)}：完成`,
+  "node.progress_check":(data,title)=>data.stop?`${title(data.node_id)}：运行 ${data.minutes} 分钟后检查，判断已卡住并停止（${data.reason??""}）`:`${title(data.node_id)}：运行 ${data.minutes} 分钟后检查，仍在推进，继续执行`,
   "node.retry":(data,title)=>data.reason==="environment_fixed"?`${title(data.node_id)}：环境已修复，重新执行`:`${title(data.node_id)}：未通过，准备重试（${data.reason??""}）`,
   "node.failed":(data,title)=>`${title(data.node_id)}：失败（${data.error??""}）`,
   "run.rework":(data,title)=>`${title(data.verifier)} 发现问题，第 ${data.round} 轮返工：${data.problems??""}`,

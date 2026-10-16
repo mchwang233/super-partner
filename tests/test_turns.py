@@ -1,3 +1,4 @@
+import pytest
 from super_partner.config import settings
 from super_partner.db import Database
 from super_partner.executor import Executor, turns_for
@@ -21,6 +22,12 @@ def model(model_id: str, coding: float, channel: str = "api") -> ModelProfile:
 
 
 MODELS = {m.id: m for m in [model("x:flash", 90), model("cli:claude", 96, "cli")]}
+
+
+@pytest.fixture(autouse=True)
+def turn_limit(monkeypatch):
+    """These tests are about the optional turn limit, which is off by default."""
+    monkeypatch.setattr(settings, "api_agent_max_turns", 40)
 
 
 class Providers:

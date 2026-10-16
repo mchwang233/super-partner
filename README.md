@@ -267,13 +267,20 @@ deepest; `none` turns thinking off). Deeper thinking is slower and spends more o
   and a bounded output token count. Calls wait for competing reservations to be released;
   insufficient remaining funds pause the task without consuming a quality retry. Final
   replies are checked too. Usage that a provider never reports cannot be reconstructed.
-- **Turns.** A turn is one model request, which may hold several tool calls; the prompt says
-  so and asks the model to batch independent calls and write each file whole. A node gets
-  `api_agent_max_turns` (40) turns when easy, 1.5× when normal and 2× when hard. Five turns
-  before the limit the model is told to wrap up; at the limit it gets one more request, without
-  further tool calls, to answer with a progress summary (done, not done, what next). That
-  summary goes through the usual review and reaches the next attempt as its previous result;
-  with review off it counts as rejected. `read_file` returns up to 1200 lines per call.
+- **Turns and progress checks.** A turn is one model request, which may hold several tool
+  calls; the prompt asks the model to batch independent calls and write each file whole. Steps
+  have no turn limit by default and no fixed timeout, for API models and membership CLIs alike.
+  Instead, every `SUPER_PARTNER_PROGRESS_CHECK_MINUTES` (10) minutes of an attempt, another
+  model looks at what it has been doing (an API model's latest tool calls; for a CLI, the files
+  it changed and the processes it runs) and says whether it is still getting somewhere. Long
+  work that keeps moving goes on; an attempt found stuck (repeating itself, failing the same way,
+  waiting on something that will not come, drifting off the step) is stopped and fails like any
+  other attempt, without falling back to an API model. Each check is a `node.progress_check`
+  event. A check that cannot be made lets the attempt continue; the task budget still applies.
+  `SUPER_PARTNER_API_AGENT_MAX_TURNS` sets an optional limit (×1 easy, ×1.5 normal, ×2 hard):
+  five turns before it the model is told to wrap up, and at it the model answers with a
+  progress summary that is reviewed and reaches the next attempt. Tool loops nobody checks
+  (diagnoses) stop at 40 turns. `read_file` returns up to 1200 lines per call.
 - **Tool-call log.** Every tool call of an attempt is recorded on it (turn, tool, file or
   command, whether it went through) and shown, folded, under the attempt in the plan view;
   diagnoses get a per-tool count and the latest attempt's calls.

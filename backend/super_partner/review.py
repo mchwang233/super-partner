@@ -4,10 +4,11 @@ model against the acceptance criteria. Mixed into executor.Executor."""
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Optional
 
-from . import quality
+from . import progress, quality
 from .budget import BudgetExceeded
 from .config import settings
 from .models import ExecutionRun
@@ -95,6 +96,35 @@ class Reviewing:
             fix=str(payload.get("fix") or unable or ""), summary=summary, unable=unable.strip()[:1000] if unable else None,
             reviewer_model_id=reviewer.id, cost_usd=review_cost, accounted_cost_usd=review_cost,
         )
+
+    def _progress_watch(self, run: ExecutionRun, node, model_id: str) -> progress.Watch:
+        """Checks on an attempt of ``node`` by ``model_id`` that runs long: another model says
+        whether it is stuck. A check that cannot be made lets the attempt go on."""
+        started = time.monotonic()
+
+        async def watch(evidence: str) -> Optional[str]:
+            minutes = (time.monotonic() - started) / 60
+            prompt = progress.check_prompt(node, minutes, evidence)
+            checker = pick_reviewer(list(self.model_lookup.values()), self._configured(run), model_id,
+                                    len(prompt) // 3 + 1000)
+            reason = None
+            if checker:
+                folder = settings.workspace_root / run.folder_id / ".review"
+                folder.mkdir(parents=True, exist_ok=True)
+                try:
+                    reply = await self._complete(run, node, checker.id, prompt, folder, cli_timeout=300,
+                                                 allow_api_fallback=False)
+                    reason = progress.parse(reply.text)
+                except (asyncio.CancelledError, BudgetExceeded):
+                    raise
+                except Exception:
+                    reason = None
+            self.emit(run.id, "node.progress_check", node_id=node.id, model_id=model_id,
+                      checker_model_id=checker.id if checker else None, minutes=round(minutes),
+                      stop=bool(reason), reason=reason)
+            return reason
+
+        return watch
 
     def _reviewer(self, run: ExecutionRun, node, tokens: int):
         return pick_reviewer(list(self.model_lookup.values()), self._configured(run), node.model_id, tokens)

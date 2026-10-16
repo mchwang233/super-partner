@@ -400,6 +400,7 @@ class Executor(Reviewing, Diagnosing, SelfRepair):
             result = await self._complete(
                 run, node, model_id, prompt, workspace, allow_api_fallback=fallback and not in_project,
                 attachments=run.attachments, act=act, max_turns=turns_for(node), tool_log=log,
+                watch=self._progress_watch(run, node, model_id),
             )
             try:
                 after = await asyncio.to_thread(quality.file_state, workspace) if uses_files else {}

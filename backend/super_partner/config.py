@@ -21,7 +21,13 @@ class Settings(BaseSettings):
     # API models work on files and run sandboxed commands through tools (agent.py); off, they
     # only return text and cannot be routed to nodes that change a project.
     api_agent: bool = True
-    api_agent_max_turns: int = Field(default=40, ge=1, le=200)
+    # Turns of tool calls per attempt of an API model; 0 means no limit. Long attempts are not cut
+    # off but checked (progress_check_minutes).
+    api_agent_max_turns: int = Field(default=0, ge=0, le=1000)
+    # Minutes of an attempt after which, and then every so often, another model checks whether it
+    # is still making progress; only a stuck attempt is stopped. CLIs are checked the same way
+    # instead of being killed at a fixed timeout.
+    progress_check_minutes: float = Field(default=10, gt=0)
     # Output tokens per request for a model whose own ceiling the catalog does not give; a known
     # ceiling is used as is. Reasoning models spend their thinking from this too, so a small cap
     # can end a turn before it writes anything. A model that rejects the cap is retried with a

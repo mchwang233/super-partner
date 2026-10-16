@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import os
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,7 @@ import httpx
 
 from . import agent as agent_tools
 from . import attachments as files
+from . import progress
 from .budget import BudgetExceeded, ProviderError
 from .cli_channels import CLI_SPECS, CliChannelRegistry
 from .config import settings
@@ -42,10 +45,16 @@ PLAIN_OUTPUT_TOKENS = 4096
 OUTPUT_LIMIT_REJECTED = re.compile(r"max_(?:completion_)?tokens|max_?output|output tokens", re.IGNORECASE)
 
 
+# Turns for a tool loop that has no limit set and nobody checking on it (a diagnosis, say).
+UNWATCHED_TURNS = 40
 # Turns before the limit at which the model is told to wrap up.
 WRAP_UP_TURNS = 5
 MAX_LOGGED_CALLS = 300
 TURN_LIMIT_MARK = "在 {limit} 轮工具调用后仍未完成"
+
+
+def _turns(turn: int, limit: Optional[int]) -> int:
+    return turn if limit is None else min(turn, limit)
 
 
 def _turn_note(left: int) -> str:
@@ -105,12 +114,14 @@ class ProviderRegistry:
         act: bool = False, spend_ok: Optional[Callable[[str, int, int], bool]] = None,
         repair: bool = False, max_turns: Optional[int] = None, tool_log: Optional[list] = None,
         network: bool = False, review_workspace: Optional[Path] = None, review_files: list[str] = (),
+        watch: Optional[progress.Watch] = None,
     ) -> ProviderResult:
         """One model call. With ``act``, an API model works on ``workspace`` through tools
         (see agent.py) until it is done; ``spend_ok(model_id, input, output)`` can stop it.
         ``repair`` lets the model's commands leave the sandbox to fix the environment;
         ``network`` lets sandboxed commands reach the internet for a task that allows it.
-        ``review_workspace`` gives API reviewers only safe file reads, independently of act/repair."""
+        ``review_workspace`` gives API reviewers only safe file reads, independently of act/repair.
+        ``watch`` checks a long call from time to time instead of a turn limit or a timeout."""
         provider, model = model_id.split(":", 1)
         attachments = list(attachments)
         if provider == "cli":
@@ -119,10 +130,14 @@ class ProviderRegistry:
                     model_id, prompt + files.describe(attachments, with_paths=True),
                     workspace or settings.workspace_root, timeout=cli_timeout,
                     attachments=attachments, repair=repair, **({"network": True} if network else {}),
+                    **({"watch": watch} if watch else {}),
                 )
                 return ProviderResult(
                     text=text, input_tokens=0, output_tokens=0, used_model_id=model_id,
                 )
+            except progress.Stopped as exc:
+                # Stuck, not unavailable: the attempt fails rather than falling back to an API model.
+                raise ProviderError(str(exc)) from exc
             except RuntimeError as exc:
                 kind = self.quota.classify(model_id, str(exc))
                 if kind:
@@ -137,7 +152,7 @@ class ProviderRegistry:
                 result = await self.complete(
                     fallback, prompt, workspace, cli_timeout, attachments=attachments,
                     act=act, spend_ok=spend_ok, network=network,
-                    review_workspace=review_workspace, review_files=review_files,
+                    review_workspace=review_workspace, review_files=review_files, watch=watch,
                 )
                 result.used_model_id = fallback
                 return result
@@ -161,6 +176,8 @@ class ProviderRegistry:
                 Path(workspace or settings.workspace_root), host=repair, max_turns=max_turns, log=tool_log,
                 network=network,
             ) if act else None
+        if agent:
+            agent.watch = watch
         if provider == "anthropic":
             return await self._anthropic(model, prompt, images, agent, spend_ok)
         if provider == "google":
@@ -232,11 +249,15 @@ class ProviderRegistry:
             prompt = f"{agent.instructions()}\n\n{prompt}"
         state = {"prompt": prompt, "images": images, "tools": tools, "history": None, "results": None}
         total_in = total_out = turn = 0
-        limit = (agent.max_turns or settings.api_agent_max_turns) if agent else 1
+        # Without a limit (the default) a long attempt is checked instead (progress.py).
+        watch = getattr(agent, "watch", None)
+        limit = (agent.max_turns or settings.api_agent_max_turns or (None if watch else UNWATCHED_TURNS)) if agent else 1
+        interval = settings.progress_check_minutes * 60
+        next_check, seen = time.monotonic() + interval, []
         try:
             # One turn past the limit: the model's chance to answer with a progress summary.
-            for turn in range(1, limit + 2 if agent else 2):
-                final = bool(agent) and turn > limit
+            for turn in itertools.count(1) if limit is None else range(1, limit + 2 if agent else 2):
+                final = bool(agent) and limit is not None and turn > limit
                 if spend_ok and not spend_ok(model_id, total_in, total_out):
                     raise BudgetExceeded("已达到任务可用的预算，模型调用被中止。")
                 text, calls, used_in, used_out, truncated = await step(state)
@@ -253,23 +274,29 @@ class ProviderRegistry:
                         "（output truncated by length），没有给出完整回答或工具调用。"
                     )
                 if not calls or not agent:
-                    return ProviderResult(text or "", total_in, total_out, model_id, turns=min(turn, limit), turn_limit=final)
+                    return ProviderResult(text or "", total_in, total_out, model_id, turns=_turns(turn, limit), turn_limit=final)
                 if final:
                     raise ProviderError(f"{model_id} {TURN_LIMIT_MARK.format(limit=limit)}，最后也没有交出进度总结。")
                 results = []
                 for call_id, name, args in calls:
                     output = await agent.call(name, args)
                     results.append((call_id, name, output))
+                    seen.append({"turn": turn, "tool": name, "detail": agent_tools.describe_call(name, args),
+                                 "ok": not output.startswith("Error:") and (name != "run_command" or output.startswith("exit code 0"))})
                     if agent.log is not None and len(agent.log) < MAX_LOGGED_CALLS:
-                        agent.log.append({"turn": turn, "tool": name, "detail": agent_tools.describe_call(name, args),
-                                          "ok": not output.startswith("Error:") and (name != "run_command" or output.startswith("exit code 0"))})
-                if note := _turn_note(limit - turn):
+                        agent.log.append(seen[-1])
+                if limit is not None and (note := _turn_note(limit - turn)):
                     call_id, name, output = results[-1]
                     results[-1] = (call_id, name, f"{output}\n\n{note}")
                 state["results"] = results
+                if watch and time.monotonic() >= next_check:
+                    # Not cut off at a time limit: another model says whether it is stuck.
+                    if reason := await watch(progress.api_evidence(turn, seen)):
+                        raise ProviderError(f"{model_id} {progress.STOPPED}{reason}")
+                    next_check = time.monotonic() + interval
             raise AssertionError("unreachable")
         except (Exception, asyncio.CancelledError) as exc:
-            exc.usage = ProviderResult("", total_in, total_out, model_id, turns=min(turn, limit))
+            exc.usage = ProviderResult("", total_in, total_out, model_id, turns=_turns(turn, limit))
             raise
 
     def _reasoning(self, provider: str, model: str) -> dict:

@@ -7,12 +7,14 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
-from . import environment
+from . import environment, progress
 from .attachments import path
+from .config import settings
 
 
 @dataclass(frozen=True)
@@ -193,12 +195,27 @@ class CliChannelRegistry:
         except (OSError, subprocess.SubprocessError) as exc:
             return CliStatus(id=spec.id, installed=True, authenticated=False, error=str(exc)[:200])
 
+    @staticmethod
+    async def _watched(spec, process, talk: asyncio.Future, cwd: Path, watch: progress.Watch, started: float):
+        """Wait for the CLI, asking ``watch`` every progress_check_minutes whether it is stuck;
+        ``started`` is when it was launched (epoch seconds)."""
+        last = started
+        while True:
+            done, _ = await asyncio.wait({talk}, timeout=settings.progress_check_minutes * 60)
+            if done:
+                return talk.result()
+            evidence = await progress.cli_evidence(Path(cwd), started, last, process.pid)
+            last = time.time()
+            if reason := await watch(evidence):
+                raise progress.Stopped(f"{spec.executable} {progress.STOPPED}{reason}")
+
     async def complete(
         self, model_id: str, prompt: str, cwd: Path, timeout: int = 900, attachments=(), repair: bool = False,
-        network: bool = False,
+        network: bool = False, watch: Optional[progress.Watch] = None,
     ) -> str:
         """Run a CLI in ``cwd``. With ``repair`` it leaves its sandbox to fix the environment;
-        with ``network`` its sandbox lets commands reach the internet."""
+        with ``network`` its sandbox lets commands reach the internet. With ``watch`` it is not
+        killed at ``timeout`` but checked every progress_check_minutes, and stopped only if stuck."""
         spec = CLI_SPECS[model_id]
         executable = shutil.which(spec.executable)
         if not executable:
@@ -215,6 +232,7 @@ class CliChannelRegistry:
         command = repair_command(executable, args) if repair else [executable, *args]
         # Tools that environment repairs installed are on PATH for every CLI.
         env = environment.command_env(dict(os.environ))
+        started = time.time()
         spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
             *command, cwd=str(cwd), env=env, stdin=asyncio.subprocess.PIPE if stdin else None,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -226,13 +244,19 @@ class CliChannelRegistry:
             # The CLI may already be running; finish spawning so its whole group can be killed.
             await _kill_process_group(await spawn)
             raise
+        talk = asyncio.ensure_future(process.communicate(stdin))
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(stdin), timeout=timeout)
+            if watch is None:
+                stdout, stderr = await asyncio.wait_for(asyncio.shield(talk), timeout=timeout)
+            else:
+                stdout, stderr = await self._watched(spec, process, talk, cwd, watch, started)
         except asyncio.TimeoutError:
             await _kill_process_group(process)
+            talk.cancel()
             raise RuntimeError(f"{spec.executable} timed out after {timeout}s")
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, progress.Stopped):
             await _kill_process_group(process)
+            talk.cancel()
             raise
         if process.returncode:
             raise RuntimeError(f"{spec.executable} failed: {_failure_detail(stdout, stderr)}")
