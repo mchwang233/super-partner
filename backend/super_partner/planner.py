@@ -1,11 +1,14 @@
 import json
+import logging
 import re
 from typing import Optional
 from uuid import uuid4
 
+from . import supervisor
 from .models import (
     DIFFICULTY_THRESHOLDS,
     ModelProfile,
+    SupervisorSession,
     TaskNode,
     TaskPlan,
     difficulty_for,
@@ -13,6 +16,8 @@ from .models import (
 )
 from .providers import ProviderRegistry
 from .quota import ModelUnavailable
+
+logger = logging.getLogger(__name__)
 
 
 def _node(
@@ -189,14 +194,62 @@ def _validate_plan(payload: dict) -> TaskPlan:
     return TaskPlan(summary=str(payload.get("summary", "Autonomous task plan"))[:240], nodes=nodes)
 
 
+async def _plan_as_lead(request: str, models: list[ModelProfile], configured: set[str], providers,
+                        session: SupervisorSession, in_project: bool) -> Optional[TaskPlan]:
+    """The best lead plans in its own conversation, which ``session`` then holds; None if none can."""
+    for model in supervisor.candidates(models, configured)[:supervisor.MAX_LEADS]:
+        fresh = supervisor.new_session(model)
+        cost = 0.0
+        try:
+            result = await providers.converse(fresh, supervisor.ROLE + request)
+            cost += _cost(result, model)
+            try:
+                plan = _validate_plan(_extract_json(result.text))
+            except (ValueError, TypeError, KeyError):
+                # Same conversation: it knows what it meant, it only has to say it as asked.
+                result = await providers.converse(fresh, "That reply was not a valid plan. Reply with the "
+                                                         "plan as the JSON object described, and nothing else.")
+                cost += _cost(result, model)
+                plan = _validate_plan(_extract_json(result.text))
+        except Exception as exc:
+            # The next lead tries; with none left, the usual single-call planner does.
+            logger.warning("lead %s could not plan: %s", model.id, exc)
+            continue
+        for name, value in fresh:
+            setattr(session, name, value)
+        if not in_project:
+            for node in plan.nodes:
+                node.needs_workspace = False
+        plan.planning_method = "model"
+        plan.planner_model_id = model.id
+        plan.planning_cost_usd = round(cost, 6)
+        plan.planning_note = f"由负责人 {model.display_name} 规划，并全程跟进这个任务"
+        return plan
+    return None
+
+
+def _cost(result, model: ModelProfile) -> float:
+    return ((result.input_tokens * (model.input_per_million or 0)
+             + result.output_tokens * (model.output_per_million or 0)) / 1_000_000)
+
+
 async def autonomous_plan(
     prompt: str,
     models: list[ModelProfile],
     configured: set[str],
     providers: ProviderRegistry,
     project_context: Optional[str] = None,
+    session: Optional[SupervisorSession] = None,
 ) -> TaskPlan:
+    """Plan ``prompt``. Given ``session``, the plan is made by the task's lead in a conversation
+    that it keeps for the rest of the task (supervisor.py); ``session`` is filled in. Without a
+    lead able to plan, the best planner plans in a single call and ``session`` stays empty."""
     in_project = project_context is not None
+    request = PLANNER_PROMPT + prompt + (f"\n\n{project_context}" if project_context else "")
+    if session is not None:
+        plan = await _plan_as_lead(request, models, configured, providers, session, in_project)
+        if plan:
+            return plan
     planner = select_planner_model(models, configured)
     if planner is None or planner.provider == "mock":
         plan = heuristic_plan(prompt, in_project)
@@ -207,10 +260,7 @@ async def autonomous_plan(
     try:
         while True:
             try:
-                result = await providers.complete(
-                    planner.id, PLANNER_PROMPT + prompt + (f"\n\n{project_context}" if project_context else ""),
-                    cli_timeout=120,
-                )
+                result = await providers.complete(planner.id, request, cli_timeout=120)
                 break
             except ModelUnavailable:
                 # Out of quota: the next best planner takes over, up to a few.

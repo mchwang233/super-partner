@@ -302,6 +302,22 @@ class Diagnosis(BaseModel):
     finished_at: Optional[datetime] = None
 
 
+class SupervisorSession(BaseModel):
+    """The task's lead: the strong model that planned it keeps one conversation until the task
+    ends (supervisor.py, docs/design/supervisor.md)."""
+    model_id: Optional[str] = None
+    # A membership CLI's own conversation id, continued on every call.
+    session_id: Optional[str] = None
+    # The folder the CLI conversation lives in; it must stay the same for it to be continued.
+    cwd: Optional[str] = None
+    # An API model's conversation: [{"role": "user" | "assistant", "content": text}].
+    history: list[dict] = Field(default_factory=list)
+    calls: int = 0
+    # Models that led before (their conversation was lost or they ran out of quota).
+    previous: list[str] = Field(default_factory=list)
+    started_at: datetime = Field(default_factory=utcnow)
+
+
 class ExecutionRun(BaseModel):
     id: str
     prompt: str
@@ -318,6 +334,7 @@ class ExecutionRun(BaseModel):
     # Repository the output was last published to.
     github_url: Optional[str] = None
     diagnoses: list[Diagnosis] = Field(default_factory=list)
+    supervisor: Optional[SupervisorSession] = None
     # Only tasks deliberately held for an application repair may resume after its restart.
     maintenance_id: Optional[str] = None
     waiting_diagnosis_id: Optional[str] = None

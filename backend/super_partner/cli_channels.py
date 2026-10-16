@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -11,6 +12,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 from . import environment, progress
 from .attachments import path
@@ -90,6 +92,22 @@ def repair_command(executable: str, args: list[str]) -> list[str]:
     if not shutil.which("bwrap"):
         raise RuntimeError("repairing the environment needs bubblewrap (bwrap), which blocks sudo")
     return ["bwrap", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--die-with-parent", "--", executable, *args]
+
+
+# The task's lead (supervisor.py) keeps one conversation per task. It reads files and runs
+# sandboxed commands to look things up, but does not edit: the steps' models do the work.
+SESSION_ARGS = {
+    "cli:claude": ("-p", "--output-format", "json", "--permission-mode", "default",
+                   "--settings", CLAUDE_SANDBOX_SETTINGS, "--disallowedTools", "Edit,Write,NotebookEdit"),
+    "cli:codex": ("exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never"),
+}
+SESSION_CLIS = set(SESSION_ARGS)
+# How a CLI says the conversation to continue is gone.
+SESSION_MISSING = re.compile(r"no (conversation|session|rollout)|not found|does not exist", re.IGNORECASE)
+
+
+class SessionLost(RuntimeError):
+    """A conversation to continue no longer exists (the CLI cleaned it up, say)."""
 
 
 CLI_SPECS = {
@@ -209,27 +227,10 @@ class CliChannelRegistry:
             if reason := await watch(evidence):
                 raise progress.Stopped(f"{spec.executable} {progress.STOPPED}{reason}")
 
-    async def complete(
-        self, model_id: str, prompt: str, cwd: Path, timeout: int = 900, attachments=(), repair: bool = False,
-        network: bool = False, watch: Optional[progress.Watch] = None,
-    ) -> str:
-        """Run a CLI in ``cwd``. With ``repair`` it leaves its sandbox to fix the environment;
-        with ``network`` its sandbox lets commands reach the internet. With ``watch`` it is not
-        killed at ``timeout`` but checked every progress_check_minutes, and stopped only if stuck."""
-        spec = CLI_SPECS[model_id]
-        executable = shutil.which(spec.executable)
-        if not executable:
-            raise RuntimeError(f"{spec.executable} is no longer installed")
-        args = list(REPAIR_ARGS.get(spec.id, spec.invoke_args) if repair else spec.invoke_args)
-        if network and not repair:
-            args = _with_network(spec.id, args)
-        args = _with_attachments(spec.id, args, list(attachments))
-        if spec.id in {"cli:gemini", "cli:qwen"}:
-            args[1] = prompt
-            stdin = None
-        else:
-            stdin = prompt.encode()
-        command = repair_command(executable, args) if repair else [executable, *args]
+    async def _run(self, spec, command: list[str], cwd: Path, stdin: Optional[bytes], timeout: float,
+                   watch: Optional[progress.Watch] = None) -> str:
+        """Run a CLI command in its own process group and return its output; a failure raises
+        RuntimeError, and the whole group is killed when the call ends early."""
         # Tools that environment repairs installed are on PATH for every CLI.
         env = environment.command_env(dict(os.environ))
         started = time.time()
@@ -260,7 +261,69 @@ class CliChannelRegistry:
             raise
         if process.returncode:
             raise RuntimeError(f"{spec.executable} failed: {_failure_detail(stdout, stderr)}")
-        text = stdout.decode(errors="replace").strip()
+        return stdout.decode(errors="replace")
+
+    async def converse(self, model_id: str, prompt: str, cwd: Path, session_id: Optional[str] = None,
+                       timeout: float = 600) -> tuple[str, str]:
+        """Say ``prompt`` in the conversation ``session_id`` (a new one without it), in ``cwd``;
+        returns the reply and the conversation's id. Only SESSION_CLIS keep conversations."""
+        spec = CLI_SPECS[model_id]
+        executable = shutil.which(spec.executable)
+        if not executable or model_id not in SESSION_ARGS:
+            raise RuntimeError(f"{model_id} cannot keep a conversation here")
+        if model_id == "cli:claude":
+            sid = session_id or str(uuid4())
+            args = [*SESSION_ARGS[model_id], "--resume" if session_id else "--session-id", sid]
+        else:
+            sid = session_id
+            args = (["exec", "resume", session_id, "--json", "--skip-git-repo-check",
+                     "-c", 'sandbox_mode="read-only"', "-"] if session_id else [*SESSION_ARGS[model_id], "-"])
+        try:
+            output = await self._run(spec, [executable, *args], cwd, prompt.encode(), timeout)
+        except RuntimeError as exc:
+            if session_id and SESSION_MISSING.search(str(exc)):
+                raise SessionLost(str(exc)) from exc
+            raise
+        if model_id == "cli:claude":
+            payload = json.loads(output)
+            return str(payload.get("result") or ""), str(payload.get("session_id") or sid)
+        text = ""
+        for line in output.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "thread.started":
+                sid = event.get("thread_id") or sid
+            elif event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message":
+                text = event["item"].get("text") or text
+        if not sid:
+            raise RuntimeError("codex did not report its conversation id")
+        return text, sid
+
+    async def complete(
+        self, model_id: str, prompt: str, cwd: Path, timeout: int = 900, attachments=(), repair: bool = False,
+        network: bool = False, watch: Optional[progress.Watch] = None,
+    ) -> str:
+        """Run a CLI in ``cwd``. With ``repair`` it leaves its sandbox to fix the environment;
+        with ``network`` its sandbox lets commands reach the internet. With ``watch`` it is not
+        killed at ``timeout`` but checked every progress_check_minutes, and stopped only if stuck."""
+        spec = CLI_SPECS[model_id]
+        executable = shutil.which(spec.executable)
+        if not executable:
+            raise RuntimeError(f"{spec.executable} is no longer installed")
+        args = list(REPAIR_ARGS.get(spec.id, spec.invoke_args) if repair else spec.invoke_args)
+        if network and not repair:
+            args = _with_network(spec.id, args)
+        args = _with_attachments(spec.id, args, list(attachments))
+        if spec.id in {"cli:gemini", "cli:qwen"}:
+            args[1] = prompt
+            stdin = None
+        else:
+            stdin = prompt.encode()
+        command = repair_command(executable, args) if repair else [executable, *args]
+        stdout = await self._run(spec, command, cwd, stdin, timeout, watch)
+        text = stdout.strip()
         if spec.id in {"cli:claude", "cli:gemini", "cli:qwen"}:
             try:
                 payload = json.loads(text)

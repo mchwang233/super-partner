@@ -229,6 +229,18 @@ internet from its next model call on. A requirement change inherits the setting.
   step is retried. Missing packages are still installed by the diagnosis into the shared tools
   folder, so a task does not need the network just to get its dependencies.
 
+## The task's lead
+
+The strong model that plans a task stays with it until it ends, in one conversation
+(design: [`docs/design/supervisor.md`](docs/design/supervisor.md)). A membership CLI that keeps
+conversations (Claude Code: `--session-id` then `--resume`; Codex: `exec` then `exec resume`)
+is preferred, read-only; otherwise the best API planner, whose history is stored with the task
+and sent again on each message. The conversation is saved on the task (`supervisor`), so it
+continues after a restart. A lost conversation is rebuilt from the task record with the same
+model; an unavailable model hands the task to the next lead (`run.lead_changed`).
+`POST /api/tasks/{id}/lead` asks the lead a question in that conversation. Decisions during the
+run move to the lead in the next stages of the design.
+
 ## API models act through tools
 
 When a node runs on an API model, the model gets five tools and works in a loop until it

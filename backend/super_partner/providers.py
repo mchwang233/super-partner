@@ -17,10 +17,10 @@ from . import agent as agent_tools
 from . import attachments as files
 from . import progress
 from .budget import BudgetExceeded, ProviderError
-from .cli_channels import CLI_SPECS, CliChannelRegistry
+from .cli_channels import CLI_SPECS, CliChannelRegistry, SessionLost
 from .config import settings
 from .db import Database
-from .models import Attachment
+from .models import Attachment, SupervisorSession
 from .quality import REVIEW_MARKER
 from .quota import ModelUnavailable, QuotaTracker
 from .secrets import PROVIDER_ENV
@@ -51,6 +51,14 @@ UNWATCHED_TURNS = 40
 WRAP_UP_TURNS = 5
 MAX_LOGGED_CALLS = 300
 TURN_LIMIT_MARK = "在 {limit} 轮工具调用后仍未完成"
+
+
+def _transcript(history: list[dict], prompt: str) -> str:
+    """A conversation as one prompt; earlier turns first, so the prefix stays the same (and cached)."""
+    if not history:
+        return prompt
+    turns = "\n\n".join(f"[{item['role'].upper()}]\n{item['content']}" for item in history)
+    return f"The conversation so far:\n\n{turns}\n\n[USER]\n{prompt}"
 
 
 def _turns(turn: int, limit: Optional[int]) -> int:
@@ -107,6 +115,33 @@ class ProviderRegistry:
                 unavailable.usage = getattr(exc, "usage", None)
                 raise unavailable from exc
             raise
+
+    async def converse(self, session: SupervisorSession, prompt: str, timeout: float = 600,
+                       spend_ok=None) -> ProviderResult:
+        """One message in a conversation that lasts (the task's lead, supervisor.py): a membership
+        CLI continues its own conversation; an API model is sent the whole history again, which
+        its prompt cache makes cheap. ``session`` is updated in place."""
+        model_id = session.model_id
+        if self.quota.exhausted(model_id):
+            raise self.quota.error(model_id)
+        if model_id.startswith("cli:"):
+            Path(session.cwd).mkdir(parents=True, exist_ok=True)
+            try:
+                text, session.session_id = await self.cli.converse(
+                    model_id, prompt, Path(session.cwd), session.session_id, timeout)
+            except SessionLost:
+                raise
+            except RuntimeError as exc:
+                kind = self.quota.classify(model_id, str(exc))
+                if kind:
+                    raise self.quota.mark(model_id, str(exc), kind) from exc
+                raise ProviderError(str(exc)) from exc
+            result = ProviderResult(text=text, input_tokens=0, output_tokens=0, used_model_id=model_id)
+        else:
+            result = await self.complete(model_id, _transcript(session.history, prompt), spend_ok=spend_ok)
+            session.history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": result.text}]
+        session.calls += 1
+        return result
 
     async def _complete(
         self, model_id: str, prompt: str, workspace=None, cli_timeout: int = 900,

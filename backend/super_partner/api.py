@@ -31,6 +31,7 @@ from .models import (
     ExecutionRun,
     NodeStatus,
     RunStatus,
+    SupervisorSession,
 )
 from .planner import autonomous_plan
 from .projects import (
@@ -68,6 +69,10 @@ class CreateTask(BaseModel):
 
 class NetworkAccess(BaseModel):
     allow: bool
+
+
+class LeadQuestion(BaseModel):
+    message: str = Field(min_length=1, max_length=20_000)
 
 
 class ConfirmTask(BaseModel):
@@ -395,6 +400,7 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
     plan = await autonomous_plan(
         f"{background}\n\n新需求：\n{request}" if background else request, list(models.values()), configured, providers,
         project_context=await asyncio.to_thread(project_context, project_dir) if project_dir else None,
+        session=(session := SupervisorSession()),
     )
     try:
         for node in plan.nodes:
@@ -426,6 +432,7 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
         project_dir=str(project_dir) if project_dir else None, attachments=attached,
         actual_cost_usd=plan.planning_cost_usd, background=background,
         parent_run_id=parent.id if parent else None, workspace_id=parent.folder_id if parent else None,
+        supervisor=session if session.model_id else None,
     )
     db.save_run(run)
     db.add_event(Event(
@@ -635,6 +642,18 @@ async def set_network_access(run_id: str, body: NetworkAccess):
             db.save_run(run)
             executor.emit(run_id, "run.network_changed", allow=body.allow)
     return run
+
+
+@app.post("/api/tasks/{run_id}/lead")
+async def ask_lead(run_id: str, body: LeadQuestion):
+    """Ask the task's lead, in the conversation it keeps for this task (supervisor.py)."""
+    get_task(run_id)
+    try:
+        reply = await executor.ask_lead(run_id, body.message)
+    except ProviderError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    run = get_task(run_id)
+    return {"reply": reply, "model_id": run.supervisor.model_id if run.supervisor else None}
 
 
 @app.post("/api/tasks/{run_id}/diagnoses/{diagnosis_id}/reply", response_model=ExecutionRun)

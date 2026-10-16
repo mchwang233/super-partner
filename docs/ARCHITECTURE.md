@@ -25,7 +25,8 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | HTTP API, task lifecycle endpoints | `api.py` | `create_task`, `follow_up_task`, `resume_task`, `reopen_node`, `reply_to_diagnosis`, `set_network_access` |
 | Records and statuses | `models.py` | `RunStatus`, `NodeStatus`, `Outcome` (attempt outcomes), `DiagnosisStatus`, `FINISHED`, `TaskNode`, `NodeAttempt`, `Diagnosis`, `ExecutionRun` |
 | Storage (SQLite, JSON bodies) | `db.py` | `Database.save_run`, `get_run`, events |
-| Planning | `planner.py` | `autonomous_plan`, `_validate_plan` |
+| Planning | `planner.py` | `autonomous_plan` (by the lead when one is available: `_plan_as_lead`), `_validate_plan` |
+| The task's lead: one conversation from planning to the end (docs/design/supervisor.md) | `supervisor.py` | `candidates`, `ask`, `handover`, `trim`; `Executor.ask_lead`, `ProviderRegistry.converse`, `CliChannelRegistry.converse`, `ExecutionRun.supervisor` |
 | Model choice | `routing.py` | `route_node` (first pick), `strongest_for` (retry), `stronger_than` (escalation), `pick_reviewer`, `diagnosers` |
 | Scheduling, attempts, step outcomes | `executor.py` | `Executor`; see "Executor" below |
 | Reviewing a result | `review.py` (mixed into `Executor`) | `_check`, `_reviewer`, `MAX_BACKUPS` |
@@ -74,6 +75,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Network, sandbox, tools | `test_network.py`, `test_agent.py`, `test_safety.py` |
 | Providers, output caps | `test_providers.py`, `test_quota.py` |
 | Progress checks | `test_progress.py` |
+| The lead's conversation | `test_supervisor.py` |
 | Review prompts and evidence | `test_quality.py`, `test_review_evidence.py` |
 | Platform self-repair | `test_platform_repair.py` |
 | Catalog and benchmarks | `test_catalog_sync.py`, `test_benchmarks.py`, `test_scoring.py` |

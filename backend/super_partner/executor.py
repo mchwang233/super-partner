@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import quality
+from . import quality, supervisor
 from .budget import BudgetExceeded, RequestBudget
 from .cli_channels import CLI_SPECS
 from .config import settings
@@ -40,6 +40,8 @@ class Executor(Reviewing, Diagnosing, SelfRepair):
         self.tasks: dict[str, asyncio.Task] = {}
         self.diagnosing: dict[str, asyncio.Task] = {}
         self.locks: dict[str, asyncio.Lock] = {}
+        # One message at a time in each task's conversation with its lead.
+        self.lead_locks: dict[str, asyncio.Lock] = {}
         self.project_locks: dict[str, asyncio.Lock] = {}
         self.node_tasks: dict[tuple[str, str], asyncio.Task] = {}
         # Tool calls of each node's attempt in progress, written onto the attempt when it ends.
@@ -554,8 +556,37 @@ class Executor(Reviewing, Diagnosing, SelfRepair):
 
 
 
+    async def ask_lead(self, run_id: str, prompt: str) -> str:
+        """Ask the task's lead (supervisor.py); its conversation is saved with the task. One
+        message at a time per task, so the conversation stays in order."""
+        async with self.lead_locks.setdefault(run_id, asyncio.Lock()):
+            run = self.db.get_run(run_id)
+            previous = run.supervisor.model_id if run.supervisor else None
+
+            async def charged(model_id, call):
+                return await self._charged(run, None, model_id, call)
+
+            text, session = await supervisor.ask(self.providers, list(self.model_lookup.values()),
+                                                 self._configured(run), run, prompt, charged)
+            async with self.locks.setdefault(run_id, asyncio.Lock()):
+                latest = self.db.get_run(run_id)
+                latest.supervisor = session
+                self._save(latest)
+            if session.model_id != previous:
+                self.emit(run_id, "run.lead_changed", model_id=session.model_id, previous_model_id=previous)
+            return text
+
     async def _complete(self, run, node, model_id, prompt, workspace, **kwargs):
-        """Persist each received usage report, even if a later round fails or is cancelled."""
+        # Read fresh, so allowing the network takes effect from the task's next model call.
+        latest = self.db.get_run(run.id)
+        if latest and latest.allow_network and not kwargs.get("repair"):
+            kwargs["network"] = True
+        return await self._charged(run, node, model_id, lambda budget: self.providers.complete(
+            model_id, prompt, workspace, spend_ok=budget, **kwargs))
+
+    async def _charged(self, run, node, model_id, call):
+        """Run ``call(budget)``, a model call, against the task's budget. Persist each received
+        usage report, even if a later round fails or is cancelled."""
         async def charge(cost):
             if not cost:
                 return
@@ -572,12 +603,8 @@ class Executor(Reviewing, Diagnosing, SelfRepair):
         budget = RequestBudget(self.model_lookup, remaining, self.reservations.setdefault(run.id, {}), charge,
                                self.budget_events.setdefault(run.id, asyncio.Event()))
         result = None
-        # Read fresh, so allowing the network takes effect from the task's next model call.
-        latest = self.db.get_run(run.id)
-        if latest and latest.allow_network and not kwargs.get("repair"):
-            kwargs["network"] = True
         try:
-            result = await self.providers.complete(model_id, prompt, workspace, spend_ok=budget, **kwargs)
+            result = await call(budget)
             # CLI calls and provider adapters without streaming usage are accounted here.
             extra = max(0.0, self._actual_cost(result, node, None if node and model_id == node.model_id else model_id) - budget.spent)
             await charge(extra)
