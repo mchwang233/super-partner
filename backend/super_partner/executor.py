@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -21,17 +20,8 @@ from .providers import Conversation, ProviderRegistry
 from .quota import ModelUnavailable, failure_kind
 from .recovery import retry_model, turns_for
 from .review import Reviewing
-from .routing import (
-    NoEligibleModelError,
-    brief_writer,
-    can_act,
-    eligible_for_node,
-    node_cost,
-    route_node,
-)
+from .routing import NoEligibleModelError, can_act, eligible_for_node, node_cost, route_node
 from .self_repair import SelfRepair
-
-logger = logging.getLogger(__name__)
 
 # How a model call that ran out of turns reads in an attempt's reason (providers.TURN_LIMIT_MARK).
 TURN_LIMIT_HINT = "轮工具调用后仍未完成"
@@ -67,8 +57,6 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         self.tool_logs: dict[tuple[str, str], list[dict]] = {}
         # Each step's conversation with its API model, continued by its next attempt.
         self.conversations: dict[tuple[str, str], Conversation] = {}
-        # One brief update at a time per working folder; steps running alongside wait for it.
-        self.brief_locks: dict[str, asyncio.Lock] = {}
         self.reservations: dict[str, dict] = {}
         self.budget_events: dict[str, asyncio.Event] = {}
         # Shared environment repairs must not overwrite one another across projects.
@@ -354,25 +342,17 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         self.conversations[key] = Conversation()
         return self.conversations[key]
 
-    async def _with_brief(self, run: ExecutionRun, node, workspace: Path, prompt: str) -> str:
-        """``prompt`` with the project brief, brought up to date first (briefing.py), and the
-        full text of the files the step most likely needs. Without a model to write it, or if
-        writing it fails, the step gets the plain file list."""
-        brief = None
-        writer = brief_writer(list(self.model_lookup.values()), self._configured(run)) if settings.project_brief else None
-        if writer:
-            async def ask(text: str) -> str:
-                return (await self._complete(run, node, writer.id, text, None, effort="low")).text
-
-            async with self.brief_locks.setdefault(str(workspace), asyncio.Lock()):
-                try:
-                    brief = await briefing.refresh(workspace, settings.data_dir, ask)
-                except (asyncio.CancelledError, BudgetExceeded):
-                    raise
-                except Exception as exc:
-                    logger.warning("project brief unavailable: %s", exc)
-        files = await asyncio.to_thread(briefing.render, workspace, brief)
-        attached = await asyncio.to_thread(briefing.attached_files, workspace, node, run)
+    @staticmethod
+    def _with_files(run: ExecutionRun, node, workspace: Path, prompt: str) -> str:
+        """``prompt`` with the full text of the files the step needs. A work package the planner
+        scoped gets its own files and nothing else; any other step gets the list of the project's
+        files and the files it most likely needs (briefing.py)."""
+        if node.files or node.reads:
+            attached = briefing.attached_files(workspace, node.files + node.reads, briefing.SCOPED_ATTACH_CHARS,
+                                               briefing.SCOPED_ATTACH_CHARS)
+            return "\n\n".join(part for part in (prompt, attached) if part)
+        files = briefing.render(workspace, None)
+        attached = briefing.attached_files(workspace, briefing.likely_files(workspace, node, run))
         return "\n\n".join(part for part in (prompt, files, attached) if part)
 
     def _forget(self, run_id: str) -> None:
@@ -472,8 +452,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         uses_files = model_id.startswith("cli:") or act
         before = await asyncio.to_thread(quality.file_state, workspace) if uses_files else {}
         if uses_files and before and not (conversation and conversation.followup):
-            # A continued conversation knows the project already.
-            prompt = await self._with_brief(run, node, workspace, prompt)
+            # A continued conversation has its files already.
+            prompt = await asyncio.to_thread(self._with_files, run, node, workspace, prompt)
         async with contextlib.AsyncExitStack() as stack:
             if in_project:
                 # CLI agents editing the same checkout concurrently would clobber each other.

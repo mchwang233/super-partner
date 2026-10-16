@@ -87,7 +87,11 @@ Decompose the user request into a small, executable DAG. Return JSON only, with 
       "difficulty": "easy|normal|hard",
       "acceptance_criteria": "checkable conditions a reviewer uses to accept the result",
       "verifies": [],
-      "needs_workspace": false
+      "needs_workspace": false,
+      "files": ["files this node creates or changes"],
+      "reads": ["files it must read for reference"],
+      "provides": "what later nodes can rely on",
+      "check": "one command that shows it works"
     }
   ]
 }
@@ -105,13 +109,27 @@ in a sandbox that can write only to their working directory and has no network a
 they can run syntax checks, tests and scripts but cannot install packages or fetch URLs.
 API models that support tool calls work the same way through file and command tools in
 the same sandbox. Keep acceptance criteria within these limits.
-Use 2-10 nodes. Dependencies reference earlier node keys only. Parallelize independent work.
+Work in a project (when a project brief is given below) is planned as small work packages, not
+areas of work. Each node that changes files lists in "files" the 1-{max_files} files it creates or
+changes and in "reads" up to {max_reads} more files it must read for reference, by their paths in the
+brief. Its model is given only these files, not the project, so they must be enough for the job.
+"provides" says what later nodes can rely on: function names and signatures, endpoints and their
+fields, CSS classes, commands. "check" is one command that shows the package works (a test or a
+script). A package should take a capable model about 10-15 tool turns; split anything larger,
+for example one package per component, endpoint or screen. Nodes whose "files" do not overlap
+run at the same time, so packages that touch different files also finish sooner. A verification
+node lists the files it checks in "reads". Without a project, leave these four fields empty.
+Use 2-{max_nodes} nodes. Dependencies reference earlier node keys only. Parallelize independent work.
 Include verification and final synthesis nodes when appropriate. Set needs_workspace to true
-only for nodes that must read or modify files in the target project; those run one at a time. Token estimates must include expected
-dependency results and project context. Never include markdown fences.
+only for nodes that must read or modify files in the target project. Token estimates must include expected
+dependency results and the files given. Never include markdown fences.
 
 User request:
-"""
+""".replace("{max_files}", "5").replace("{max_reads}", "8").replace("{max_nodes}", "30")
+MAX_NODES = 30
+# A work package's scope (see the prompt above).
+MAX_SCOPE_FILES = 5
+MAX_READ_FILES = 8
 
 
 def select_planner_model(models: list[ModelProfile], configured: set[str]) -> Optional[ModelProfile]:
@@ -159,8 +177,8 @@ def _difficulty(raw: dict) -> dict:
 
 def _validate_plan(payload: dict) -> TaskPlan:
     raw_nodes = payload.get("nodes")
-    if not isinstance(raw_nodes, list) or not 2 <= len(raw_nodes) <= 10:
-        raise ValueError("planner must return 2-10 nodes")
+    if not isinstance(raw_nodes, list) or not 2 <= len(raw_nodes) <= MAX_NODES:
+        raise ValueError(f"planner must return 2-{MAX_NODES} nodes")
     allowed = {"coding", "planning", "research", "chinese", "tool_use", "structured_output"}
     key_to_id: dict[str, str] = {}
     nodes: list[TaskNode] = []
@@ -188,10 +206,46 @@ def _validate_plan(payload: dict) -> TaskPlan:
             acceptance_criteria=str(raw.get("acceptance_criteria", "")).strip()[:1000],
             verifies=[key_to_id[item] for item in _verified(raw, dependencies)],
             needs_workspace=raw.get("needs_workspace") is True,
+            **package(raw),
         ))
     if any(not node.instructions for node in nodes):
         raise ValueError("every planner node needs instructions")
     return TaskPlan(summary=str(payload.get("summary", "Autonomous task plan"))[:240], nodes=nodes)
+
+
+def _paths(value) -> list[str]:
+    items = value if isinstance(value, list) else []
+    return list(dict.fromkeys(str(item).strip().removeprefix("./") for item in items if str(item).strip()))[:20]
+
+
+def package(raw: dict) -> dict:
+    """A node's work-package fields from a planner's (or lead's) JSON."""
+    return {"files": _paths(raw.get("files")), "reads": _paths(raw.get("reads")),
+            "provides": str(raw.get("provides") or "").strip()[:2000],
+            "check": str(raw.get("check") or "").strip()[:500]}
+
+
+def scope_problems(plan: TaskPlan) -> list[str]:
+    """Why some work packages of a project plan are not small and scoped, to send back to the
+    planner: a step that changes files must name them, few enough, and files rather than folders."""
+    problems = []
+    for node in plan.nodes:
+        if not node.needs_workspace or node.verifies:
+            continue
+        broad = [path for path in node.files + node.reads if path.endswith("/") or "*" in path or path in {".", ""}]
+        if not node.files:
+            problems.append(f"{node.title}: lists no files; name the files it creates or changes")
+        elif len(node.files) > MAX_SCOPE_FILES:
+            problems.append(f"{node.title}: changes {len(node.files)} files; split it so each node changes at most "
+                            f"{MAX_SCOPE_FILES}")
+        if len(node.reads) > MAX_READ_FILES:
+            problems.append(f"{node.title}: reads {len(node.reads)} files; at most {MAX_READ_FILES}, or split it")
+        if broad:
+            problems.append(f"{node.title}: names folders or patterns ({', '.join(broad)}); name files")
+    return problems
+
+
+SCOPE_ROUNDS = 2
 
 
 async def _plan_as_lead(request: str, models: list[ModelProfile], configured: set[str], providers,
@@ -211,6 +265,18 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
                                                          "plan as the JSON object described, and nothing else.")
                 cost += _cost(result, model)
                 plan = _validate_plan(_extract_json(result.text))
+            for _ in range(SCOPE_ROUNDS if in_project else 0):
+                if not (problems := scope_problems(plan)):
+                    break
+                # Too broad a step makes its model explore the project; have the lead cut it up.
+                result = await providers.converse(fresh, (
+                    "Some nodes are not small, scoped work packages:\n- " + "\n- ".join(problems)
+                    + "\nReply with the whole corrected plan as the JSON object described, and nothing else."))
+                cost += _cost(result, model)
+                try:
+                    plan = _validate_plan(_extract_json(result.text))
+                except (ValueError, TypeError, KeyError):
+                    break  # keep the plan it gave before
         except Exception as exc:
             # The next lead tries; with none left, the usual single-call planner does.
             logger.warning("lead %s could not plan: %s", model.id, exc)
@@ -240,12 +306,15 @@ async def autonomous_plan(
     providers: ProviderRegistry,
     project_context: Optional[str] = None,
     session: Optional[SupervisorSession] = None,
+    brief: Optional[str] = None,
 ) -> TaskPlan:
     """Plan ``prompt``. Given ``session``, the plan is made by the task's lead in a conversation
     that it keeps for the rest of the task (supervisor.py); ``session`` is filled in. Without a
-    lead able to plan, the best planner plans in a single call and ``session`` stays empty."""
-    in_project = project_context is not None
-    request = PLANNER_PROMPT + prompt + (f"\n\n{project_context}" if project_context else "")
+    lead able to plan, the best planner plans in a single call and ``session`` stays empty.
+    ``brief`` is the project brief (briefing.py): with it the plan is cut into small work
+    packages, each naming the files it needs, so no step has to learn the whole project."""
+    in_project = project_context is not None or brief is not None
+    request = PLANNER_PROMPT + prompt + "".join(f"\n\n{part}" for part in (project_context, brief) if part)
     if session is not None:
         plan = await _plan_as_lead(request, models, configured, providers, session, in_project)
         if plan:

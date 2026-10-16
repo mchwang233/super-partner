@@ -7,7 +7,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 from .models import ExecutionRun, ModelProfile, NodeStatus, TaskNode
-from .planner import _difficulty
+from .planner import MAX_NODES, _difficulty, package
 from .routing import NoEligibleModelError, route_node
 
 
@@ -16,7 +16,6 @@ class PlanError(Exception):
 
 
 CAPABILITIES = {"coding", "planning", "research", "chinese", "tool_use", "structured_output"}
-MAX_NODES = 30
 # Steps that may not be removed or rewritten: their work is done or under way.
 SETTLED = {NodeStatus.SUCCEEDED, NodeStatus.RUNNING}
 
@@ -74,7 +73,7 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
             acceptance_criteria=str(raw.get("acceptance_criteria") or "").strip()[:1000],
             dependencies=resolve(raw.get("dependencies") or [], f"step {raw['key']} dependencies"),
             verifies=resolve(raw.get("verifies") or [], f"step {raw['key']} verifies"),
-            needs_workspace=workspace, **_difficulty(raw),
+            needs_workspace=workspace, **_difficulty(raw), **package(raw),
         ))
 
     updated = []
@@ -85,6 +84,9 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
         for field in ("title", "instructions", "acceptance_criteria"):
             if raw.get(field):
                 setattr(node, field, str(raw[field]).strip()[:120 if field == "title" else 20_000])
+        for field, value in package(raw).items():
+            if field in raw:
+                setattr(node, field, value)
         if "dependencies" in raw:
             node.dependencies = resolve(raw["dependencies"], f"step {node.id} dependencies")
         updated.append(node)

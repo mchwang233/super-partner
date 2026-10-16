@@ -170,10 +170,13 @@ PLAN_FORMAT = (
     '"plan": {"add": [{"key": "new1", "title": "...", "instructions": "...", "acceptance_criteria": "...", '
     '"capability": "coding | planning | research | chinese | tool_use | structured_output", '
     '"difficulty": "easy | normal | hard", "dependencies": ["ids of existing steps or keys of added ones"], '
-    '"verifies": ["optional: ids or keys of steps this one verifies"]}], '
+    '"verifies": ["optional: ids or keys of steps this one verifies"], '
+    '"files": ["files it creates or changes, at most 5"], "reads": ["files it reads for reference"], '
+    '"provides": "what later steps can rely on", "check": "a command that shows it works"}], '
     '"remove": ["ids of steps that have not finished"], '
     '"update": [{"id": "...", "title": "optional", "instructions": "optional", "acceptance_criteria": "optional", '
-    '"dependencies": ["optional: the full new list"]}]}'
+    '"dependencies": ["optional: the full new list"], "files": ["optional: the full new list"], '
+    '"reads": ["optional"], "provides": "optional", "check": "optional"}]}'
 )
 
 

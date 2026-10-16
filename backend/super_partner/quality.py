@@ -75,6 +75,31 @@ def _handoff(item: TaskNode, limit: int) -> tuple[str, str]:
 MAX_OTHER_STEPS = 30
 # Background on the earlier task that each step of a requirement change gets.
 BACKGROUND_CHARS = 2500
+# What a scoped work package gets of each step before it: what that step provides, and this much
+# of its result. The files themselves are attached (briefing.attached_files).
+SCOPED_HANDOFF_CHARS = 1500
+SCOPED_ANSWER = (
+    "Answer briefly, in at most 15 lines: Changed: the files and what changed in them; Provides: what "
+    "later steps can rely on (names, signatures, endpoints, fields, classes); Check: the command you ran "
+    "and its result."
+)
+
+
+def scope_section(node: TaskNode) -> str:
+    """What a work package may touch, for a step the planner scoped (planner.package)."""
+    lines = []
+    if node.files:
+        lines.append("Change only these files (create them if they do not exist): " + ", ".join(node.files))
+    if node.reads:
+        lines.append("For reference: " + ", ".join(node.reads))
+    lines.append("This is a small work package: the files above are attached in full below, as they are now, with "
+                 "what earlier steps delivered. That is what you need, so do not explore the project; read another "
+                 "file only if something you must use is missing there, and say which in your answer.")
+    if node.provides:
+        lines.append(f"Later steps rely on you providing: {node.provides}")
+    if node.check:
+        lines.append(f"Before you finish, run: {node.check}")
+    return "Your work package.\n" + "\n".join(lines)
 
 
 def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, list[NodeInput]]:
@@ -88,6 +113,9 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
                         + run.background[:BACKGROUND_CHARS])
     if node.acceptance_criteria:
         sections.append(f"Acceptance criteria (your result will be checked against these):\n{node.acceptance_criteria}")
+    scoped = bool(node.files or node.reads)
+    if scoped:
+        sections.append(scope_section(node))
     if node.feedback:
         previous = f"\n\nYour previous result:\n{node.result[:limit]}" if node.result else ""
         sections.append(f"A previous attempt was not accepted. Fix these problems:\n{node.feedback}{previous}")
@@ -100,7 +128,11 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
         item = by_id.get(dependency)
         if not item or not item.result:
             continue
-        text, form = _handoff(item, limit)
+        text, form = _handoff(item, SCOPED_HANDOFF_CHARS if scoped else limit)
+        if scoped:
+            text = text[:SCOPED_HANDOFF_CHARS]
+            if item.provides:
+                text = f"It provides: {item.provides}\n{text}"
         files = item.changed_files[:MAX_LISTED_FILES]
         listed = f"\nFiles it changed: {', '.join(files)}" if files else ""
         if len(item.changed_files) > len(files):
@@ -116,6 +148,8 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
     sections.append(UNABLE_RULE)
     if node.verifies:
         sections.append(_verdict_rule(node, by_id))
+    elif scoped:
+        sections.append(SCOPED_ANSWER)
     return "\n\n".join(sections), inputs
 
 

@@ -201,6 +201,13 @@ class TaskNode(BaseModel):
     difficulty: str = "normal"
     # True when the node must read or change files in the run's project directory.
     needs_workspace: bool = False
+    # The step as a small work package (planner.py): the files it creates or changes, the files
+    # it only reads, what it delivers to later steps (names, signatures, endpoints), and a
+    # command that shows it works. A scoped step gets just these files, not the whole project.
+    files: list[str] = Field(default_factory=list)
+    reads: list[str] = Field(default_factory=list)
+    provides: str = ""
+    check: str = ""
     model_id: Optional[str] = None
     # Why the router chose model_id, for the plan view.
     routing_note: Optional[str] = None

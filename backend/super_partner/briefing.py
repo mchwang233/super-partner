@@ -3,8 +3,9 @@ model and kept current, so that every step, whichever model runs it, starts know
 instead of reading it again. Only files whose content changed are summarized again; the brief
 is kept per working directory under the data folder and reused by later tasks.
 
-Each step also gets the full text of the files it most likely needs (``attached_files``): those
-its instructions name and those the steps before it changed.
+The brief is for whoever plans (``planning_brief``): with it the lead cuts the task into small
+work packages that each name their files, and each step then gets only the full text of those
+files (``attached_files``), not the project.
 """
 from __future__ import annotations
 
@@ -40,7 +41,9 @@ PARALLEL = 4
 # Full text attached to a step.
 ATTACH_CHARS = 100_000
 ATTACH_FILE_CHARS = 64_000
-MAX_ATTACHED = 12
+MAX_ATTACHED = 13
+# A scoped work package gets all its files, however long each is, within this.
+SCOPED_ATTACH_CHARS = 200_000
 
 Ask = Callable[[str], Awaitable[str]]
 
@@ -82,6 +85,27 @@ def scan(root: Path) -> dict[str, tuple[str, str]]:
             if len(found) >= MAX_SUMMARIZED_FILES:
                 return found
     return found
+
+
+async def planning_brief(root: Path, data_dir: Path, providers, writer) -> tuple[str, float]:
+    """The brief of ``root`` for planning, brought up to date by ``writer`` (a ModelProfile, or
+    None for just the file list), and what writing it cost."""
+    spent = 0.0
+
+    async def ask(text: str) -> str:
+        nonlocal spent
+        result = await providers.complete(writer.id, text, effort="low")
+        spent += (result.input_tokens * (writer.input_per_million or 0)
+                  + result.output_tokens * (writer.output_per_million or 0)) / 1_000_000
+        return result.text
+
+    brief = None
+    if writer:
+        try:
+            brief = await refresh(root, data_dir, ask)
+        except Exception as exc:
+            logger.warning("project brief unavailable for planning: %s", exc)
+    return await asyncio.to_thread(render, root, brief), spent
 
 
 def store_path(data_dir: Path, root: Path) -> Path:
@@ -197,9 +221,9 @@ def render(root: Path, brief: Optional[dict]) -> str:
 PATH_LIKE = re.compile(r"[\w./-]*[\w-]\.[A-Za-z0-9]{1,8}\b")
 
 
-def attached_files(root: Path, node: TaskNode, run: ExecutionRun) -> str:
-    """Full text of the files ``node`` most likely needs: those its instructions name, then
-    those the steps it depends on changed, within ATTACH_CHARS."""
+def likely_files(root: Path, node: TaskNode, run: ExecutionRun) -> list[str]:
+    """The files a step the planner did not scope most likely needs: those its instructions
+    name, then those the steps it depends on changed."""
     text = f"{node.instructions}\n{node.acceptance_criteria}"
     wanted, names = [], None
     for token in PATH_LIKE.findall(text):
@@ -219,8 +243,15 @@ def attached_files(root: Path, node: TaskNode, run: ExecutionRun) -> str:
     by_id = {item.id: item for item in run.plan.nodes}
     for dependency in node.dependencies:
         wanted += by_id[dependency].changed_files if dependency in by_id else []
+    return list(dict.fromkeys(wanted))
+
+
+def attached_files(root: Path, names: list[str], total_chars: int = ATTACH_CHARS,
+                   file_chars: int = ATTACH_FILE_CHARS) -> str:
+    """Full text of the files ``names`` that exist, in order, while they fit: no file longer than
+    ``file_chars``, none past ``total_chars`` in all. Never binary, hidden or private files."""
     sections, total = [], 0
-    for name in dict.fromkeys(wanted):
+    for name in dict.fromkeys(names):
         path = root / name
         if (len(sections) >= MAX_ATTACHED or not path.is_file() or path.suffix.lower() in BINARY_SUFFIXES
                 or review_path(root, name) is None):
@@ -229,7 +260,7 @@ def attached_files(root: Path, node: TaskNode, run: ExecutionRun) -> str:
             data = path.read_bytes()
         except OSError:
             continue
-        if b"\0" in data[:4096] or len(data) > ATTACH_FILE_CHARS or total + len(data) > ATTACH_CHARS:
+        if b"\0" in data[:4096] or len(data) > file_chars or total + len(data) > total_chars:
             continue
         total += len(data)
         sections.append(f"=== {name} (full text, current) ===\n{data.decode('utf-8', errors='replace')}")

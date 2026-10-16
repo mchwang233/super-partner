@@ -8,6 +8,7 @@ import shutil
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
@@ -17,8 +18,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field
 
 from . import attachments as files
+from . import briefing, publish
 from . import diagnosis as diagnosis_module
-from . import publish
 from .benchmarks import BenchmarkCatalog
 from .catalog_sync import CatalogSync, seed_catalog
 from .config import settings
@@ -46,7 +47,7 @@ from .projects import (
     resolve_project_dir,
 )
 from .providers import ProviderError, ProviderRegistry
-from .routing import NoEligibleModelError, eligible_for_node, estimate, route_node
+from .routing import NoEligibleModelError, brief_writer, eligible_for_node, estimate, route_node
 from .scoring import AA_SOURCE, rescore
 from .secrets import (
     PROVIDER_ENV,
@@ -398,11 +399,18 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
     needs_vision = any(item.kind == "image" for item in attached)
     background = change_background(parent) if parent else None
     request = body.prompt + files.describe(attached, with_paths=False)
+    # The lead plans from the project brief, so it can cut the work into scoped packages.
+    root = Path(project_dir) if project_dir else settings.workspace_root / parent.folder_id if parent else None
+    brief, brief_cost = None, 0.0
+    if root and root.is_dir() and any(root.iterdir()):
+        writer = brief_writer(list(models.values()), configured) if settings.project_brief else None
+        brief, brief_cost = await briefing.planning_brief(root, settings.data_dir, providers, writer)
     plan = await autonomous_plan(
         f"{background}\n\n新需求：\n{request}" if background else request, list(models.values()), configured, providers,
         project_context=await asyncio.to_thread(project_context, project_dir) if project_dir else None,
-        session=(session := SupervisorSession()),
+        session=(session := SupervisorSession()), brief=brief,
     )
+    plan.planning_cost_usd = round(plan.planning_cost_usd + brief_cost, 6)
     try:
         for node in plan.nodes:
             if parent:

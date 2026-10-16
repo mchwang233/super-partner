@@ -5,7 +5,7 @@ import re
 from super_partner import briefing
 from super_partner.config import settings
 from super_partner.executor import Executor
-from super_partner.models import NodeStatus, RunStatus, TaskNode
+from super_partner.models import TaskNode
 from super_partner.providers import ProviderResult
 from super_partner.routing import brief_writer
 from test_leading import MODELS
@@ -59,7 +59,7 @@ def test_a_failed_summary_leaves_the_file_listed_without_one(tmp_path):
     assert "app.py (2 lines)" in text and "Project brief" not in text
 
 
-def test_a_step_gets_the_files_it_names_and_what_came_before_changed(tmp_path, database):
+def test_an_unscoped_step_gets_the_files_it_names_and_what_came_before_changed(tmp_path, database):
     root = project(tmp_path)
     (root / "lib").mkdir()
     (root / "lib" / "util.py").write_text("x = 1\n")
@@ -68,7 +68,7 @@ def test_a_step_gets_the_files_it_names_and_what_came_before_changed(tmp_path, d
     run.plan.nodes[0].changed_files = ["lib/util.py"]
     step = TaskNode(id="b", title="B", instructions="改 app.py 和 big.js，别动 .env", capability="coding",
                     dependencies=[run.plan.nodes[0].id])
-    text = briefing.attached_files(root, step, run)
+    text = briefing.attached_files(root, briefing.likely_files(root, step, run))
     assert "=== app.py (full text, current) ===\ndef main()" in text and "=== lib/util.py" in text
     assert "big.js" not in text and "secret" not in text  # too long to attach; never secrets
 
@@ -83,31 +83,41 @@ def test_the_brief_is_written_by_the_cheapest_api_model():
 
 class Team:
     def __init__(self):
-        self.prompts, self.summaries = [], []
+        self.prompts = []
 
     def configured_models(self, ids):
         return set(ids)
 
     async def complete(self, model_id, prompt, workspace=None, **kwargs):
-        if prompt.startswith(briefing.SUMMARY_PROMPT):
-            self.summaries.append(kwargs.get("effort"))
-            paths = re.findall(r"^=== (.+) ===$", prompt, re.MULTILINE)
-            return ProviderResult(json.dumps({path: f"about {path}" for path in paths}), 0, 0, model_id)
-        if prompt.startswith(briefing.OVERVIEW_PROMPT):
-            return ProviderResult("overview", 0, 0, model_id)
         self.prompts.append(prompt)
         return ProviderResult("做完了", 0, 0, model_id)
 
 
-async def test_each_step_of_a_project_task_starts_from_the_brief(database, tmp_path, monkeypatch):
+async def test_a_work_package_gets_its_own_files_and_not_the_project(database, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "lead_decisions", False)
     root = project(tmp_path / "proj")
+    (root / "other.py").write_text("unrelated = True\n")
     run = database.get_run("r")
-    run.project_dir, run.status = str(root), RunStatus.QUEUED
-    run.plan.nodes[0].needs_workspace = True
-    run.plan.nodes[0].status = NodeStatus.PENDING
+    run.project_dir = str(root)
+    node = run.plan.nodes[0]
+    node.needs_workspace, node.files, node.reads, node.check = True, ["app.py"], ["README.md"], "python -m pytest -q"
     database.save_run(run)
     team = Team()
     await Executor(database, team, MODELS).execute("r")
     [prompt] = team.prompts
-    assert "app.py (2 lines): about app.py" in prompt and team.summaries == ["low"]
+    assert "Change only these files (create them if they do not exist): app.py" in prompt
+    assert "=== app.py (full text, current) ===" in prompt and "=== README.md" in prompt
+    assert "other.py" not in prompt and "Before you finish, run: python -m pytest -q" in prompt
+    assert "at most 15 lines" in prompt
+
+
+async def test_the_planner_gets_the_brief(tmp_path):
+    root = project(tmp_path / "proj")
+    writer = model("cheap:api", 80)
+
+    class Providers:
+        async def complete(self, model_id, prompt, **kwargs):
+            return ProviderResult(await Writer()(prompt), 1000, 100, model_id)
+
+    text, cost = await briefing.planning_brief(root, tmp_path / "data", Providers(), writer)
+    assert "app.py (2 lines): about app.py" in text and cost > 0

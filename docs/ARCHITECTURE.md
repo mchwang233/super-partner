@@ -29,7 +29,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | HTTP API, task lifecycle endpoints | `api.py` | `create_task`, `follow_up_task`, `resume_task`, `reopen_node`, `reply_to_diagnosis`, `set_network_access` |
 | Records and statuses | `models.py` | `RunStatus`, `NodeStatus`, `Outcome` (attempt outcomes), `DiagnosisStatus`, `FINISHED`, `TaskNode`, `NodeAttempt`, `Diagnosis`, `ExecutionRun` |
 | Storage (SQLite, JSON bodies) | `db.py` | `Database.save_run`, `get_run`, events |
-| Planning | `planner.py` | `autonomous_plan` (by the lead when one is available: `_plan_as_lead`), `_validate_plan` |
+| Planning | `planner.py` | `autonomous_plan` (by the lead when one is available: `_plan_as_lead`), `_validate_plan`; project work as small packages (`TaskNode.files/reads/provides/check`, `package`, `scope_problems` sends broad steps back to the lead) |
 | The task's lead: one conversation from planning to the end (docs/design/supervisor.md) | `supervisor.py` | `candidates`, `ask`, `handover`, `trim`; `Executor.ask_lead`, `ProviderRegistry.converse`, `CliChannelRegistry.converse`, `ExecutionRun.supervisor` |
 | Model choice | `routing.py` | `route_node` (first pick), `strongest_for` (retry), `stronger_than` (escalation), `pick_reviewer`, `diagnosers` |
 | Scheduling, attempts, step outcomes | `executor.py` | `Executor`; see "Executor" below |
@@ -43,7 +43,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Diagnosis prompts and parsing | `diagnosis.py` | `prompt`, `repair_prompt`, `platform_instructions`, `parse`, `STATUS` |
 | API model calls, output caps, tool loop | `providers.py` | `ProviderRegistry.complete`, `_send`, `output_ceiling`, `_loop`, `Conversation` (a step's next attempt continues it; chosen by `Executor._conversation`) |
 | CLI model calls and their sandboxes | `cli_channels.py` | `CliChannelRegistry.complete`, `_with_network`, `repair_command` |
-| Project brief given to every step (file summaries by the cheapest API model, refreshed for changed files only; full text of the files a step names or its dependencies changed) | `briefing.py` | `refresh`, `render`, `attached_files`; `Executor._with_brief`, `routing.brief_writer` |
+| Project brief for planning (file summaries by the cheapest API model, refreshed for changed files only), and the files a step is given: a package's own files in full, otherwise the file list and the files it names | `briefing.py` | `planning_brief`, `refresh`, `render`, `attached_files`, `likely_files`; `Executor._with_files`, `quality.scope_section`, `routing.brief_writer` |
 | Tools and sandbox for API models | `agent.py` | `Workspace`, `project_map` (file list given at the start of an attempt), `sandbox_args`, `network_prefix` |
 | Checking long attempts instead of turn limits and timeouts | `progress.py` | `check_prompt`, `parse`, `api_evidence`, `cli_evidence`, `Stopped`; the check itself is `Executor._progress_watch` (review.py) |
 | Per-request budget reservations | `budget.py` | `RequestBudget.reserve` |
