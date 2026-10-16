@@ -129,3 +129,23 @@ async def test_anthropic_max_tokens_stop_without_tool_use_is_an_error(tmp_path, 
     finally:
         await registry.client.aclose()
     assert sent[0]["max_tokens"] == 32768
+
+
+async def test_deepseek_thinks_as_hard_as_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    sent = []
+    done = deepseek({"content": "done"}, "stop")
+    registry = registry_with([done] * 3, sent)
+    plain = ModelProfile(id="deepseek:plain", provider="deepseek", display_name="Plain", supports_reasoning=False)
+    registry.models = {plain.id: plain}
+    try:
+        await registry.complete("deepseek:deepseek-flash", "work", tmp_path, act=True)
+        monkeypatch.setattr(settings, "deepseek_reasoning_effort", "none")
+        await registry.complete("deepseek:deepseek-flash", "plain")
+        # A model known not to reason is not sent the parameter.
+        await registry.complete("deepseek:plain", "plain")
+    finally:
+        await registry.client.aclose()
+    assert sent[0]["reasoning_effort"] == "max"
+    assert sent[1]["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in sent[2]

@@ -237,6 +237,11 @@ answers without calling one: `list_dir`, `read_file`, `write_file`, `edit_file` 
 `tools`/`tool_calls`, Anthropic `tool_use`/`tool_result`, Gemini `functionCall`/
 `functionResponse`), so API models can change projects and run checks like the CLIs.
 
+Each request asks for the model's own output ceiling from the catalog (32768 tokens when the
+catalog does not give one). DeepSeek's reasoning models think at
+`SUPER_PARTNER_DEEPSEEK_REASONING_EFFORT` (sent as `reasoning_effort`; default `max`, the
+deepest; `none` turns thinking off). Deeper thinking is slower and spends more output tokens.
+
 - File tools resolve every path inside the working directory (symlinks included) and
   refuse anything outside it.
 - `run_command` runs under bubblewrap: the system is read-only, the home folder is replaced

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # can end a turn before it writes anything. A model that rejects the cap is retried with a
     # smaller one; the task budget can lower it further.
     api_agent_max_output_tokens: int = Field(default=32768, ge=1024, le=262144)
+    # How hard DeepSeek's reasoning models think (its `reasoning_effort`); "none" turns thinking
+    # off. Higher is slower and spends more output tokens, and gets harder problems right.
+    deepseek_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] = "max"
     # Seconds to wait for one API response; long outputs take minutes to generate.
     api_request_timeout: float = Field(default=600, ge=30)
     # Local TCP ports that API models' sandboxed commands may still reach, such as an EDA

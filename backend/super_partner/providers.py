@@ -272,6 +272,13 @@ class ProviderRegistry:
             exc.usage = ProviderResult("", total_in, total_out, model_id, turns=min(turn, limit))
             raise
 
+    def _reasoning(self, provider: str, model: str) -> dict:
+        """DeepSeek's reasoning effort, for its models that reason (or are not known not to)."""
+        known = self.models.get(f"{provider}:{model}")
+        if provider != "deepseek" or getattr(known, "supports_reasoning", None) is False:
+            return {}
+        return {"reasoning_effort": settings.deepseek_reasoning_effort}
+
     def output_ceiling(self, model_id: str) -> int:
         model = self.models.get(model_id)
         return getattr(model, "max_output_tokens", None) or settings.api_agent_max_output_tokens
@@ -326,7 +333,7 @@ class ProviderRegistry:
                 ] if state["images"] else state["prompt"]}]
             for call_id, _name, output in state["results"] or []:
                 state["history"].append({"role": "tool", "tool_call_id": call_id, "content": output})
-            body = {"model": model, "messages": state["history"]}
+            body = {"model": model, "messages": state["history"], **self._reasoning(provider, model)}
             if state["tools"]:
                 body["tools"] = [{"type": "function", "function": tool} for tool in state["tools"]]
             field = "max_completion_tokens" if provider == "openai" else "max_tokens"
