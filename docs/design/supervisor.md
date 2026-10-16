@@ -1,6 +1,6 @@
 # 设计：任务负责人（Supervisor）
 
-状态：已确认，分阶段实现中（第 1、2 阶段已完成）
+状态：已确认，分阶段实现中（第 1 到 3 阶段已完成）
 范围：调度层（`executor.py`、`diagnosing.py`、`recovery.py`、`review.py`、`planner.py`）
 
 ## 1. 为什么要改

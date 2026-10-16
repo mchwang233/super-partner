@@ -463,7 +463,11 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
                 self.emit(run_id, "node.succeeded", node_id=node.id, cost_usd=spent,
                           selected_model_id=node.model_id, used_model_id=result.used_model_id if result else None)
             elif outcome == Outcome.VERIFY_FAILED:
-                self._send_back(run, node, verdict)
+                if self._can_lead():
+                    # The lead judges the findings before any work is sent back (leading.py).
+                    node.status = NodeStatus.RUNNING
+                else:
+                    self._send_back(run, node, verdict)
             elif settings.auto_diagnose:
                 # Every failed attempt is diagnosed first; _repair_done then retries or pauses.
                 node.status = NodeStatus.RUNNING
@@ -480,7 +484,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
                 node.status == NodeStatus.RUNNING or (outcome == Outcome.VERIFY_FAILED and node.status == NodeStatus.FAILED)
             )
             # A failed attempt held for recovery goes to the task's lead (leading.py).
-            lead = diagnose and node.status == NodeStatus.RUNNING and self._can_lead()
+            lead = node.status == NodeStatus.RUNNING and self._can_lead() and (
+                settings.auto_diagnose or outcome == Outcome.VERIFY_FAILED)
             self._save(run)
         if lead:
             await self._decide(run_id, node_id, verdict, outcome)
@@ -530,17 +535,21 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         node.review = f"无法完成：{(reason or '').strip()}"[:500]
         self.emit(run.id, "node.unable", node_id=node.id, reason=reason, user_action=action)
 
-    def _send_back(self, run: ExecutionRun, verifier, verdict: quality.Verdict) -> None:
-        """A failed verification reopens the verified nodes with its findings, and everything
-        that already used their results, including the verifier itself."""
-        if run.rework_rounds >= settings.max_rework_rounds:
+    def _send_back(self, run: ExecutionRun, verifier, verdict: quality.Verdict, targets: Optional[set] = None,
+                   note: Optional[str] = None, limited: bool = True) -> None:
+        """A failed verification reopens the verified nodes (or the ``targets`` among them) with
+        its findings and ``note``, and everything that already used their results, including the
+        verifier itself. Without the lead deciding (``limited``), max_rework_rounds caps it."""
+        if limited and run.rework_rounds >= settings.max_rework_rounds:
             verifier.status = NodeStatus.FAILED
             verifier.review = f"返工 {run.rework_rounds} 轮后验证仍未通过：{verdict.fix or verdict.reason}"
             self.emit(run.id, "node.failed", node_id=verifier.id, error=verifier.review)
             return
         run.rework_rounds += 1
-        targets = {item for item in verifier.verifies if any(node.id == item for node in run.plan.nodes)}
+        targets = {item for item in (targets or verifier.verifies) if item in verifier.verifies
+                   and any(node.id == item for node in run.plan.nodes)}
         reopened = targets | quality.descendants(run, targets) | {verifier.id}
+        asked = f"\n负责人要求：{note}" if note else ""
         for node in run.plan.nodes:
             if node.id not in reopened:
                 continue
@@ -549,7 +558,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
             if task and task is not asyncio.current_task() and not task.done():
                 task.cancel()
             node.status, node.failed_attempts = NodeStatus.PENDING, 0
-            node.feedback = f"{quality.REWORK_PREFIX}{verifier.title}）发现问题：{verdict.fix or verdict.reason}" if node.id in targets else None
+            node.feedback = (f"{quality.REWORK_PREFIX}{verifier.title}）发现问题：{verdict.fix or verdict.reason}{asked}"
+                             if node.id in targets else None)
         self.emit(run.id, "run.rework", round=run.rework_rounds, verifier=verifier.id,
                   reopened=sorted(reopened), problems=verdict.fix or verdict.reason)
 

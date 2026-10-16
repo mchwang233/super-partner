@@ -147,3 +147,61 @@ async def test_past_the_decision_limit_the_task_pauses_for_the_user(database, mo
     _, result = await run(database, team)
     assert result.status == RunStatus.PAUSED and "已决策 2 次" in result.error
     assert len(result.decisions) == 2 and len(team.work) == 3
+
+
+class Checked(Team):
+    """A build that always finishes, and a verification answering from ``verdicts`` in order."""
+
+    def __init__(self, decisions, verdicts):
+        super().__init__(decisions, fails=0)
+        self.verdicts = list(verdicts)
+        self.verifications = []
+
+    async def complete(self, model_id, prompt, workspace=None, **kwargs):
+        if "You are verifying" in prompt:
+            self.verifications.append(prompt)
+            return ProviderResult(self.verdicts.pop(0) if self.verdicts else "VERDICT: PASS", 0, 0, model_id)
+        return await super().complete(model_id, prompt, workspace, **kwargs)
+
+
+@pytest.fixture
+def checked(database):
+    current = database.get_run("r")
+    current.plan.nodes.append(TaskNode(id="v", title="验证", instructions="跑测试", capability="coding",
+                                       model_id="x:api", dependencies=["a"], verifies=["a"]))
+    database.save_run(current)
+    return database
+
+
+async def test_the_lead_sends_work_back_with_what_to_change(checked, monkeypatch):
+    # Rework rounds no longer cap it: the lead's decision limits do.
+    monkeypatch.setattr(settings, "max_rework_rounds", 0)
+    team = Checked([decision("rework", targets=["a"], instructions="补上空文件的处理")],
+                   ["VERDICT: FAIL: 空文件会崩溃"])
+    _, result = await run(checked, team)
+    assert result.status == RunStatus.SUCCEEDED and result.rework_rounds == 1
+    assert len(team.work) == 2 and "负责人要求：补上空文件的处理" in team.work[1][1]
+    assert "空文件会崩溃" in team.lead[0] and '"targets"' in team.lead[0]
+    assert [item.action for item in result.decisions] == ["rework"]
+
+
+async def test_the_lead_overrules_a_verification_that_asks_for_too_much(checked):
+    team = Checked([decision("accept")], ["VERDICT: FAIL: 还应该支持 Windows 路径"])
+    _, result = await run(checked, team)
+    verifier = result.plan.nodes[1]
+    assert result.status == RunStatus.SUCCEEDED and len(team.work) == 1 and result.rework_rounds == 0
+    assert verifier.review.startswith("负责人接受")
+
+
+async def test_the_lead_reruns_a_verification_that_got_it_wrong(checked):
+    team = Checked([decision("retry", instructions="先装依赖再跑测试")], ["VERDICT: FAIL: 测试找不到模块"])
+    _, result = await run(checked, team)
+    assert result.status == RunStatus.SUCCEEDED and len(team.work) == 1 and len(team.verifications) == 2
+    assert "负责人要求：先装依赖再跑测试" in team.verifications[1]
+
+
+async def test_without_a_decision_a_failed_verification_sends_the_work_back_as_before(checked):
+    team = Checked(["随便", decision("rework", targets=["nope"])], ["VERDICT: FAIL: 空文件会崩溃"])
+    _, result = await run(checked, team)
+    assert [item.action for item in result.decisions] == ["fallback"]
+    assert result.status == RunStatus.SUCCEEDED and result.rework_rounds == 1 and len(team.work) == 2

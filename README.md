@@ -247,7 +247,11 @@ new diagnosis each time. It answers with one decision and a reason, shown as `ru
 `ask_user` (shown like a diagnosis question; the answer goes back to the lead), or
 `repair_environment` / `repair_platform`, which run the repair session with its brief. Past
 `SUPER_PARTNER_MAX_NODE_DECISIONS` (5) decisions for a step or `SUPER_PARTNER_MAX_RUN_DECISIONS`
-(25) for the task, the task pauses; continuing it gives a fresh allowance. Without a lead able to
+(25) for the task, the task pauses; continuing it gives a fresh allowance. A failed verification also goes to the
+lead before anything is sent back: it judges whether the findings are real problems, new
+requirements the task never asked for, or mistakes of the verification, then reworks the steps
+it chooses with what to change (`rework`), accepts, or reruns the verification. Without a lead,
+the findings send all verified steps back, up to `SUPER_PARTNER_MAX_REWORK_ROUNDS`. Without a lead able to
 decide, the diagnosis below handles the failure. `SUPER_PARTNER_LEAD_DECISIONS=false` turns this
 off.
 

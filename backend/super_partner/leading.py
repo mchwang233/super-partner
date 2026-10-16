@@ -6,12 +6,13 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import uuid4
 
 from . import quality, supervisor
 from .budget import BudgetExceeded
 from .config import settings
-from .models import Decision, Diagnosis, DiagnosisStatus, NodeStatus, RunStatus
+from .models import Decision, Diagnosis, DiagnosisStatus, NodeStatus, Outcome, RunStatus
 from .routing import eligible_for_node, node_cost
 
 
@@ -56,23 +57,42 @@ class Leading:
             self.emit(run_id, "approval.required", reason="decision_limit", node_id=node_id)
             return
         choices = self._choices(run, node)
-        prompt = supervisor.failure_message(run, node, node.attempts[-1], verdict, choices, left)
-        decision = await self._ask_for_decision(run_id, node_id, prompt, {item.id for item in choices})
+        verifying = outcome == Outcome.VERIFY_FAILED
+        targets = self._targets(run, node) if verifying else None
+        prompt = (supervisor.verification_message(run, node, verdict, choices, left) if verifying
+                  else supervisor.failure_message(run, node, node.attempts[-1], verdict, choices, left))
+        decision = await self._ask_for_decision(run_id, node_id, prompt, {item.id for item in choices}, targets)
         if decision is None:
             await self._record_fallback(run_id, node_id)
-            await self._repair(run_id, node_id, verdict, outcome)
+            if verifying:
+                # As before the lead: the findings send the verified work back, within the usual rounds.
+                async with self.locks.setdefault(run_id, asyncio.Lock()):
+                    latest = self.db.get_run(run_id)
+                    self._send_back(latest, next(item for item in latest.plan.nodes if item.id == node_id), verdict)
+                    self._save(latest)
+            else:
+                await self._repair(run_id, node_id, verdict, outcome)
         elif decision != "budget":
-            await self._apply_decision(run_id, node_id, decision, verdict, outcome, "attempt_failed")
+            await self._apply_decision(run_id, node_id, decision, verdict, outcome,
+                                       "verify_failed" if verifying else "attempt_failed")
 
-    async def _ask_for_decision(self, run_id: str, node_id: str, prompt: str, model_ids: set[str]):
+    @staticmethod
+    def _targets(run, node) -> set[str]:
+        """The steps a verification may send back: those it checks."""
+        return {item for item in node.verifies if any(other.id == item for other in run.plan.nodes)}
+
+    async def _ask_for_decision(self, run_id: str, node_id: str, prompt: str, model_ids: set[str],
+                                targets: Optional[set[str]] = None):
         """The lead's decision; None when no lead can give a valid one, or "budget" when the task
-        has run out of budget for asking (it is then paused)."""
+        has run out of budget for asking (it is then paused). ``targets``: a failed verification's
+        steps, which rework may send back."""
         try:
-            decision = supervisor.parse_decision(await self.ask_lead(run_id, prompt), model_ids)
+            decision = supervisor.parse_decision(await self.ask_lead(run_id, prompt), model_ids, targets)
             if decision is None:
                 # Same conversation: it only has to say what it decided in the asked form.
                 decision = supervisor.parse_decision(await self.ask_lead(
-                    run_id, "That was not a valid decision.\n" + supervisor.DECISION_FORMAT), model_ids)
+                    run_id, "That was not a valid decision.\n" + supervisor.decision_format(bool(targets))),
+                    model_ids, targets)
             return decision
         except asyncio.CancelledError:
             raise
@@ -119,6 +139,8 @@ class Leading:
                 node.status = NodeStatus.PENDING
                 self.emit(run_id, "node.retry", node_id=node_id, reason="lead", model_id=node.model_id,
                           attempt=len(node.attempts) + 1)
+            elif action == "rework":
+                self._send_back(run, node, verdict, set(decision["targets"]), instructions, limited=False)
             elif action == "accept":
                 node.status, node.feedback = NodeStatus.SUCCEEDED, None
                 node.review = f"负责人接受：{reason}"
@@ -149,7 +171,7 @@ class Leading:
                 repair = (verdict, f"{what}: {instructions or reason}")
             self._save(run)
         self.emit(run_id, "run.decision", node_id=node_id, action=action, reason=reason,
-                  model_id=decision.get("model_id"), event=event)
+                  model_id=decision.get("model_id"), targets=decision.get("targets"), event=event)
         if repair:
             await self._repair(run_id, node_id, repair[0], outcome, brief=repair[1])
 
@@ -165,8 +187,10 @@ class Leading:
             reply = question.messages[-1]
             answer = "\n".join(filter(None, [reply.choice, reply.text]))
             choices = self._choices(run, node)
+            targets = self._targets(run, node) or None
             decision = await self._ask_for_decision(
-                run_id, node.id, supervisor.answer_message(node, question.question, answer), {m.id for m in choices})
+                run_id, node.id, supervisor.answer_message(node, question.question, answer, bool(targets)),
+                {m.id for m in choices}, targets)
             if decision == "budget":
                 return
             if decision is None:

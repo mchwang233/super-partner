@@ -138,31 +138,47 @@ async def ask(providers, models: list[ModelProfile], configured: set[str], run: 
 
 # --- deciding what to do after a failed attempt -------------------------------------------------
 
-ACTIONS = ("retry", "switch_model", "accept", "unable", "ask_user", "repair_environment", "repair_platform")
-DECISION_FORMAT = (
-    "Reply with only a JSON object:\n"
-    '{"action": "retry | switch_model | accept | unable | ask_user | repair_environment | repair_platform", '
-    '"reason": "one or two sentences in Chinese, shown to the user", '
-    '"instructions": "for retry / switch_model: exactly what the next attempt must do differently; '
-    'for repair_*: what to repair", "model_id": "switch_model only: one of the models listed", '
-    '"question": "ask_user only, in Chinese", "options": ["ask_user only: up to 4 answers"], '
-    '"user_action": "unable only: what the user could do to make it possible"}\n'
-    "- retry: the same model again. Only if the next attempt will do something materially different.\n"
-    "- switch_model: another model from the list takes the step (a model that keeps failing it, or "
-    "one too weak for it).\n"
-    "- accept: the result is good enough for the task's goal although its check failed (the check "
-    "was wrong, or asked for more than the step needs); say why.\n"
-    "- unable: the step's goal cannot be reached in this environment and no repair can change that "
-    "(hardware, an account, a licence or credentials the task does not have). The rest of the task "
-    "goes on without it.\n"
-    "- ask_user: only the user can decide or provide something (a choice, credentials, budget, "
-    "permission). The task pauses until they answer.\n"
-    "- repair_environment: something outside the task blocks it (missing software, sandbox or "
-    "machine limits, configuration). A repair session with access to this machine fixes it, then "
-    "the step runs again.\n"
-    "- repair_platform: Super Partner itself (its scheduler, tools or sandbox) is at fault; say what "
-    "and where. A source repair is made, checked and applied, then the task continues."
-)
+ACTIONS = ("retry", "switch_model", "accept", "unable", "ask_user", "repair_environment", "repair_platform",
+           "rework")
+ACTION_RULES = {
+    "rework": "- rework: send the verified steps listed in targets back to be redone, with instructions "
+              "saying exactly what to change. Only for real problems the task needs fixed; not for new "
+              "requirements the task never asked for, and not when the verification itself is wrong.\n",
+    "retry": "- retry: the same model again. Only if the next attempt will do something materially different.\n",
+    "switch_model": "- switch_model: another model from the list takes the step (a model that keeps failing "
+                    "it, or one too weak for it).\n",
+    "accept": "- accept: the result is good enough for the task's goal although its check failed (the check "
+              "was wrong, or asked for more than the task needs); say why.\n",
+    "unable": "- unable: the step's goal cannot be reached in this environment and no repair can change that "
+              "(hardware, an account, a licence or credentials the task does not have). The rest of the "
+              "task goes on without it.\n",
+    "ask_user": "- ask_user: only the user can decide or provide something (a choice, credentials, budget, "
+                "permission). The task pauses until they answer.\n",
+    "repair_environment": "- repair_environment: something outside the task blocks it (missing software, sandbox "
+                          "or machine limits, configuration). A repair session with access to this machine "
+                          "fixes it, then the step runs again.\n",
+    "repair_platform": "- repair_platform: Super Partner itself (its scheduler, tools or sandbox) is at fault; say "
+                       "what and where. A source repair is made, checked and applied, then the task continues.\n",
+}
+
+
+def decision_format(rework: bool = False) -> str:
+    """How to answer; a failed verification may also send steps back (``rework``)."""
+    actions = [action for action in ACTIONS if rework or action != "rework"]
+    return (
+        "Reply with only a JSON object:\n"
+        f'{{"action": "{" | ".join(actions)}", '
+        '"reason": "one or two sentences in Chinese, shown to the user", '
+        '"instructions": "for retry / switch_model / rework: exactly what must be done differently; '
+        'for repair_*: what to repair", "model_id": "switch_model only: one of the models listed", '
+        + ('"targets": ["rework only: ids of the verified steps to redo"], ' if rework else "")
+        + '"question": "ask_user only, in Chinese", "options": ["ask_user only: up to 4 answers"], '
+        '"user_action": "unable only: what the user could do to make it possible"}\n'
+        + "".join(ACTION_RULES[action] for action in actions)
+    )
+
+
+DECISION_FORMAT = decision_format()
 MAX_EVIDENCE_CHARS = 1500
 
 
@@ -204,7 +220,37 @@ def failure_message(run: ExecutionRun, node, attempt, verdict, choices: list[Mod
     return "\n".join(lines)
 
 
-def answer_message(node, question: str, answer: str) -> str:
+def verification_message(run: ExecutionRun, verifier, verdict, choices: list[ModelProfile],
+                         left: tuple[int, int]) -> str:
+    """Tell the lead a verification failed, with what it found and what it checked, and ask
+    whether to send work back."""
+    verified = [node for node in run.plan.nodes if node.id in verifier.verifies]
+    lines = [
+        f"EVENT: a verification failed. Step [{verifier.id}] {verifier.title} checks "
+        + ", ".join(f"[{node.id}] {node.title}" for node in verified) + ".",
+        f"What it found: {verdict.reason}",
+        *([f"What it says to change: {verdict.fix}"] if verdict.fix and verdict.fix != verdict.reason else []),
+        f"Its report (start):\n{(verifier.result or '')[:MAX_EVIDENCE_CHARS]}",
+        f"Work sent back so far in this task: {run.rework_rounds} times.",
+        "The steps it checks:",
+    ]
+    for node in verified:
+        lines.append(f"- [{node.id}] {node.title}, by {node.model_id}, {len(node.attempts)} attempts; "
+                     f"review: {(node.review or '')[:300]}")
+        lines.append(f"  result: {(node.summary or node.result or '')[:800]}")
+    lines += [
+        "Where the steps stand:", *_steps(run),
+        "Models that can run the verification:", *_models(choices, verifier),
+        f"Decisions left: {left[0]} for this step, {left[1]} for the task; after that the task pauses for the user.",
+        "",
+        ("Judge the findings first: are they real problems the task needs fixed, new requirements it "
+         "never asked for, or mistakes of the verification itself? Then decide."),
+        decision_format(rework=True),
+    ]
+    return "\n".join(lines)
+
+
+def answer_message(node, question: str, answer: str, rework: bool = False) -> str:
     """Hand the user's answer to the lead's question back to it."""
     return "\n".join([
         f"EVENT: the user answered your question about step [{node.id}] {node.title}.",
@@ -212,12 +258,13 @@ def answer_message(node, question: str, answer: str) -> str:
         f"Their answer: {answer}",
         "",
         "Decide what to do with this step now.",
-        DECISION_FORMAT,
+        decision_format(rework),
     ])
 
 
-def parse_decision(text: str, model_ids: set[str]) -> Optional[dict]:
-    """The decision in the lead's reply, or None if there is no valid one."""
+def parse_decision(text: str, model_ids: set[str], targets: Optional[set[str]] = None) -> Optional[dict]:
+    """The decision in the lead's reply, or None if there is no valid one. ``targets`` are the
+    steps a failed verification may send back; without them, rework is not a valid answer."""
     start, end = (text or "").find("{"), (text or "").rfind("}")
     if start < 0 or end <= start:
         return None
@@ -235,4 +282,9 @@ def parse_decision(text: str, model_ids: set[str]) -> Optional[dict]:
         return None
     if clean["action"] == "ask_user" and not clean.get("question"):
         return None
+    if clean["action"] == "rework":
+        chosen = payload.get("targets") or sorted(targets or ())
+        if not targets or not isinstance(chosen, list) or not set(map(str, chosen)) <= targets:
+            return None
+        clean["targets"] = [str(item) for item in chosen]
     return clean

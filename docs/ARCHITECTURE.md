@@ -64,7 +64,9 @@ api.confirm_task ── Executor.execute ── _dispatch                       
   model, retry after an environment fix, mark unable (`_mark_unable`), pause, or retry.
 - `_retry_or_fail`: counts the failure and fails the node or retries it on
   `recovery.retry_model` (a model that failed the node twice in a row gives way).
-- `_send_back`: a failed verification reopens the verified steps (rework rounds).
+- A failed verification goes to the lead too (`supervisor.verification_message`): rework chosen
+  steps with what to change (`_send_back(..., limited=False)`), accept, or rerun the verification.
+  Without a lead, `_send_back` reopens all verified steps, capped by max_rework_rounds.
 - `_fix_platform` → `platform_repair.check` → `_activate_platform` (self_repair.py): self-repair,
   applied by restart.
 
