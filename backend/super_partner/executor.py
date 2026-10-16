@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import briefing, progress, quality, supervisor
+from . import briefing, progress, quality, scopes, supervisor
 from .budget import BudgetExceeded, RequestBudget
 from .cli_channels import CLI_SPECS
 from .config import settings
@@ -51,7 +51,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         self.lead_locks: dict[str, asyncio.Lock] = {}
         # The user's messages to each task's lead, answered in the background.
         self.lead_tasks: dict[str, asyncio.Task] = {}
-        self.project_locks: dict[str, asyncio.Lock] = {}
+        # Steps working in one folder at once (scopes.py).
+        self.folder_locks: dict[str, scopes.FolderLock] = {}
         self.node_tasks: dict[tuple[str, str], asyncio.Task] = {}
         # Tool calls of each node's attempt in progress, written onto the attempt when it ends.
         self.tool_logs: dict[tuple[str, str], list[dict]] = {}
@@ -450,14 +451,16 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         # API models act on the workspace through tools; CLIs do so on their own.
         act = bool(model and model.channel != "cli" and can_act(model))
         uses_files = model_id.startswith("cli:") or act
-        before = await asyncio.to_thread(quality.file_state, workspace) if uses_files else {}
-        if uses_files and before and not (conversation and conversation.followup):
-            # A continued conversation has its files already.
-            prompt = await asyncio.to_thread(self._with_files, run, node, workspace, prompt)
+        scope = scopes.of(node)
         async with contextlib.AsyncExitStack() as stack:
-            if in_project:
-                # CLI agents editing the same checkout concurrently would clobber each other.
-                await stack.enter_async_context(self.project_locks.setdefault(run.project_dir, asyncio.Lock()))
+            if in_project or run.background:
+                # Steps editing the same folder at once would clobber each other, unless the files
+                # they change do not overlap (scopes.py).
+                await stack.enter_async_context(self.folder_locks.setdefault(str(workspace), scopes.FolderLock()).hold(scope))
+            before = await asyncio.to_thread(quality.file_state, workspace) if uses_files else {}
+            if uses_files and before and not (conversation and conversation.followup):
+                # A continued conversation has its files already.
+                prompt = await asyncio.to_thread(self._with_files, run, node, workspace, prompt)
             log = self.tool_logs[run.id, node.id] = []
             result = await self._complete(
                 run, node, model_id, prompt, workspace, allow_api_fallback=fallback and not in_project,
@@ -472,7 +475,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
                 raise
         # The node's own model falls back to its routed estimate; a takeover has none.
         cost = self._actual_cost(result, node, None if model_id == node.model_id else model_id)
-        return result, quality.changed_files(before, after), cost, workspace
+        return result, scope.own(quality.changed_files(before, after)), cost, workspace
 
 
     async def _finish(self, run_id: str, node_id: str, result, verdict: quality.Verdict, inputs, changed, cost: float, outcome: Optional[str],
