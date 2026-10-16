@@ -12,6 +12,7 @@ from .cli_channels import CLI_SPECS
 from .config import settings
 from .db import Database
 from .diagnosing import Diagnosing
+from .leading import Leading
 from .models import Diagnosis, Event, ExecutionRun, NodeAttempt, NodeStatus, Outcome, RunStatus
 from .platform_repair import PlatformRepairs
 from .projects import git_snapshot
@@ -29,9 +30,10 @@ TURN_LIMIT_HINT = "轮工具调用后仍未完成"
 MAX_UNABLE_REPORT = 1500
 
 
-class Executor(Reviewing, Diagnosing, SelfRepair):
+class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
     """Runs a task's steps: scheduling, attempts, retries and step outcomes. Reviewing
-    (review.py), diagnosing (diagnosing.py) and self-repair (self_repair.py) are mixed in."""
+    (review.py), the lead's decisions (leading.py), diagnosing (diagnosing.py) and self-repair
+    (self_repair.py) are mixed in."""
 
     def __init__(self, db: Database, providers: ProviderRegistry, model_lookup: dict):
         self.db = db
@@ -477,8 +479,12 @@ class Executor(Reviewing, Diagnosing, SelfRepair):
             diagnose = settings.auto_diagnose and (
                 node.status == NodeStatus.RUNNING or (outcome == Outcome.VERIFY_FAILED and node.status == NodeStatus.FAILED)
             )
+            # A failed attempt held for recovery goes to the task's lead (leading.py).
+            lead = diagnose and node.status == NodeStatus.RUNNING and self._can_lead()
             self._save(run)
-        if diagnose:
+        if lead:
+            await self._decide(run_id, node_id, verdict, outcome)
+        elif diagnose:
             await self._repair(run_id, node_id, verdict, outcome)
 
 
@@ -509,10 +515,11 @@ class Executor(Reviewing, Diagnosing, SelfRepair):
         self.emit(run.id, "node.retry", node_id=node.id, reason=verdict.reason, model_id=node.model_id,
                   attempt=node.failed_attempts + 1)
 
-    def _mark_unable(self, run: ExecutionRun, node, reason: Optional[str], diagnosis: Optional[Diagnosis] = None) -> None:
+    def _mark_unable(self, run: ExecutionRun, node, reason: Optional[str], diagnosis: Optional[Diagnosis] = None,
+                     user_action: Optional[str] = None) -> None:
         """End a step that cannot be done in this environment, saying why and what the user
         could do; steps that need its result are skipped when the task ends."""
-        action = diagnosis.user_action if diagnosis else None
+        action = user_action or (diagnosis.user_action if diagnosis else None)
         report = (diagnosis.report or "")[:MAX_UNABLE_REPORT] if diagnosis and diagnosis.status == "done" else ""
         node.status = NodeStatus.UNABLE
         node.unable_reason = "\n\n".join(part for part in [

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Optional
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -302,6 +303,22 @@ class Diagnosis(BaseModel):
     finished_at: Optional[datetime] = None
 
 
+class Decision(BaseModel):
+    """What the task's lead decided, why, and about what (supervisor.py)."""
+    id: str = Field(default_factory=lambda: uuid4().hex[:8])
+    node_id: Optional[str] = None
+    # What it decided on: attempt_failed | user_answer.
+    event: str
+    # retry | switch_model | accept | unable | ask_user | repair_environment | repair_platform,
+    # or fallback when no lead could decide and the usual diagnosis took over.
+    action: str
+    reason: str = ""
+    instructions: Optional[str] = None
+    model_id: Optional[str] = None
+    lead_model_id: Optional[str] = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class SupervisorSession(BaseModel):
     """The task's lead: the strong model that planned it keeps one conversation until the task
     ends (supervisor.py, docs/design/supervisor.md)."""
@@ -335,6 +352,9 @@ class ExecutionRun(BaseModel):
     github_url: Optional[str] = None
     diagnoses: list[Diagnosis] = Field(default_factory=list)
     supervisor: Optional[SupervisorSession] = None
+    decisions: list[Decision] = Field(default_factory=list)
+    # Decisions counted against the limits only from here: the user continuing a task resets them.
+    decisions_since: Optional[datetime] = None
     # Only tasks deliberately held for an application repair may resume after its restart.
     maintenance_id: Optional[str] = None
     waiting_diagnosis_id: Optional[str] = None

@@ -7,6 +7,7 @@ import re
 import shutil
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
@@ -586,6 +587,8 @@ async def confirm_task(run_id: str, body: ConfirmTask):
             reopen_node(run, node)
     if reopened:
         run.rework_rounds, run.error = 0, None
+    # The user said go on: the lead gets a fresh allowance of decisions.
+    run.decisions_since = datetime.now(timezone.utc)
     # A task paused by the user may still be finishing its running steps; that loop goes on.
     task = executor.tasks.get(run.id)
     run.status = RunStatus.RUNNING if task and not task.done() else RunStatus.QUEUED
@@ -674,9 +677,17 @@ async def reply_to_diagnosis(run_id: str, diagnosis_id: str, body: DiagnosisRepl
             raise HTTPException(422, "请选择一个方案或填写你的想法。")
         previous.messages.append(DiagnosisMessage(text=text, choice=choice))
         if choice == diagnosis_module.NETWORK_CHOICE and not run.allow_network:
-            # The diagnosis asked whether the task may use the internet; the answer applies at once.
+            # A diagnosis or the lead asked whether the task may use the internet; the answer applies at once.
             run.allow_network = True
             executor.emit(run_id, "run.network_changed", allow=True)
+        if previous.trigger == "lead":
+            # The task's lead asked: the answer goes back to it, in its conversation.
+            if run.waiting_diagnosis_id == diagnosis_id:
+                run.waiting_diagnosis_id = None
+            db.save_run(run)
+            executor.emit(run_id, "run.diagnosis_reply", diagnosis_id=diagnosis_id, choice=choice, text=text)
+            executor.start_lead_answer(run_id, diagnosis_id)
+            return run
         focus = previous.node_id or next((n.id for n in run.plan.nodes if n.status == NodeStatus.FAILED), None)
         following = executor.begin_diagnosis(run, "manual", focus)
         run.diagnoses[-1].reply_to = diagnosis_id
@@ -735,6 +746,7 @@ async def resume_task(run_id: str, body: ConfirmTask):
             409, f"Budget ${budget:.2f} is below the ${required:.4f} needed to finish this task",
         )
     run.budget_usd, run.rework_rounds, run.error = budget, 0, None
+    run.decisions_since = datetime.now(timezone.utc)
     if run.plan.estimate:
         run.plan.estimate.hard_limit_usd = budget
     run.status = RunStatus.QUEUED

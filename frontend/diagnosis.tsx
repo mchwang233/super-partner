@@ -78,9 +78,9 @@ function AssistantMessage({ item, model, node, run }: { item: Diagnosis; model: 
     : `正在由 ${model} 分析任务的计划、每次尝试和改动…`;
   return <article className="dx-msg dx-ai">
     <div className="dx-meta">
-      <span className="dx-avatar" aria-hidden="true">🩺</span>
+      <span className="dx-avatar" aria-hidden="true">{item.trigger === "lead" ? "🧭" : "🩺"}</span>
       <b>{model}</b>
-      <small>{item.reply_to ? "回复" : item.trigger === "auto" ? "自动诊断" : "手动诊断"}{node ? ` · ${node}` : ""} · {when(item.created_at)}</small>
+      <small>{item.trigger === "lead" ? "负责人提问" : item.reply_to ? "回复" : item.trigger === "auto" ? "自动诊断" : "手动诊断"}{node ? ` · ${node}` : ""} · {when(item.created_at)}</small>
     </div>
     {item.status === "running" ? <p className="diagnosis-running"><span className="dx-typing" aria-hidden="true"><i /><i /><i /></span>{running}</p>
       : item.status === "failed" ? <p className="error">诊断没有完成：{item.error}</p>

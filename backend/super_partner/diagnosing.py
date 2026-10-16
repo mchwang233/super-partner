@@ -41,7 +41,7 @@ class Diagnosing:
     _mark_unable, _route_after_unavailable) and self-repair (_fix_platform)."""
 
     async def _repair(self, run_id: str, node_id: str, verdict: quality.Verdict, outcome: str,
-                      diagnosis_id: Optional[str] = None) -> None:
+                      diagnosis_id: Optional[str] = None, brief: str = "") -> None:
         """After a failed attempt, a strong model (a membership CLI when possible) looks for
         what blocks the node outside the task (missing software, sandbox or machine limits,
         configuration) and repairs it. Its status decides the rest (see _repair_done).
@@ -80,7 +80,7 @@ class Diagnosing:
                 shared = environment.prepare()
                 before = await asyncio.to_thread(quality.file_state, shared)
                 prompt = repair_prompt(run, node, str(workspace), str(shared), agent_tools.sandbox_ports(),
-                                       events, self.db.shared_repairs(limit=5), self.platform.context())
+                                       events, self.db.shared_repairs(limit=5), self.platform.context(), brief)
                 if self.platform_pending:
                     text, extra = await self._fix_platform(run, diagnosis, node, "")
                     result = None

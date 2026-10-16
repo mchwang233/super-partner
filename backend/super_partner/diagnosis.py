@@ -153,8 +153,9 @@ def prompt(run: ExecutionRun, node_id: Optional[str], workspace: str, events: li
 
 
 def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str, ports: list[int], events: list[str],
-                  shared_repairs: tuple | list = (), platform: str = "") -> str:
-    """Find and repair what blocks a step from outside the task, or say what should happen."""
+                  shared_repairs: tuple | list = (), platform: str = "", brief: str = "") -> str:
+    """Find and repair what blocks a step from outside the task, or say what should happen.
+    ``brief`` is what the task's lead asked to be repaired."""
     port_note = f"local ports {', '.join(map(str, ports))} only" if ports else "nothing"
     last = node.attempts[-1] if node.attempts else None
     return "\n".join([
@@ -163,6 +164,7 @@ def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str,
          "and repair whatever blocks it outside the task itself: missing software, sandbox or "
          "machine limits, configuration, licenses, unreachable services. Do not do the step's work "
          "and do not change the task's files; the scheduler selects the model for the next attempt."),
+        *([f"The task's lead, who follows the whole task, sent you to repair this: {brief}"] if brief else []),
         *_repeated(node),
         *([("The attempt reported that part of the step cannot be done in this environment (outcome "
             "`unable`). Lift that limit if you can (FIXED), or ask the user when only they can decide "

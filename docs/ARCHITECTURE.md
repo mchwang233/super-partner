@@ -30,7 +30,8 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Model choice | `routing.py` | `route_node` (first pick), `strongest_for` (retry), `stronger_than` (escalation), `pick_reviewer`, `diagnosers` |
 | Scheduling, attempts, step outcomes | `executor.py` | `Executor`; see "Executor" below |
 | Reviewing a result | `review.py` (mixed into `Executor`) | `_check`, `_reviewer`, `MAX_BACKUPS` |
-| Diagnosing failures and acting on them | `diagnosing.py` (mixed into `Executor`) | `_repair`, `_diagnose_with`, `_repair_done`, `begin_diagnosis`, `_run_diagnosis` |
+| The lead's decisions after a failed attempt, and its questions to the user | `leading.py` (mixed into `Executor`) | `_decide`, `_apply_decision`, `_decisions_left`, `start_lead_answer`; prompts in `supervisor.failure_message`, `parse_decision` |
+| Diagnosing failures and acting on them (when no lead decides; repairs the lead asks for) | `diagnosing.py` (mixed into `Executor`) | `_repair`, `_diagnose_with`, `_repair_done`, `begin_diagnosis`, `_run_diagnosis` |
 | Repairing Super Partner itself (flow) | `self_repair.py` (mixed into `Executor`) | `_fix_platform`, `_activate_platform`, `_hold_for_platform`, `restore_platform` |
 | What happens after a failure (retry model, meaning of a diagnosis) | `recovery.py` | `retry_model`, `failed_models`, `after_diagnosis`, `turns_for`, `MODEL_FAILURES` |
 | Prompts for steps and reviews, verdict parsing | `quality.py` | `node_prompt`, `review_prompt`, `parse_review`, `UNABLE_RULE`, `unable_claim`, `retry_feedback` |
@@ -56,7 +57,9 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 - `_execute_node`: one attempt; exceptions map to outcomes (`budget`, `error`, quota → `_switch_model`).
 - `_check` (review.py): review or verification verdict; `quality.Verdict(passed, reason, fix, unable, ...)`.
 - `_finish`: appends the `NodeAttempt` with an `Outcome`.
-- After a failure: `_repair` (when `auto_diagnose`) then `_repair_done` (diagnosing.py), which carries out
+- After a failure (when `auto_diagnose`): the lead decides (`_decide`, leading.py): retry, switch
+  model, accept, unable, ask the user, or a repair, which runs `_repair` with its brief. Without a
+  lead able to decide: `_repair` then `_repair_done` (diagnosing.py), which carries out
   `recovery.after_diagnosis(outcome, status)`: hold for a platform repair, ask the user, switch
   model, retry after an environment fix, mark unable (`_mark_unable`), pause, or retry.
 - `_retry_or_fail`: counts the failure and fails the node or retries it on
@@ -76,6 +79,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Providers, output caps | `test_providers.py`, `test_quota.py` |
 | Progress checks | `test_progress.py` |
 | The lead's conversation | `test_supervisor.py` |
+| The lead's decisions | `test_leading.py` |
 | Review prompts and evidence | `test_quality.py`, `test_review_evidence.py` |
 | Platform self-repair | `test_platform_repair.py` |
 | Catalog and benchmarks | `test_catalog_sync.py`, `test_benchmarks.py`, `test_scoring.py` |

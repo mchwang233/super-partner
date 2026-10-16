@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     # is still making progress; only a stuck attempt is stopped. CLIs are checked the same way
     # instead of being killed at a fixed timeout.
     progress_check_minutes: float = Field(default=10, gt=0)
+    # A failed attempt goes to the task's lead to decide what next (supervisor.py), instead of a
+    # new diagnosis each time. Past these many decisions for one step, or for the whole task, the
+    # task pauses for the user.
+    lead_decisions: bool = True
+    max_node_decisions: int = Field(default=5, ge=1, le=50)
+    max_run_decisions: int = Field(default=25, ge=1, le=500)
     # Output tokens per request for a model whose own ceiling the catalog does not give; a known
     # ceiling is used as is. Reasoning models spend their thinking from this too, so a small cap
     # can end a turn before it writes anything. A model that rejects the cap is retried with a

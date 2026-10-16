@@ -238,8 +238,18 @@ is preferred, read-only; otherwise the best API planner, whose history is stored
 and sent again on each message. The conversation is saved on the task (`supervisor`), so it
 continues after a restart. A lost conversation is rebuilt from the task record with the same
 model; an unavailable model hands the task to the next lead (`run.lead_changed`).
-`POST /api/tasks/{id}/lead` asks the lead a question in that conversation. Decisions during the
-run move to the lead in the next stages of the design.
+`POST /api/tasks/{id}/lead` asks the lead a question in that conversation.
+
+A failed attempt goes to the lead with the evidence (why it failed, the step's answer and tool
+calls, earlier attempts, where all steps stand, the models that can take the step), instead of a
+new diagnosis each time. It answers with one decision and a reason, shown as `run.decision`:
+`retry` with instructions, `switch_model`, `accept` the result despite a failed check, `unable`,
+`ask_user` (shown like a diagnosis question; the answer goes back to the lead), or
+`repair_environment` / `repair_platform`, which run the repair session with its brief. Past
+`SUPER_PARTNER_MAX_NODE_DECISIONS` (5) decisions for a step or `SUPER_PARTNER_MAX_RUN_DECISIONS`
+(25) for the task, the task pauses; continuing it gives a fresh allowance. Without a lead able to
+decide, the diagnosis below handles the failure. `SUPER_PARTNER_LEAD_DECISIONS=false` turns this
+off.
 
 ## API models act through tools
 
