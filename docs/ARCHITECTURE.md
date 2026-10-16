@@ -43,6 +43,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Diagnosis prompts and parsing | `diagnosis.py` | `prompt`, `repair_prompt`, `platform_instructions`, `parse`, `STATUS` |
 | API model calls, output caps, tool loop | `providers.py` | `ProviderRegistry.complete`, `_send`, `output_ceiling`, `_loop`, `Conversation` (a step's next attempt continues it; chosen by `Executor._conversation`) |
 | CLI model calls and their sandboxes | `cli_channels.py` | `CliChannelRegistry.complete`, `_with_network`, `repair_command` |
+| Project brief given to every step (file summaries by the cheapest API model, refreshed for changed files only; full text of the files a step names or its dependencies changed) | `briefing.py` | `refresh`, `render`, `attached_files`; `Executor._with_brief`, `routing.brief_writer` |
 | Tools and sandbox for API models | `agent.py` | `Workspace`, `project_map` (file list given at the start of an attempt), `sandbox_args`, `network_prefix` |
 | Checking long attempts instead of turn limits and timeouts | `progress.py` | `check_prompt`, `parse`, `api_evidence`, `cli_evidence`, `Stopped`; the check itself is `Executor._progress_watch` (review.py) |
 | Per-request budget reservations | `budget.py` | `RequestBudget.reserve` |

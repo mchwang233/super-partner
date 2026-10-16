@@ -5,6 +5,9 @@ from typing import Optional
 from .config import settings
 from .models import CostEstimate, ModelProfile, TaskNode
 
+# Context the project brief's writer needs for a batch of whole files (briefing.BATCH_CHARS).
+BRIEF_CONTEXT = 64_000
+
 
 class NoEligibleModelError(ValueError):
     pass
@@ -173,6 +176,20 @@ def pick_reviewer(
         -model.scores.reliability,
         model.input_per_million + model.output_per_million,
     ))
+
+
+def brief_writer(models: list[ModelProfile], configured: set[str]) -> Optional[ModelProfile]:
+    """Who writes the project brief (briefing.py): the cheapest API model with a large enough
+    context, the most reliable among equally cheap ones. Plain summaries need no strong model."""
+    available = [
+        model for model in models
+        if model.enabled and model.routing_ready and model.id in configured and model.channel != "cli"
+        and model.provider != "mock" and (model.context_window or 0) >= BRIEF_CONTEXT
+        and model.input_per_million is not None and model.output_per_million is not None
+    ]
+    return min(available, key=lambda model: (
+        model.input_per_million + model.output_per_million, -model.scores.reliability,
+    ), default=None)
 
 
 def diagnosers(models: list[ModelProfile], configured: set[str]) -> list[ModelProfile]:

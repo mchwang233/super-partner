@@ -182,6 +182,7 @@ class ProviderRegistry:
         repair: bool = False, max_turns: Optional[int] = None, tool_log: Optional[list] = None,
         network: bool = False, review_workspace: Optional[Path] = None, review_files: list[str] = (),
         watch: Optional[progress.Watch] = None, conversation: Optional[Conversation] = None,
+        effort: Optional[str] = None,
     ) -> ProviderResult:
         """One model call. With ``act``, an API model works on ``workspace`` through tools
         (see agent.py) until it is done; ``spend_ok(model_id, input, output)`` can stop it.
@@ -189,7 +190,8 @@ class ProviderRegistry:
         ``network`` lets sandboxed commands reach the internet for a task that allows it.
         ``review_workspace`` gives API reviewers only safe file reads, independently of act/repair.
         ``watch`` checks a long call from time to time instead of a turn limit or a timeout.
-        ``conversation`` keeps an acting model's conversation so a later attempt can continue it."""
+        ``conversation`` keeps an acting model's conversation so a later attempt can continue it.
+        ``effort`` replaces the configured reasoning effort, for simple work such as summaries."""
         provider, model = model_id.split(":", 1)
         attachments = list(attachments)
         if provider == "cli":
@@ -251,7 +253,7 @@ class ProviderRegistry:
         if provider == "google":
             return await self._gemini(model, prompt, images, agent, spend_ok)
         return await self._openai_compatible(provider, model, prompt, images, agent, spend_ok,
-                                             conversation if agent else None)
+                                             conversation if agent else None, effort)
 
     async def test_provider(self, provider: str) -> str:
         urls = {
@@ -388,12 +390,12 @@ class ProviderRegistry:
             exc.usage = ProviderResult("", total_in, total_out, model_id, turns=_turns(turn, limit))
             raise
 
-    def _reasoning(self, provider: str, model: str) -> dict:
+    def _reasoning(self, provider: str, model: str, effort: Optional[str] = None) -> dict:
         """DeepSeek's reasoning effort, for its models that reason (or are not known not to)."""
         known = self.models.get(f"{provider}:{model}")
         if provider != "deepseek" or getattr(known, "supports_reasoning", None) is False:
             return {}
-        return {"reasoning_effort": settings.deepseek_reasoning_effort}
+        return {"reasoning_effort": effort or settings.deepseek_reasoning_effort}
 
     def output_ceiling(self, model_id: str) -> int:
         model = self.models.get(model_id)
@@ -427,7 +429,7 @@ class ProviderRegistry:
 
     async def _openai_compatible(
         self, provider: str, model: str, prompt: str, images: list[Attachment] = (), agent=None, spend_ok=None,
-        conversation: Optional[Conversation] = None,
+        conversation: Optional[Conversation] = None, effort: Optional[str] = None,
     ) -> ProviderResult:
         urls = {
             "openai": "https://api.openai.com/v1/chat/completions",
@@ -452,7 +454,7 @@ class ProviderRegistry:
                 state["history"].append({"role": "tool", "tool_call_id": call_id, "content": output})
             if followup := state.pop("followup", None):
                 state["history"].append({"role": "user", "content": followup})
-            body = {"model": model, "messages": state["history"], **self._reasoning(provider, model)}
+            body = {"model": model, "messages": state["history"], **self._reasoning(provider, model, effort)}
             if state["tools"]:
                 body["tools"] = [{"type": "function", "function": tool} for tool in state["tools"]]
             field = "max_completion_tokens" if provider == "openai" else "max_tokens"

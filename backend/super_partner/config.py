@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     api_agent_max_output_tokens: int = Field(default=32768, ge=1024, le=262144)
     # How hard DeepSeek's reasoning models think (its `reasoning_effort`); "none" turns thinking
     # off. Higher is slower and spends more output tokens, and gets harder problems right.
+    # A project brief (briefing.py) written by a cheap model and given to every step, so models
+    # do not each read the project again; and the full text of the files a step most likely needs.
+    project_brief: bool = True
     deepseek_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] = "max"
     # Seconds to wait for one API response; long outputs take minutes to generate.
     api_request_timeout: float = Field(default=600, ge=30)

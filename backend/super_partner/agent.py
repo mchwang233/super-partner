@@ -210,10 +210,12 @@ def _clip(text: str, tail: bool = False, limit: int = MAX_TOOL_OUTPUT) -> str:
     return note + "\n" + text[-limit:] if tail else text[:limit] + "\n" + note
 
 
-def project_map(root: Path) -> str:
-    """The files of a working directory with their line counts, given at the start of an
-    attempt so the model reads what it needs straight away instead of exploring folder by
-    folder. Binary files are summed up per folder; hidden and build folders are left out."""
+def project_map(root: Path, summaries: dict[str, str] | None = None) -> str:
+    """The files of a working directory with their line counts (and ``summaries`` of them, from
+    the project brief), given at the start of an attempt so the model reads what it needs
+    straight away instead of exploring folder by folder. Binary files are summed up per folder;
+    hidden and build folders are left out."""
+    summaries = summaries or {}
     texts, binaries, more = [], {}, 0
     for folder, dirs, names in os.walk(root):
         dirs[:] = sorted(name for name in dirs if name not in SKIP_DIRS and not name.startswith("."))
@@ -241,7 +243,8 @@ def project_map(root: Path) -> str:
                 more += 1
                 continue
             count = data.count(b"\n") + (bool(data) and not data.endswith(b"\n"))
-            texts.append(f"{relative} ({count} lines)")
+            summary = " ".join(summaries.get(relative, "").split())
+            texts.append(f"{relative} ({count} lines)" + (f": {summary}" if summary else ""))
     if not texts and not binaries:
         return ""
     lines = [*texts, *(f"{folder}/: {len(kinds)} binary files ({', '.join(sorted(set(kinds)))})"
