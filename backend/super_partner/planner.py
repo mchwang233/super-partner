@@ -109,16 +109,19 @@ in a sandbox that can write only to their working directory and has no network a
 they can run syntax checks, tests and scripts but cannot install packages or fetch URLs.
 API models that support tool calls work the same way through file and command tools in
 the same sandbox. Keep acceptance criteria within these limits.
-Work in a project (when a project brief is given below) is planned as small work packages, not
-areas of work. Each node that changes files lists in "files" the 1-{max_files} files it creates or
-changes and in "reads" up to {max_reads} more files it must read for reference, by their paths in the
-brief. Its model is given only these files, not the project, so they must be enough for the job.
+Work that produces files (code, tests, documents) is planned as small work packages, not areas of
+work, in a new task as much as in an existing project. Each node that writes files lists in "files"
+the 1-{max_files} files it creates or changes and in "reads" up to {max_reads} more files it must read
+for reference: in a project, by their paths in the brief given below; in a new task, by the file
+names you choose for it. Its model is given only these files, not the rest, so they must be enough
+for the job.
 "provides" says what later nodes can rely on: function names and signatures, endpoints and their
 fields, CSS classes, commands. "check" is one command that shows the package works (a test or a
 script). A package should take a capable model about 10-15 tool turns; split anything larger,
 for example one package per component, endpoint or screen. Nodes whose "files" do not overlap
 run at the same time, so packages that touch different files also finish sooner. A verification
-node lists the files it checks in "reads". Without a project, leave these four fields empty.
+node lists the files it checks in "reads". Nodes that write no files (research, review, a final
+summary) leave "files" empty.
 Use 2-{max_nodes} nodes. Dependencies reference earlier node keys only. Parallelize independent work.
 Include verification and final synthesis nodes when appropriate. Set needs_workspace to true
 only for nodes that must read or modify files in the target project. Token estimates must include expected
@@ -225,12 +228,18 @@ def package(raw: dict) -> dict:
             "check": str(raw.get("check") or "").strip()[:500]}
 
 
+def writes_files(node: TaskNode) -> bool:
+    """Whether a step produces files, and so must be a scoped work package: it works on the
+    project, writes code, or names files it writes."""
+    return not node.verifies and (node.needs_workspace or node.capability == "coding" or bool(node.files))
+
+
 def scope_problems(plan: TaskPlan) -> list[str]:
-    """Why some work packages of a project plan are not small and scoped, to send back to the
-    planner: a step that changes files must name them, few enough, and files rather than folders."""
+    """Why some work packages of a plan are not small and scoped, to send back to the planner: a
+    step that writes files must name them, few enough, and files rather than folders."""
     problems = []
     for node in plan.nodes:
-        if not node.needs_workspace or node.verifies:
+        if not writes_files(node):
             continue
         broad = [path for path in node.files + node.reads if path.endswith("/") or "*" in path or path in {".", ""}]
         if not node.files:
@@ -265,7 +274,7 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
                                                          "plan as the JSON object described, and nothing else.")
                 cost += _cost(result, model)
                 plan = _validate_plan(_extract_json(result.text))
-            for _ in range(SCOPE_ROUNDS if in_project else 0):
+            for _ in range(SCOPE_ROUNDS):
                 if not (problems := scope_problems(plan)):
                     break
                 # Too broad a step makes its model explore the project; have the lead cut it up.

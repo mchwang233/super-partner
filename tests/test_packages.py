@@ -55,8 +55,10 @@ def test_what_makes_a_package_too_broad():
     [missing] = scope_problems(TaskPlan(summary="s", nodes=[step()]))
     [many] = scope_problems(TaskPlan(summary="s", nodes=[step(files=[f"{i}.py" for i in range(6)])]))
     assert "lists no files" in missing and "changes 6 files" in many
-    # Verifications and steps outside the project need no scope.
-    assert scope_problems(TaskPlan(summary="s", nodes=[step(verifies=["x"]), step(needs_workspace=False)])) == []
+    # A new task's code needs a scope too; verifications and steps that write nothing do not.
+    assert "lists no files" in scope_problems(TaskPlan(summary="s", nodes=[step(needs_workspace=False)]))[0]
+    assert scope_problems(TaskPlan(summary="s", nodes=[
+        step(verifies=["x"]), step(needs_workspace=False, capability="research")])) == []
 
 
 def test_a_package_hears_what_came_before_in_brief(database):
@@ -92,3 +94,16 @@ def test_the_lead_is_asked_only_about_scoped_packages(database):
     assert expected_turns(step) == 25
     assert expected_turns(step.model_copy(update={"files": []})) is None
     assert expected_turns(step.model_copy(update={"verifies": ["a"]})) is None
+
+
+async def test_a_new_task_is_cut_into_packages_too():
+    broad = plan(("全部", [], {}), ("说明", ["全部"], {"capability": "chinese"})).replace('"needs_workspace": true, ', '')
+    leads = Leads([broad, json.dumps(
+        {"summary": "s", "nodes": [
+            {"key": "rtl", "title": "RTL", "instructions": "写 FIFO", "capability": "coding", "files": ["async_fifo.v"],
+             "provides": "module async_fifo #(DATA_WIDTH, DEPTH)"},
+            {"key": "tb", "title": "测试", "instructions": "写测试", "capability": "coding",
+             "files": ["tb_async_fifo.v", "Makefile"]}]})])
+    result = await autonomous_plan("写一个异步 FIFO", MODELS, CONFIGURED, leads, session=SupervisorSession())
+    assert "全部: lists no files" in leads.messages[1][2]
+    assert [node.files for node in result.nodes] == [["async_fifo.v"], ["tb_async_fifo.v", "Makefile"]]

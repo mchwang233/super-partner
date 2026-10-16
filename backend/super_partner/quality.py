@@ -92,9 +92,10 @@ def scope_section(node: TaskNode) -> str:
         lines.append("Change only these files (create them if they do not exist): " + ", ".join(node.files))
     if node.reads:
         lines.append("For reference: " + ", ".join(node.reads))
-    lines.append("This is a small work package: the files above are attached in full below, as they are now, with "
-                 "what earlier steps delivered. That is what you need, so do not explore the project; read another "
-                 "file only if something you must use is missing there, and say which in your answer.")
+    lines.append("This is a small work package: those of the files above that exist are attached in full below, as "
+                 "they are now, with what earlier steps delivered. That is what you need, so do not explore the "
+                 "rest; read another file only if something you must use is missing there, and say which in "
+                 "your answer.")
     if node.provides:
         lines.append(f"Later steps rely on you providing: {node.provides}")
     if node.check:

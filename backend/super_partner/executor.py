@@ -453,7 +453,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         uses_files = model_id.startswith("cli:") or act
         scope = scopes.of(node)
         async with contextlib.AsyncExitStack() as stack:
-            if in_project or run.background:
+            if uses_files:
                 # Steps editing the same folder at once would clobber each other, unless the files
                 # they change do not overlap (scopes.py).
                 await stack.enter_async_context(self.folder_locks.setdefault(str(workspace), scopes.FolderLock()).hold(scope))

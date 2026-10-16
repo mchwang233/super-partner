@@ -28,9 +28,10 @@ def unavailable(model_id):
     return ModelUnavailable(model_id, datetime.now(timezone.utc), "额度用完")
 
 PLAN = json.dumps({"summary": "待办网页", "nodes": [
-    {"key": "a", "title": "页面", "instructions": "写页面", "capability": "coding", "difficulty": "normal"},
+    {"key": "a", "title": "页面", "instructions": "写页面", "capability": "coding", "difficulty": "normal",
+     "files": ["index.html"]},
     {"key": "b", "title": "检查", "instructions": "检查页面", "capability": "coding", "difficulty": "easy",
-     "dependencies": ["a"]}]})
+     "dependencies": ["a"], "files": ["test_index.py"], "reads": ["index.html"]}]})
 
 
 def model(model_id, planning, channel="api"):

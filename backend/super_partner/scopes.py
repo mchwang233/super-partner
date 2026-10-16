@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 from typing import Optional
 
+from .planner import writes_files
+
 
 class Scope:
     """What a step changes and reads; ``None`` for a step that may touch anything."""
@@ -27,10 +29,11 @@ class Scope:
 
 
 def of(node) -> Scope:
-    """A step's scope: its package's files, or everything when the planner gave it none."""
-    if not node.files and not node.reads:
-        return Scope()
-    return Scope(node.files, node.reads)
+    """A step's scope: its package's files; nothing for a step that writes no files (a review or
+    summary); everything for one that writes files the planner did not name."""
+    if node.files or node.reads:
+        return Scope(node.files, node.reads)
+    return Scope() if writes_files(node) else Scope([], [])
 
 
 class FolderLock:
