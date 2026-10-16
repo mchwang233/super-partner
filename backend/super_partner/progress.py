@@ -22,6 +22,18 @@ class Stopped(RuntimeError):
 
 # How the error of a stopped attempt reads.
 STOPPED = "进度检查判断这次尝试卡住，已停止："
+# A work package past twice its expected turns goes to the task's lead (supervisor.overrun_message),
+# and again at every further multiple; how the error reads when the lead stops it.
+OVERRUN_FACTOR = 2
+OVERRUN = "超出预计轮数，负责人已停止这次尝试："
+EXPECTED_TURNS = {"easy": 10, "normal": 15, "hard": 25}
+
+
+def expected_turns(node: TaskNode) -> Optional[int]:
+    """Tool turns a scoped work package should take (planner.package); None for other steps."""
+    if not (node.files or node.reads) or node.verifies:
+        return None
+    return EXPECTED_TURNS.get(node.difficulty, EXPECTED_TURNS["normal"])
 VERDICT = re.compile(r"^\s*VERDICT:\s*(CONTINUE|STOP)\b:?\s*(.*)$", re.IGNORECASE | re.MULTILINE)
 # Tool calls of an API model shown to the checker, latest last.
 RECENT_CALLS = 40

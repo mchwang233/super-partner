@@ -1,9 +1,16 @@
 """A project task is planned as small work packages, each naming the files it needs."""
 import json
 
+import httpx
+import pytest
+from super_partner import progress
+from super_partner.budget import ProviderError
 from super_partner.models import SupervisorSession, TaskNode, TaskPlan
 from super_partner.planner import autonomous_plan, scope_problems
+from super_partner.progress import expected_turns
+from super_partner.providers import ProviderRegistry
 from super_partner.quality import node_prompt
+from test_progress import READ, reply
 from test_supervisor import CONFIGURED, MODELS, Leads
 
 BRIEF = "Project brief ...\napp.js (1447 lines): SPA\nstyle.css (308 lines): styles"
@@ -61,3 +68,27 @@ def test_a_package_hears_what_came_before_in_brief(database):
     prompt, _ = node_prompt(step, run, 4000)
     assert "It provides: GET /api/admin/mail-settings -> {host, port}" in prompt
     assert prompt.count("很长的过程说明") < 200  # 1500 characters of it, not the whole result
+
+
+async def test_a_package_far_past_its_turns_goes_to_the_lead(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    registry = ProviderRegistry()
+    registry.client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json=reply({"content": None, "tool_calls": [READ]}))))
+    asked = []
+
+    async def lead(evidence):
+        asked.append(evidence)
+        return None if len(asked) == 1 else "一直在读同一个目录，这个包太大，应拆开"
+
+    with pytest.raises(ProviderError, match=progress.OVERRUN):
+        await registry.complete("deepseek:deepseek-flash", "work", tmp_path, act=True, overrun=(5, lead))
+    await registry.client.aclose()
+    assert [evidence.split(" ", 1)[0] for evidence in asked] == ["10", "20"]
+
+
+def test_the_lead_is_asked_only_about_scoped_packages(database):
+    step = TaskNode(id="b", title="B", instructions="i", capability="coding", difficulty="hard", files=["a.py"])
+    assert expected_turns(step) == 25
+    assert expected_turns(step.model_copy(update={"files": []})) is None
+    assert expected_turns(step.model_copy(update={"verifies": ["a"]})) is None

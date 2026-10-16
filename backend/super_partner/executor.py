@@ -467,6 +467,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
                 attachments=run.attachments, act=act, max_turns=turns_for(node), tool_log=log,
                 watch=self._progress_watch(run, node, model_id),
                 **({"conversation": conversation} if conversation else {}),
+                **({"overrun": overrun} if (overrun := self._overrun_check(run, node, model_id)) else {}),
             )
             try:
                 after = await asyncio.to_thread(quality.file_state, workspace) if uses_files else {}

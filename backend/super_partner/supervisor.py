@@ -293,6 +293,20 @@ def final_message(run: ExecutionRun, left: int) -> str:
     return "\n".join(lines)
 
 
+def overrun_message(node, turns: int, expected: int, evidence: str) -> str:
+    """A work package taking far more turns than planned: going on, or stopped (and then split)."""
+    return "\n".join([
+        (f"EVENT: work package [{node.id}] {node.title} was planned for about {expected} tool turns and has "
+         f"taken {turns}."),
+        f"Its files: {', '.join(node.files) or '-'}; reads: {', '.join(node.reads) or '-'}",
+        f"What it has been doing:\n{evidence}",
+        ("Is it still doing its own package and close to done, or is the package too big, under-specified, "
+         "or going wrong? Stopped, the attempt fails and you then decide what to do (for a package too "
+         "big: replan to split it). End with exactly one line: `VERDICT: CONTINUE` or "
+         "`VERDICT: STOP: <why, in Chinese>`."),
+    ])
+
+
 def chat_message(text: str) -> str:
     """The user writing to the lead directly, not answering one of its questions."""
     return (

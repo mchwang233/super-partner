@@ -151,6 +151,7 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "run.plan_changed":data=>`负责人调整了计划：${[data.added?.length?`新增 ${data.added.join("、")}`:"",data.removed?.length?`删除 ${data.removed.join("、")}`:"",data.updated?.length?`修改 ${data.updated.join("、")}`:""].filter(Boolean).join("；")}`,
   "run.lead_changed":data=>`负责人换成 ${data.model_id}${data.previous_model_id?`（原为 ${data.previous_model_id}）`:""}`,
   "node.succeeded":(data,title)=>`${title(data.node_id)}：完成`,
+  "node.overrun_check":(data,title)=>data.stop?`${title(data.node_id)}：已用 ${data.turns} 轮（预计 ${data.expected} 轮），负责人停止了这次尝试（${data.reason??""}）`:`${title(data.node_id)}：已用 ${data.turns} 轮（预计 ${data.expected} 轮），负责人判断仍在推进，继续执行`,
   "node.progress_check":(data,title)=>data.stop?`${title(data.node_id)}：运行 ${data.minutes} 分钟后检查，判断已卡住并停止（${data.reason??""}）`:`${title(data.node_id)}：运行 ${data.minutes} 分钟后检查，仍在推进，继续执行`,
   "node.retry":(data,title)=>data.reason==="environment_fixed"?`${title(data.node_id)}：环境已修复，重新执行`:`${title(data.node_id)}：未通过，准备重试（${data.reason??""}）`,
   "node.failed":(data,title)=>`${title(data.node_id)}：失败（${data.error??""}）`,

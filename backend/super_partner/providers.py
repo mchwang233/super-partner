@@ -182,7 +182,7 @@ class ProviderRegistry:
         repair: bool = False, max_turns: Optional[int] = None, tool_log: Optional[list] = None,
         network: bool = False, review_workspace: Optional[Path] = None, review_files: list[str] = (),
         watch: Optional[progress.Watch] = None, conversation: Optional[Conversation] = None,
-        effort: Optional[str] = None,
+        effort: Optional[str] = None, overrun: Optional[tuple[int, progress.Watch]] = None,
     ) -> ProviderResult:
         """One model call. With ``act``, an API model works on ``workspace`` through tools
         (see agent.py) until it is done; ``spend_ok(model_id, input, output)`` can stop it.
@@ -191,7 +191,9 @@ class ProviderRegistry:
         ``review_workspace`` gives API reviewers only safe file reads, independently of act/repair.
         ``watch`` checks a long call from time to time instead of a turn limit or a timeout.
         ``conversation`` keeps an acting model's conversation so a later attempt can continue it.
-        ``effort`` replaces the configured reasoning effort, for simple work such as summaries."""
+        ``effort`` replaces the configured reasoning effort, for simple work such as summaries.
+        ``overrun`` is (expected turns, check): an acting model past progress.OVERRUN_FACTOR times
+        those turns is checked, and stopped if the check says so."""
         provider, model = model_id.split(":", 1)
         attachments = list(attachments)
         if provider == "cli":
@@ -247,7 +249,7 @@ class ProviderRegistry:
                 network=network,
             ) if act else None
         if agent:
-            agent.watch = watch
+            agent.watch, agent.overrun = watch, overrun
         if provider == "anthropic":
             return await self._anthropic(model, prompt, images, agent, spend_ok)
         if provider == "google":
@@ -380,6 +382,11 @@ class ProviderRegistry:
                     call_id, name, output = results[-1]
                     results[-1] = (call_id, name, f"{output}\n\n{note}")
                 state["results"] = results
+                expected, check = getattr(agent, "overrun", None) or (0, None)
+                # Far past what a package was planned for: the lead says whether to go on.
+                if (check and turn % (expected * progress.OVERRUN_FACTOR) == 0
+                        and (reason := await check(progress.api_evidence(turn, seen)))):
+                    raise ProviderError(f"{model_id} {progress.OVERRUN}{reason}")
                 if watch and time.monotonic() >= next_check:
                     # Not cut off at a time limit: another model says whether it is stuck.
                     if reason := await watch(progress.api_evidence(turn, seen)):

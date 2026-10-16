@@ -10,6 +10,7 @@ export type PlanNode = {
   acceptance_criteria?: string; verifies?: string[]; attempts?: NodeAttempt[]; failed_attempts?: number;
   feedback?: string | null; unable_reason?: string | null; review_passed?: boolean | null; review?: string | null; summary?: string | null;
   changed_files?: string[]; inputs?: { node_id: string; form: string; changed_files: number }[];
+  files?: string[]; reads?: string[]; provides?: string; check?: string;
 };
 type ToolCall = { turn: number; tool: string; detail?: string; ok?: boolean };
 type NodeAttempt = { model_id?: string | null; outcome: string; reason?: string | null; reviewer_model_id?: string | null; cost_usd: number; finished_at?: string;
@@ -263,6 +264,12 @@ function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, o
       <div className="node-progress-side">
         {node.unable_reason && <section className="unable-reason"><h5>无法完成的原因</h5><MarkdownView text={node.unable_reason} /></section>}
         {node.acceptance_criteria && <section><h5>验收标准</h5><p>{node.acceptance_criteria}</p></section>}
+        {!!(node.files?.length || node.reads?.length) && <section className="node-scope"><h5>工作范围</h5>
+          {!!node.files?.length && <p>改动：{node.files.join("、")}</p>}
+          {!!node.reads?.length && <p>参考：{node.reads.join("、")}</p>}
+          {node.provides && <p>交付：{node.provides}</p>}
+          {node.check && <p>检查：<code>{node.check}</code></p>}
+        </section>}
         {node.review && <section><h5>验收意见</h5><p>{node.review}</p></section>}
         {node.feedback && node.status !== "succeeded" && <section><h5>需要修改</h5><p>{node.feedback}</p></section>}
         {!!inputs.length && <section><h5>收到的上游结果</h5><p>{inputs.map(input => `${number.get(input.node_id) ?? "?"} 的${INPUT_LABELS[input.form] ?? input.form}${input.changed_files ? `（改动 ${input.changed_files} 个文件）` : ""}`).join("，")}</p></section>}

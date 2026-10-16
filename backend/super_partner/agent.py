@@ -271,6 +271,8 @@ class Workspace:
         self.max_turns, self.log = max_turns, log
         # Checks a long attempt instead of a turn limit (progress.Watch); set by the caller.
         self.watch = None
+        # (expected turns, progress.Watch): asked when a work package runs well past them.
+        self.overrun = None
         # Host mode, for repairing the environment: commands leave the sandbox (network, any
         # folder the user can write) but still cannot gain root.
         self.host = host and not read_only

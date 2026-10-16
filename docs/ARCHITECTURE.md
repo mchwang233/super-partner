@@ -44,6 +44,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | API model calls, output caps, tool loop | `providers.py` | `ProviderRegistry.complete`, `_send`, `output_ceiling`, `_loop`, `Conversation` (a step's next attempt continues it; chosen by `Executor._conversation`) |
 | CLI model calls and their sandboxes | `cli_channels.py` | `CliChannelRegistry.complete`, `_with_network`, `repair_command` |
 | Project brief for planning (file summaries by the cheapest API model, refreshed for changed files only), and the files a step is given: a package's own files in full, otherwise the file list and the files it names | `briefing.py` | `planning_brief`, `refresh`, `render`, `attached_files`, `likely_files`; `Executor._with_files`, `quality.scope_section`, `routing.brief_writer` |
+| A work package far past its expected turns goes to the lead (continue, or stop and then split) | `progress.py`, `review.py` | `expected_turns`, `OVERRUN_FACTOR`; `_overrun_check`, `supervisor.overrun_message` |
 | Steps in one project at once: disjoint package files run together, unscoped steps alone | `scopes.py` | `FolderLock.hold`, `Scope.clashes`, `Scope.own`; `Executor._work` |
 | Tools and sandbox for API models | `agent.py` | `Workspace`, `project_map` (file list given at the start of an attempt), `sandbox_args`, `network_prefix` |
 | Checking long attempts instead of turn limits and timeouts | `progress.py` | `check_prompt`, `parse`, `api_evidence`, `cli_evidence`, `Stopped`; the check itself is `Executor._progress_watch` (review.py) |

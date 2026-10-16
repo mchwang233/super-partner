@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import progress, quality
+from . import progress, quality, supervisor
 from .budget import BudgetExceeded
 from .config import settings
 from .models import ExecutionRun
@@ -125,6 +125,28 @@ class Reviewing:
             return reason
 
         return watch
+
+    def _overrun_check(self, run: ExecutionRun, node, model_id: str) -> Optional[tuple[int, progress.Watch]]:
+        """For a work package with a lead: (expected turns, a check that asks the lead whether an
+        attempt far past them should go on). None for other steps."""
+        expected = progress.expected_turns(node)
+        if not expected or not run.supervisor or not run.supervisor.model_id or not self._can_lead():
+            return None
+
+        async def check(evidence: str) -> Optional[str]:
+            turns = int(evidence.split(" ", 1)[0]) if evidence[:1].isdigit() else 0
+            try:
+                reply = await self.ask_lead(run.id, supervisor.overrun_message(node, turns, expected, evidence))
+                reason = progress.parse(reply)
+            except (asyncio.CancelledError, BudgetExceeded):
+                raise
+            except Exception:
+                reason = None  # without an answer the attempt goes on
+            self.emit(run.id, "node.overrun_check", node_id=node.id, model_id=model_id, turns=turns,
+                      expected=expected, stop=bool(reason), reason=reason)
+            return reason
+
+        return expected, check
 
     def _reviewer(self, run: ExecutionRun, node, tokens: int):
         return pick_reviewer(list(self.model_lookup.values()), self._configured(run), node.model_id, tokens)
