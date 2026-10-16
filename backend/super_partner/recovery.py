@@ -25,12 +25,13 @@ def turns_for(node: TaskNode) -> int:
 
 
 def recent_failures(node: TaskNode) -> list:
-    """The step's model failures since its last accepted attempt, oldest first."""
+    """The step's model failures since its last accepted attempt, oldest first. Running out of
+    turns is one too, whatever the model claimed at the end."""
     failures = []
     for attempt in node.attempts:
         if attempt.outcome == Outcome.PASSED:
             failures = []
-        elif attempt.outcome in MODEL_FAILURES:
+        elif attempt.outcome in MODEL_FAILURES or attempt.turn_limit:
             failures.append(attempt)
     return failures
 

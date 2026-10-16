@@ -36,7 +36,8 @@ UNABLE_RULE = (
     "do not simulate it, fake its output, or describe it as done: do every part you can, say what "
     "is ready, and end your answer with one final line `UNABLE: <what could not be done, why, and "
     "what would make it possible>`. Judge only this step: work that belongs to other steps or to "
-    "the overall goal (such as deploying, when this step only builds) is not yours to do or report."
+    "the overall goal (such as deploying, when this step only builds) is not yours to do or report. "
+    "Running out of turns or time is not a limit of the environment: report your progress instead."
 )
 VERDICT = re.compile(r"^\s*VERDICT:\s*(PASS|FAIL)\b:?\s*(.*)$", re.IGNORECASE | re.MULTILINE)
 # Feedback a failed verification sends back, and what later retries append to it.

@@ -47,6 +47,15 @@ def test_two_failures_in_a_row_hand_the_step_to_the_best_other_model():
     assert recovery.retry_model(node, MODELS, CONFIGURED).id == "x:pro"
 
 
+def test_running_out_of_turns_counts_whatever_the_model_claimed():
+    node = step(("x:flash", "unable"), ("x:flash", "unable"))
+    assert recovery.failed_models(node) == set()
+    for attempt in node.attempts:
+        attempt.turn_limit = True
+    assert recovery.failed_models(node) == {"x:flash"}
+    assert recovery.retry_model(node, MODELS, CONFIGURED).id == "cli:codex"
+
+
 def test_only_the_models_own_failures_count():
     # Provider limits, cancellations and unverified reviews say nothing about the model's work.
     node = step(("x:flash", "rejected"), ("x:flash", "quota"), ("x:flash", "cancelled"), ("x:flash", "unverified"))

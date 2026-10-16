@@ -55,7 +55,8 @@ def _turn_note(left: int) -> str:
                 "the change in hand, run one final check, then answer without calling a tool.")
     if left == 0:
         return ("[System notice] No turns of tool calls are left. Do not call any tool. Answer now with a "
-                "progress summary: what is done (files, checks and their results), what is not done yet, "
+                "progress summary (not UNABLE: unfinished work is not a limit of the environment): what is done "
+                "(files, checks and their results), what is not done yet, "
                 "and exactly what the next attempt should do.")
     return ""
 

@@ -273,8 +273,8 @@ answers without calling one: `list_dir`, `read_file`, `write_file`, `edit_file` 
   command, whether it went through) and shown, folded, under the attempt in the plan view;
   diagnoses get a per-tool count and the latest attempt's calls.
 - **Failed twice.** When one model has failed a node twice in a row (rejected, failed
-  verification, errors and running out of turns all count; provider limits, cancellations and
-  unverified reviews do not), the next retry goes to the strongest other eligible model, a
+  verification, errors and running out of turns all count, the last even when the model claimed
+  the step cannot be done; provider limits, cancellations and unverified reviews do not), the next retry goes to the strongest other eligible model, a
   membership CLI included, even under the API-first policy. Later retries do not go back to a
   model that failed the node twice. The rules are in `backend/super_partner/recovery.py`.
 - Models marked as not supporting tools, and the offline demo model, only answer with text
@@ -354,9 +354,10 @@ build. A failed check feeds back into a bounded repair attempt; it is not treate
 
 Every model that diagnoses or repairs the platform, CLI or API, follows one procedure:
 [`skills/platform-repair/SKILL.md`](skills/platform-repair/SKILL.md), with the module map in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Both are put into the diagnosis and repair
-prompts and copied into the repair source, where `AGENTS.md` (read by Codex) and `CLAUDE.md`
-(read by Claude Code) point to them. A diagnosis names the places to change in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The repair prompt contains both; a diagnosis
+gets their paths in the source checkout, marked as being about Super Partner's own code and not
+the task's. They are copied into the repair source, where `AGENTS.md` (read by Codex) and
+`CLAUDE.md` (read by Claude Code) point to them. A diagnosis names the places to change in
 `LOCATION: path:line` lines, and the repair starts from them instead of rereading the code.
 
 For an editable source checkout started with `start.sh` under a systemd user manager, passing

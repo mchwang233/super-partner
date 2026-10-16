@@ -133,7 +133,9 @@ class PlatformRepairs:
                 "under tests and frontend/tests. The repair controller will provide an isolated "
                 "copy, run independent checks, preserve local data, and activate validated fixes "
                 "for all projects. Never modify live source, credentials, task records or Git history.\n"
-                + repair_guide(self.root))
+                f"Only if Super Partner itself is at fault: find its code with {self.root}/{REPAIR_GUIDES[1]} "
+                f"and diagnose as {self.root}/{REPAIR_GUIDES[0]} says. Both are about Super Partner's "
+                "own code, not the task: never tell the task's steps to read or follow them.")
 
     async def prepare(self, run_id: str, diagnosis_id: str, *, allow_network: bool = False) -> dict:
         if not self.enabled or not self.root:

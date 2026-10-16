@@ -289,7 +289,9 @@ async def test_platform_diagnosis_edits_copy_and_only_then_schedules_activation(
                 return ProviderResult("修复调度器并添加回归检查。\nSTATUS: FIXED", 0, 0, model_id)
             if kwargs.get("repair"):
                 assert str(source_checkout) in prompt
-                assert "LOCATION:" in prompt and "# Repairing Super Partner" in prompt
+                assert "LOCATION:" in prompt and f"{source_checkout}/skills/platform-repair/SKILL.md" in prompt
+                # Only the paths: a task diagnosis must not take the platform guide for the task's.
+                assert "# Repairing Super Partner" not in prompt
                 return ProviderResult("Super Partner 调度器没有正确处理步骤状态。\nSTATUS: PLATFORM_REPAIR", 0, 0, model_id)
             raise RuntimeError("scheduler defect")
 
