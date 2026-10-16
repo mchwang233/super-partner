@@ -21,6 +21,7 @@ const VERDICTS: Record<string, { label: string; tone: string; note: (model: stri
   quota_exhausted: { label: "换用备用模型", tone: "ok", note: model => `${model} 确认执行模型额度耗尽，会自动换用备用模型；没有备用模型时才暂停。` },
   model_unavailable: { label: "换用备用模型", tone: "ok", note: model => `${model} 确认模型服务不可用，会自动换用备用模型，其他项目也会暂时避开它。` },
   blocked: { label: "需要你处理", tone: "warn", note: (model, item) => `${model} 判断需要你先处理。${item.user_action ?? "处理后在下方告诉我，或补充信息。"}` },
+  unable: { label: "无法完成", tone: "warn", note: (model, item) => `${model} 判断这一步在当前环境中做不到，不再重试，其余步骤继续。${item.user_action ? `需要你处理：${item.user_action}` : ""}` },
   needs_input: { label: "等你回复", tone: "warn", note: () => "诊断需要你的意见，选择方案或写下想法后会继续。" },
   platform_pending: { label: "平台修复生效中", tone: "ok", note: () => "Super Partner 修复已通过验证，正在自动生效；完成后继续原任务。" },
   platform_fixed: { label: "平台已修复", tone: "ok", note: () => "Super Partner 修复已生效，所有项目都将使用修复后的版本。" },

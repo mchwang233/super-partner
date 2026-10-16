@@ -18,10 +18,11 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import Optional
 from uuid import uuid4
 
-SOURCE_DIRS = {"backend", "frontend", "tests", "scripts"}
-ROOT_FILES = {"pyproject.toml", "README.md", "Dockerfile", "compose.yaml", ".gitignore",
+SOURCE_DIRS = {"backend", "frontend", "tests", "scripts", "docs", "skills"}
+ROOT_FILES = {"pyproject.toml", "README.md", "AGENTS.md", "CLAUDE.md", "Dockerfile", "compose.yaml", ".gitignore",
               ".dockerignore", "start.sh", "stop.sh"}
 SKIP = {".git", ".agents", ".aws", ".claude", ".codex", ".super-partner", "workspaces",
         ".venv", "node_modules", "dist", "build", "__pycache__", ".pytest_cache", ".ruff_cache"}
@@ -29,6 +30,8 @@ SUFFIXES = {".py", ".ts", ".tsx", ".js", ".mjs", ".css", ".html", ".json", ".sh"
             ".md", ".svg", ".png", ".webp"}
 PRIVATE = {"credentials.json", "secrets.json", ".env"}
 CHECK_TIMEOUT = 600
+# How to diagnose and repair the platform, and where its code is; given to every model that does.
+REPAIR_GUIDES = ("skills/platform-repair/SKILL.md", "docs/ARCHITECTURE.md")
 
 
 class RepairError(RuntimeError):
@@ -76,6 +79,20 @@ def source_files(root: Path) -> dict[str, dict]:
     return result
 
 
+def repair_guide(root: Optional[Path]) -> str:
+    """The repair skill and the architecture map from ``root``, without the skill's front matter,
+    so that a model of any kind follows the same procedure."""
+    parts = []
+    for name in REPAIR_GUIDES:
+        path = root / name if root else None
+        if path and path.is_file():
+            text = path.read_text(encoding="utf-8")
+            if text.startswith("---\n"):
+                text = text.split("\n---\n", 1)[-1]
+            parts.append(f"<<< {name} >>>\n{text.strip()}")
+    return "\n\n".join(parts)
+
+
 def changed(before: dict, after: dict) -> list[str]:
     return sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
 
@@ -115,7 +132,8 @@ class PlatformRepairs:
                 "Its code is under backend/super_partner and frontend; regression tests are "
                 "under tests and frontend/tests. The repair controller will provide an isolated "
                 "copy, run independent checks, preserve local data, and activate validated fixes "
-                "for all projects. Never modify live source, credentials, task records or Git history.")
+                "for all projects. Never modify live source, credentials, task records or Git history.\n"
+                + repair_guide(self.root))
 
     async def prepare(self, run_id: str, diagnosis_id: str, *, allow_network: bool = False) -> dict:
         if not self.enabled or not self.root:
@@ -203,6 +221,7 @@ class PlatformRepairs:
 import sqlite3, sys
 from collections import Counter
 from pathlib import Path
+from typing import Optional
 from super_partner.db import Database
 
 def quoted(name):

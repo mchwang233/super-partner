@@ -20,10 +20,11 @@ from .diagnosis import interaction, repair_prompt, user_action
 from .diagnosis import parse as parse_diagnosis
 from .diagnosis import prompt as diagnosis_prompt
 from .models import Diagnosis, Event, ExecutionRun, NodeAttempt, NodeStatus, RunStatus
-from .platform_repair import PlatformRepairs, RepairError
+from .platform_repair import PlatformRepairs, RepairError, repair_guide
 from .projects import git_snapshot
 from .providers import ProviderRegistry
 from .quota import ModelUnavailable, failure_kind
+from .recovery import MAX_ENVIRONMENT_FIXES, after_diagnosis, retry_model, turns_for
 from .routing import (
     NoEligibleModelError,
     can_act,
@@ -33,28 +34,12 @@ from .routing import (
     pick_diagnoser,
     pick_reviewer,
     route_node,
-    stronger_than,
-    strongest_for,
 )
 
-# Turns of tool calls an API model gets for a node, as a multiple of api_agent_max_turns.
-TURNS_BY_DIFFICULTY = {"easy": 1.0, "normal": 1.5, "hard": 2.0}
 # How a model call that ran out of turns reads in an attempt's reason (providers.TURN_LIMIT_MARK).
 TURN_LIMIT_HINT = "轮工具调用后仍未完成"
 
 
-def turns_for(node) -> int:
-    return max(1, round(settings.api_agent_max_turns * TURNS_BY_DIFFICULTY.get(node.difficulty, 1.0)))
-
-
-def out_of_turns_twice(node) -> bool:
-    """The node's last two attempts ran out of turns on its current model."""
-    last = node.attempts[-2:]
-    return len(last) == 2 and all(item.turn_limit and item.model_id == node.model_id for item in last)
-
-
-# Environment repairs per node that do not count as failed attempts.
-MAX_ENVIRONMENT_FIXES = 2
 # Diagnosis report kept with a step that cannot be done.
 MAX_UNABLE_REPORT = 1500
 # Models tried in turn for one repair when the previous one fails.
@@ -390,8 +375,8 @@ class Executor:
         context["reason"] = "quota_exhausted" if exc.kind == "quota" else "model_unavailable"
         try:
             if node.failed_attempts:
-                # Already retrying, so on the strongest model; keep it that way.
-                backup = strongest_for(node, models, self._configured(run), needs_vision)
+                # Already retrying, so on the strongest model that has not failed it; keep it that way.
+                backup = retry_model(node, models, self._configured(run), needs_vision)
                 if backup is None:
                     raise NoEligibleModelError("no backup")
                 node.model_id, node.estimated_cost_usd = backup.id, round(node_cost(node, backup), 6)
@@ -732,15 +717,7 @@ class Executor:
 
     async def _repair_done(self, run_id: str, node_id: str, diagnosis_id: str, text, error, cost: float,
                            verdict: quality.Verdict, outcome: str, shared_files: Optional[list[str]] = None) -> None:
-        """Act on the diagnosis of a failed attempt:
-
-        - FIXED: the environment was repaired; run the node again without counting the failure
-          (at most MAX_ENVIRONMENT_FIXES times per node, then it counts as RETRY);
-        - RETRY, or no diagnosis: the usual retry, with the diagnosis's advice; out of attempts,
-          the task pauses with the report;
-        - QUOTA_EXHAUSTED: exclude the execution model and hand its work to a backup;
-        - BLOCKED: the user must act; the task pauses with the report.
-        """
+        """Act on the diagnosis of a failed attempt; recovery.after_diagnosis decides what to do."""
         async with self.locks.setdefault(run_id, asyncio.Lock()):
             run = self.db.get_run(run_id)
             if not run:
@@ -776,11 +753,13 @@ class Executor:
                 self._save(run)
                 return
             status = diagnosis.verdict if diagnosis.status == "done" else None
-            if status == "platform_pending":
+            action = after_diagnosis(outcome, status, has_model=bool(node.model_id),
+                                     environment_fixes=node.environment_fixes)
+            if action == "hold_for_platform":
                 node.status = NodeStatus.PENDING
                 node.environment_fixes += 1
                 self._hold_for_platform(run, force=diagnosis.trigger == "manual")
-            elif status == "needs_input":
+            elif action == "ask_user":
                 node.status = NodeStatus.PENDING
                 run.status = RunStatus.PAUSED
                 diagnosis.question = diagnosis.question or "请补充你希望采用的方案或约束。"
@@ -789,7 +768,7 @@ class Executor:
                 run.maintenance_id = None
                 self.emit(run_id, "run.diagnosis_question", diagnosis_id=diagnosis.id,
                           question=diagnosis.question, choices=diagnosis.choices)
-            elif status in {"quota_exhausted", "model_unavailable"} and outcome == "error" and node.model_id:
+            elif action == "switch_model":
                 if not node.attempts:
                     node.attempts.append(NodeAttempt(model_id=node.model_id, outcome="error", reason=verdict.reason))
                 failed_model = node.attempts[-1].model_id or node.model_id
@@ -801,7 +780,7 @@ class Executor:
                 node.attempts[-1].outcome = kind
                 node.review, node.review_passed = str(exc), None
                 self._route_after_unavailable(run, node, exc, diagnosis.id)
-            elif status == "fixed" and node.environment_fixes < MAX_ENVIRONMENT_FIXES:
+            elif action == "retry_fixed":
                 if shared_files:
                     self.db.save_shared_repair({
                         "id": diagnosis.id, "run_id": run.id, "model_id": diagnosis.model_id,
@@ -818,14 +797,15 @@ class Executor:
                     run.rework_rounds = max(0, settings.max_rework_rounds - 1)
                 self.emit(run_id, "node.retry", node_id=node.id, reason="environment_fixed",
                           model_id=node.model_id, attempt=len(node.attempts) + 1)
-            elif outcome == "unable" and status != "retry":
+            elif action == "unable":
                 # The diagnosis could not lift the limit (or needs the user to): the step ends as
                 # one that cannot be done here, with why, and the rest of the task goes on.
-                self._mark_unable(run, node, verdict.unable or verdict.reason, diagnosis)
-            elif status == "blocked":
+                self._mark_unable(run, node, verdict.unable or (
+                    verdict.reason if outcome == "unable" else "诊断判断：这一步在当前环境中无法完成。"), diagnosis)
+            elif action == "pause":
                 node.status = NodeStatus.FAILED
                 self._pause_for_diagnosis(run, node, diagnosis, "遇到需要你处理的问题")
-            elif outcome == "verify_failed":
+            elif action == "pause_rework":
                 self._pause_for_diagnosis(run, node, diagnosis, f"返工 {run.rework_rounds} 轮后验证仍未通过")
             else:
                 self._retry_or_fail(run, node, verdict, outcome)
@@ -857,10 +837,10 @@ class Executor:
             self.emit(run.id, "node.failed", node_id=node.id, error=verdict.reason, attempts=len(node.attempts))
             return
         # Retry with the problems spelled out, on the strongest model that can take the node; one
-        # that ran out of turns twice in a row makes way for a stronger one, a CLI included.
+        # that failed it twice in a row makes way for another, a CLI included.
         node.feedback = quality.retry_feedback(node.feedback, problem)
-        stronger = self._stronger_than(run, node) if out_of_turns_twice(node) else None
-        stronger = stronger or self._strongest(run, node)
+        needs_vision = any(item.kind == "image" for item in run.attachments)
+        stronger = retry_model(node, list(self.model_lookup.values()), self._configured(run), needs_vision)
         if stronger and stronger.id != node.model_id:
             node.model_id = stronger.id
             node.estimated_cost_usd = round(node_cost(node, stronger), 6)
@@ -1103,6 +1083,9 @@ class Executor:
             "Use file tools to implement the fix, not merely report advice. If a real user choice "
             "is required, use QUESTION, OPTIONS (JSON array), and STATUS: NEEDS_INPUT; otherwise "
             "describe your fix in Chinese and end with STATUS: FIXED.\n"
+            "Follow the repair skill below. Start from the diagnosis's LOCATION lines; read only "
+            "the code around them.\n\n"
+            f"{repair_guide(Path(job['folder']) / 'source')}\n\n"
             f"Original task: {run.prompt}\nDiagnosis: {problem}\n"
             f"User replies: {json.dumps(replies, ensure_ascii=False)}\n"
         )
@@ -1275,14 +1258,6 @@ class Executor:
         if any(node.model_id and not node.model_id.startswith("mock:") for node in run.plan.nodes):
             configured = {item for item in configured if not item.startswith("mock:")}
         return configured if run.use_cli else {item for item in configured if not item.startswith("cli:")}
-
-    def _stronger_than(self, run: ExecutionRun, node):
-        needs_vision = any(item.kind == "image" for item in run.attachments)
-        return stronger_than(node, list(self.model_lookup.values()), self._configured(run), node.model_id, needs_vision)
-
-    def _strongest(self, run: ExecutionRun, node):
-        needs_vision = any(item.kind == "image" for item in run.attachments)
-        return strongest_for(node, list(self.model_lookup.values()), self._configured(run), needs_vision)
 
     def _reviewer(self, run: ExecutionRun, node, tokens: int):
         return pick_reviewer(list(self.model_lookup.values()), self._configured(run), node.model_id, tokens)

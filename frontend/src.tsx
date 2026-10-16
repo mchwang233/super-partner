@@ -156,7 +156,7 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "run.published":data=>`已上传到 ${data.url}`,
   "run.diagnosis_started":(data,title)=>data.trigger==="auto"?`${data.model_id??"—"} 开始排查${data.node_id?`「${title(data.node_id)}」`:""}卡住的原因，并尝试修复环境`:`开始诊断${data.node_id?`（${title(data.node_id)}）`:""}，由 ${data.model_id??"—"} 分析`,
   "run.diagnosis_fallback":data=>`${data.model_id} 无法使用（${String(data.error??"").slice(0,120)}），改由 ${data.next_model_id} 继续`,
-  "run.diagnosed":data=>data.status!=="done"?"诊断失败":({fixed:"诊断：环境已修复",retry:"诊断：继续自动处理并重试",quota_exhausted:"诊断：执行模型额度耗尽，自动选择备用模型",model_unavailable:"诊断：模型服务不可用，自动选择备用模型",blocked:"诊断：需要你处理，已输出诊断报告"} as Record<string,string>)[data.verdict]??"诊断完成",
+  "run.diagnosed":data=>data.status!=="done"?"诊断失败":({fixed:"诊断：环境已修复",retry:"诊断：继续自动处理并重试",quota_exhausted:"诊断：执行模型额度耗尽，自动选择备用模型",model_unavailable:"诊断：模型服务不可用，自动选择备用模型",blocked:"诊断：需要你处理，已输出诊断报告",unable:"诊断：这一步在当前环境中无法完成"} as Record<string,string>)[data.verdict]??"诊断完成",
   "run.repair_shared":data=>`公共环境修复已保存，供其他项目复用：${(data.files??[]).join("、")}`,
   "run.diagnosis_question":data=>`诊断等待你的回复：${data.question}`,
   "run.diagnosis_reply":data=>`收到你的回复：${[data.choice,data.text].filter(Boolean).join("；")}`,

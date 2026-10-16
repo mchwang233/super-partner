@@ -13,6 +13,7 @@ import re
 from typing import Optional
 
 from .models import ExecutionRun, TaskNode
+from .recovery import SWITCH_AFTER, recent_failures
 
 MAX_RESULT_CHARS = 2_000
 # Tool calls of a node's latest attempt shown to a diagnosis.
@@ -20,7 +21,7 @@ MAX_LISTED_CALLS = 80
 ADVICE = re.compile(r"^\s*NEXT_STEP:\s*(.+?)\s*(?=^\s*STATUS:|\Z)", re.IGNORECASE | re.MULTILINE | re.DOTALL)
 # The option a diagnosis offers to let the task use the internet; choosing it turns that on.
 NETWORK_CHOICE = "允许本任务联网"
-STATUS = re.compile(r"^\s*STATUS:\s*(PLATFORM_REPAIR|PLATFORM_PENDING|NEEDS_INPUT|FIXED|RETRY|QUOTA_EXHAUSTED|MODEL_UNAVAILABLE|BLOCKED)\b", re.IGNORECASE | re.MULTILINE)
+STATUS = re.compile(r"^\s*STATUS:\s*(PLATFORM_REPAIR|PLATFORM_PENDING|NEEDS_INPUT|FIXED|RETRY|QUOTA_EXHAUSTED|MODEL_UNAVAILABLE|BLOCKED|UNABLE)\b", re.IGNORECASE | re.MULTILINE)
 QUESTION = re.compile(r"^[ \t]*QUESTION:[ \t]*(\S[^\n]*)$", re.IGNORECASE | re.MULTILINE)
 OPTIONS = re.compile(r"^[ \t]*OPTIONS:[ \t]*(\[[^\n]*\])[ \t]*$", re.IGNORECASE | re.MULTILINE)
 INTERACTION_INSTRUCTIONS = (
@@ -123,8 +124,9 @@ def platform_instructions(context: str) -> str:
         "The user authorizes fixing Super Partner defects, including common causes affecting "
         "other projects. Do not hand an actionable platform bug back to the user. "
         "Read the application source and correlate it with the failing operation and evidence. "
-        "If the application needs a code fix, describe the specific defect, source files, and a "
-        "regression check, then end with `STATUS: PLATFORM_REPAIR`. This starts a separate "
+        "If the application needs a code fix, describe the specific defect and a regression check, "
+        "give one `LOCATION: path:line function — what is wrong` line per place to change (the "
+        "repair phase starts from them), then end with `STATUS: PLATFORM_REPAIR`. This starts a separate "
         "source-editing and validation phase automatically. Do not edit the live application "
         "or restart services in this investigation phase. An upstream quota/outage alone is "
         "not a platform bug: use the existing model-switch statuses.\n" + context
@@ -161,6 +163,7 @@ def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str,
          "and repair whatever blocks it outside the task itself: missing software, sandbox or "
          "machine limits, configuration, licenses, unreachable services. Do not do the step's work "
          "and do not change the task's files; the scheduler selects the model for the next attempt."),
+        *_repeated(node),
         *([("The attempt reported that part of the step cannot be done in this environment (outcome "
             "`unable`). Lift that limit if you can (FIXED), or ask the user when only they can decide "
             "(NEEDS_INPUT). If the claim is wrong and the step can be done as is, say RETRY and how. "
@@ -238,6 +241,11 @@ def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str,
          "(HTTP 5xx, overload, timeout, or a broken provider connection). Quote the exact error. "
          "The scheduler will temporarily exclude it for all projects and switch to a backup; "
          "do not tell the user to wait or select another already configured model manually.\n"
+         "- `STATUS: UNABLE` if the step's goal cannot be reached in this environment and you cannot "
+         "change that (software that cannot be installed without root, hardware, a licence, an account "
+         "or credentials the task does not have): say what is missing and what would make it possible, "
+         "with a `USER_ACTION:` line as for BLOCKED. The step is reported as not doable here and the "
+         "rest of the task goes on, instead of retrying it.\n"
          "- `STATUS: BLOCKED` if the user must act first (it needs root, a license or account, a "
          "decision only the user can make, or the plan or acceptance criteria are impossible): write "
          f"a report in {REPORT_FORMAT} Then include a `USER_ACTION: <ROOT|CREDENTIALS|BUDGET|DECISION>: "
@@ -246,6 +254,20 @@ def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str,
          "when a user-local shared installation or configuration cannot solve it. Without a "
          "specific required user action, the scheduler treats BLOCKED as a retry."),
     ])
+
+
+def _repeated(node: TaskNode) -> list[str]:
+    """A warning when the step keeps failing, so that a diagnosis does not answer RETRY again
+    for a limit that another attempt will meet as well."""
+    failures = recent_failures(node)
+    if len(failures) < SWITCH_AFTER:
+        return []
+    reasons = "\n".join(f"- {item.model_id}: {(item.reason or '')[:200]}" for item in failures[-4:])
+    return [(f"This step has now failed {len(failures)} times in a row:\n{reasons}\n"
+             "If the same cause keeps coming back, another RETRY with advice will not help. Find what "
+             "keeps failing. If it is outside the task (a missing tool, simulator, licence, network, "
+             "credentials), fix it (FIXED), ask the user (NEEDS_INPUT), or answer UNABLE. Answer RETRY "
+             "only if the next attempt will do something materially different, and say what.")]
 
 
 def parse(text: str) -> tuple[str, Optional[str], Optional[str]]:

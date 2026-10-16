@@ -272,9 +272,11 @@ answers without calling one: `list_dir`, `read_file`, `write_file`, `edit_file` 
 - **Tool-call log.** Every tool call of an attempt is recorded on it (turn, tool, file or
   command, whether it went through) and shown, folded, under the attempt in the plan view;
   diagnoses get a per-tool count and the latest attempt's calls.
-- **Out of turns twice.** When a node's last two attempts ran out of turns on the same model,
-  the next retry goes to the strongest other eligible model, a membership CLI included, even
-  under the API-first policy.
+- **Failed twice.** When one model has failed a node twice in a row (rejected, failed
+  verification, errors and running out of turns all count; provider limits, cancellations and
+  unverified reviews do not), the next retry goes to the strongest other eligible model, a
+  membership CLI included, even under the API-first policy. Later retries do not go back to a
+  model that failed the node twice. The rules are in `backend/super_partner/recovery.py`.
 - Models marked as not supporting tools, and the offline demo model, only answer with text
   and are not routed to project nodes. `SUPER_PARTNER_API_AGENT=false` turns tools off.
 
@@ -350,6 +352,13 @@ add a regression check. The controller independently checks Python syntax, compa
 a temporary copy of existing database records, backend tests, frontend tests and a frontend
 build. A failed check feeds back into a bounded repair attempt; it is not treated as success.
 
+Every model that diagnoses or repairs the platform, CLI or API, follows one procedure:
+[`skills/platform-repair/SKILL.md`](skills/platform-repair/SKILL.md), with the module map in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Both are put into the diagnosis and repair
+prompts and copied into the repair source, where `AGENTS.md` (read by Codex) and `CLAUDE.md`
+(read by Claude Code) point to them. A diagnosis names the places to change in
+`LOCATION: path:line` lines, and the repair starts from them instead of rereading the code.
+
 For an editable source checkout started with `start.sh` under a systemd user manager, passing
 repairs activate automatically. New work waits while in-flight steps and requests finish;
 an independent worker checks for concurrent source edits, saves a database backup, applies
@@ -388,7 +397,13 @@ Its answer ends with one status line:
   that summary as feedback, and the failure does not count against its attempts (twice per
   step; after that repairs count like any retry).
 - `STATUS: RETRY` with a `NEXT_STEP:` instruction: nothing outside the task is wrong, so the
-  usual retry follows (on the strongest model) with the advice added to its feedback.
+  usual retry follows (on the strongest model) with the advice added to its feedback. Once a
+  step has failed twice in a row, the diagnosis is shown those failures and told that another
+  RETRY must change the approach materially.
+- `STATUS: UNABLE` with `USER_ACTION:`: the step's goal cannot be reached in this environment
+  and the diagnosis cannot change that (no root to install a simulator, no licence, no
+  credentials). The step ends as 无法完成 with the report instead of being retried, and the
+  rest of the task goes on.
 - `STATUS: QUOTA_EXHAUSTED`: the failed step's execution model has run out of usage or credits.
   The scheduler excludes that model and hands the original step to an eligible backup without
   counting a failed attempt. This also handles provider messages not yet recognized by the

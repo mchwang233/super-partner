@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Optional
 
 from .config import settings
@@ -137,11 +139,12 @@ def strongest_for(
 
 def stronger_than(
     node: TaskNode, models: list[ModelProfile], configured: set[str], current: Optional[str],
-    needs_vision: bool = False,
+    needs_vision: bool = False, exclude: set[str] | frozenset[str] = frozenset(),
 ) -> Optional[ModelProfile]:
-    """The best other model for a node its current model keeps failing at (running out of
-    turns, say). The API-first policy does not apply: a membership CLI is often the way out."""
-    available = [m for m in eligible_for_node(node, models, configured, needs_vision) if m.id != current]
+    """The best other model for a node its current model (and any in ``exclude``) keeps failing
+    at. The API-first policy does not apply: a membership CLI is often the way out."""
+    available = [m for m in eligible_for_node(node, models, configured, needs_vision)
+                 if m.id != current and m.id not in exclude]
     if not available:
         return None
     return min(available, key=lambda model: (

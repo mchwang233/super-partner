@@ -23,6 +23,9 @@ def source_checkout(tmp_path, monkeypatch):
         "backend/super_partner/api.py": "VALUE = 'broken'\n# unrelated user edit\n",
         "frontend/package.json": "{}\n",
         "tests/test_regression.py": "def test_existing():\n    assert True\n",
+        "skills/platform-repair/SKILL.md": "---\nname: platform-repair\n---\n# Repairing Super Partner\n",
+        "docs/ARCHITECTURE.md": "# Super Partner architecture map\n",
+        "AGENTS.md": "# Super Partner\n",
         ".super-partner/super-partner.db": "keep task data",
         ".env": "keep private configuration",
         "workspaces/kept/file.txt": "keep project",
@@ -273,6 +276,10 @@ async def test_platform_diagnosis_edits_copy_and_only_then_schedules_activation(
         async def complete(self, model_id, prompt, workspace=None, **kwargs):
             if prompt.startswith("[[super-partner:platform-repair]]"):
                 assert kwargs["repair"] is False
+                # Every model that repairs gets the skill and the map, and its copy has them too.
+                assert "# Repairing Super Partner" in prompt and "architecture map" in prompt
+                assert "name: platform-repair" not in prompt
+                assert (workspace / "AGENTS.md").is_file() and (workspace / "skills/platform-repair/SKILL.md").is_file()
                 assert workspace != source_checkout
                 assert json.loads((workspace.parent / "job.json").read_text())["allow_network"] == network_before
                 current = db.get_run("r")
@@ -282,6 +289,7 @@ async def test_platform_diagnosis_edits_copy_and_only_then_schedules_activation(
                 return ProviderResult("修复调度器并添加回归检查。\nSTATUS: FIXED", 0, 0, model_id)
             if kwargs.get("repair"):
                 assert str(source_checkout) in prompt
+                assert "LOCATION:" in prompt and "# Repairing Super Partner" in prompt
                 return ProviderResult("Super Partner 调度器没有正确处理步骤状态。\nSTATUS: PLATFORM_REPAIR", 0, 0, model_id)
             raise RuntimeError("scheduler defect")
 
