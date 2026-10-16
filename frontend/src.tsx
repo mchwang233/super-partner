@@ -3,15 +3,16 @@ import { createRoot } from "react-dom/client";
 import { ModelProfiles, type Model } from "./model-profiles";
 import { AttachButton, AttachmentTray, TaskAttachments, useAttachments, type Attachment } from "./attachments";
 import { PlanGraph, type PlanNode } from "./plan-graph";
-import { ResultPage } from "./result-page";
+import { ResultPage, type ChangeOptions } from "./result-page";
 import { MarkdownView } from "./markdown";
+import { DiagnosisPanel, type Diagnosis } from "./diagnosis";
 import { ProjectField, rememberProject } from "./project-picker";
 import { canCancelMission, canDeleteMission, CancelMissionDialog, DeleteMissionButton, DeleteMissionDialog, formatUsd, MissionHistory, needsAttention, statusLabel } from "./mission-history";
 import "./style.css";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
-type Diagnosis = {id:string;trigger:string;node_id?:string|null;model_id?:string|null;status:string;report?:string|null;advice?:string|null;verdict?:"fixed"|"retry"|"quota_exhausted"|"model_unavailable"|"blocked"|null;user_action?:string|null;error?:string|null;created_at:string};
-type Run = {id:string;status:string;prompt?:string;created_at?:string;updated_at?:string;diagnoses?:Diagnosis[];budget_usd:number;use_cli:boolean;project_dir?:string|null;attachments?:Attachment[];rework_rounds?:number;actual_cost_usd:number;final_result?:string;error?:string;plan:{summary:string;nodes:PlanNode[];planning_method:string;planner_model_id?:string;planning_note?:string;planning_cost_usd:number;estimate:{low_usd:number;high_usd:number}}};
+type Run = {id:string;status:string;prompt?:string;created_at?:string;updated_at?:string;diagnoses?:Diagnosis[];maintenance_id?:string|null;waiting_diagnosis_id?:string|null;parent_run_id?:string|null;budget_usd:number;use_cli:boolean;allow_network?:boolean;project_dir?:string|null;attachments?:Attachment[];rework_rounds?:number;actual_cost_usd:number;final_result?:string;error?:string;plan:{summary:string;nodes:PlanNode[];planning_method:string;planner_model_id?:string;planning_note?:string;planning_cost_usd:number;estimate:{low_usd:number;high_usd:number}}};
+type ReplyToDiagnosis = (run:Run, diagnosisId:string, body:{text:string;choice?:string})=>Promise<string|null>;
 type Provider = {id:string;name:string;configured:boolean};
 // The task list polls often; the model catalog is large and changes rarely.
 const POLL_MS = 2000, MODEL_REFRESH_EVERY = 15;
@@ -113,10 +114,11 @@ const STEPS = ["计划","确认","执行","结果"];
 function stepOf(status:string):{at:number;problem:boolean}{
   if(status==="awaiting_confirmation")return {at:1,problem:false};
   if(status==="succeeded")return {at:4,problem:false};
+  if(status==="incomplete")return {at:4,problem:true};
   if(status==="failed"||status==="cancelled")return {at:2,problem:true};
   return {at:2,problem:status==="paused"};
 }
-function defaultTab(status:string):Tab{return status==="succeeded"?"result":"progress"}
+function defaultTab(status:string):Tab{return status==="succeeded"||status==="incomplete"?"result":"progress"}
 function duration(ms:number){const s=Math.max(0,Math.round(ms/1000));if(s<60)return `${s} 秒`;const m=Math.floor(s/60);return m<60?`${m} 分 ${s%60} 秒`:`${Math.floor(m/60)} 小时 ${m%60} 分`}
 function elapsedOf(run:Run,now:number){
   const starts=run.plan.nodes.map(node=>node.started_at?new Date(node.started_at).getTime():NaN).filter(Number.isFinite);
@@ -135,6 +137,7 @@ function Stepper({status}:{status:string}){
 
 const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>string)=>string> = {
   "plan.created":data=>`生成执行计划（${data.planning_method==="model"?`由 ${data.planner_model_id} 规划`:"规则规划"}）`,
+  "run.network_changed":data=>data.allow?"允许本任务联网":"关闭本任务联网",
   "run.confirmed":data=>`确认执行，预算 ${formatUsd(data.budget_usd??0)}`,
   "run.resumed":data=>`从中断处继续，预算 ${formatUsd(data.budget_usd??0)}`,
   "run.started":()=>"开始执行",
@@ -155,10 +158,25 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "run.diagnosis_fallback":data=>`${data.model_id} 无法使用（${String(data.error??"").slice(0,120)}），改由 ${data.next_model_id} 继续`,
   "run.diagnosed":data=>data.status!=="done"?"诊断失败":({fixed:"诊断：环境已修复",retry:"诊断：继续自动处理并重试",quota_exhausted:"诊断：执行模型额度耗尽，自动选择备用模型",model_unavailable:"诊断：模型服务不可用，自动选择备用模型",blocked:"诊断：需要你处理，已输出诊断报告"} as Record<string,string>)[data.verdict]??"诊断完成",
   "run.repair_shared":data=>`公共环境修复已保存，供其他项目复用：${(data.files??[]).join("、")}`,
+  "run.diagnosis_question":data=>`诊断等待你的回复：${data.question}`,
+  "run.diagnosis_reply":data=>`收到你的回复：${[data.choice,data.text].filter(Boolean).join("；")}`,
+  "run.platform_repair":data=>data.phase==="validating"?"正在验证 Super Partner 修复":"开始修复 Super Partner 自身问题",
+  "run.platform_waiting":()=>"平台修复已验证，等待在途步骤结束后自动生效",
+  "run.platform_activated":()=>"Super Partner 修复已生效，任务按原预算继续",
+  "run.platform_failed":data=>`平台修复未生效：${data.error??"任务数据已保留"}`,
 };
 
+const NETWORK_HINT="执行命令时可以访问互联网（下载依赖、调用外部接口），本机上的服务仍然访问不到";
+
+/** Whether this task's commands may reach the internet; takes effect from the next model call. */
+function NetworkSwitch({run,onNetwork}:{run:Run;onNetwork:SetNetwork}){
+  const [busy,setBusy]=useState(false),[error,setError]=useState("");
+  async function toggle(allow:boolean){setBusy(true);setError("");const problem=await onNetwork(run,allow);setBusy(false);if(problem)setError(problem)}
+  return <label className="switch network-switch" title={NETWORK_HINT}><input type="checkbox" checked={!!run.allow_network} disabled={busy} onChange={e=>toggle(e.target.checked)}/><span/>允许联网{error&&<em role="alert">{error}</em>}</label>;
+}
+
 /** Request, attachments, planning notes, settings, and the full event log. */
-function TaskDetails({run}:{run:Run}){
+function TaskDetails({run,onNetwork}:{run:Run;onNetwork:SetNetwork}){
   const [events,setEvents]=useState<{id:number;kind:string;data:Record<string,any>;created_at:string}[]>([]);
   useEffect(()=>{let live=true;fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/timeline`).then(r=>r.ok?r.json():[]).then(list=>{if(live&&Array.isArray(list))setEvents(list)}).catch(()=>{});return()=>{live=false}},[run.id,run.status,run.updated_at]);
   const number=new Map(run.plan.nodes.map((node,index)=>[node.id,`${String(index+1).padStart(2,"0")} ${node.title}`]));
@@ -172,6 +190,7 @@ function TaskDetails({run}:{run:Run}){
       <div><dt>预计花费</dt><dd>{formatUsd(run.plan.estimate.low_usd)} – {formatUsd(run.plan.estimate.high_usd)}</dd></div>
       <div><dt>预算上限</dt><dd>{formatUsd(run.budget_usd)}</dd></div>
       <div><dt>会员 CLI</dt><dd>{run.use_cli?"允许":"不使用"}</dd></div>
+      <div><dt>联网</dt><dd><NetworkSwitch run={run} onNetwork={onNetwork}/></dd></div>
       <div><dt>工作位置</dt><dd>{run.project_dir?`📁 ${run.project_dir}`:"独立的临时工作区"}</dd></div>
       {run.created_at&&<div><dt>创建时间</dt><dd>{new Date(run.created_at).toLocaleString("zh-CN",{hour12:false})}</dd></div>}
     </dl>
@@ -193,33 +212,9 @@ function QuotaBanner({quota,models,onReset}:{quota:Quota[];models:Model[];onRese
   </div>;
 }
 
-/** The latest diagnosis of a stuck task, with earlier ones a click away. */
-function DiagnosisCard({run,models}:{run:Run;models:Model[]}){
-  const list=run.diagnoses??[];
-  const [index,setIndex]=useState(list.length-1),[open,setOpen]=useState(true);
-  useEffect(()=>{setIndex(list.length-1);setOpen(true)},[list.length,run.id]);
-  const item=list[Math.min(Math.max(index,0),list.length-1)];
-  if(!item)return null;
-  const model=models.find(m=>m.id===item.model_id)?.display_name??item.model_id??"—";
-  const node=run.plan.nodes.find(n=>n.id===item.node_id);
-  return <section className={`diagnosis-card ${item.status}`} aria-label="诊断报告">
-    <div className="diagnosis-head">
-      <b>🩺 诊断报告</b>
-      <small>{item.trigger==="auto"?"自动诊断":"手动诊断"}{node?` · ${node.title}`:""} · {model} · {new Date(item.created_at).toLocaleString("zh-CN",{hour12:false})}</small>
-      {list.length>1&&<span className="diagnosis-nav"><button type="button" className="ghost" disabled={index<=0} onClick={()=>setIndex(i=>i-1)} aria-label="上一次诊断">‹</button>{index+1}/{list.length}<button type="button" className="ghost" disabled={index>=list.length-1} onClick={()=>setIndex(i=>i+1)} aria-label="下一次诊断">›</button></span>}
-      <button type="button" className="ghost diagnosis-fold" onClick={()=>setOpen(o=>!o)} aria-expanded={open}>{open?"收起":"展开"}</button>
-    </div>
-    {open&&(item.status==="running"?<p className="diagnosis-running"><i className="pulse" aria-hidden="true"/>{item.trigger==="auto"?`${model} 正在排查卡住的原因，并修复环境（安装缺失的软件、调整配置等），可能需要十几分钟…`:`正在由 ${model} 分析任务的计划、每次尝试和改动，会员 CLI 可能需要几分钟…`}</p>
-      :item.status==="failed"?<p className="error">诊断没有完成：{item.error}</p>
-      :<>
-        {item.report&&<MarkdownView text={item.report}/>}
-        {item.verdict&&<p className={`diagnosis-verdict ${item.verdict==="blocked"?"warn":"ok"}`}>{{fixed:`${model} 已修复环境，这一步会重新执行。下面是修复内容。`,retry:`系统会带着 ${model} 的诊断建议继续处理并重试。`,quota_exhausted:`${model} 确认执行模型额度耗尽，系统会自动选择备用模型接替原步骤；没有可用备用模型时才暂停。`,model_unavailable:`${model} 确认模型服务不可用，系统会自动选择备用模型，并让其他项目暂时避开故障模型。`,blocked:`${model} 判断需要你先处理，任务已暂停。${item.user_action??"下面是诊断报告。"}`}[item.verdict]}</p>}
-        {item.advice&&<div className="diagnosis-advice"><b>给失败步骤的建议</b><p>{item.advice}</p>{(run.status==="failed"||run.status==="paused")&&<small>点“{run.status==="failed"?"从失败处继续":"按此预算继续"}”时，这条建议会交给失败的步骤。</small>}</div>}
-      </>)}
-  </section>;
-}
+type SetNetwork=(run:Run,allow:boolean)=>Promise<string|null>;
 
-function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,onCancel,onDelete,onOpenModel,onPause,onDiagnose}:{run:Run|null;models:Model[];onOpenModel:(model:Model)=>void;onPause:(run:Run)=>Promise<string|null>;onDiagnose:(run:Run)=>Promise<string|null>;deletingId:string|null;cancellingId:string|null;onConfirm:(run:Run,budget:number)=>Promise<string|null>;onResume:(run:Run,budget:number)=>Promise<string|null>;onCancel:(run:Run)=>void;onDelete:(run:Run)=>void}) {
+function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,onCancel,onDelete,onOpenModel,onPause,onDiagnose,onReply,onChange,onNetwork,parent,onOpenRun}:{onNetwork:SetNetwork;onChange:(run:Run,prompt:string,budget:number,options:ChangeOptions)=>Promise<string|null>;parent?:Run;onOpenRun:(run:Run)=>void;run:Run|null;models:Model[];onOpenModel:(model:Model)=>void;onPause:(run:Run)=>Promise<string|null>;onDiagnose:(run:Run)=>Promise<string|null>;onReply:ReplyToDiagnosis;deletingId:string|null;cancellingId:string|null;onConfirm:(run:Run,budget:number)=>Promise<string|null>;onResume:(run:Run,budget:number)=>Promise<string|null>;onCancel:(run:Run)=>void;onDelete:(run:Run)=>void}) {
   const [budget,setBudget]=useState(run?.budget_usd??2),[error,setError]=useState(""),[busy,setBusy]=useState(false);
   const [tab,setTab]=useState<Tab>(defaultTab(run?.status??"")),picked=useRef(false),[now,setNow]=useState(()=>Date.now());
   useEffect(()=>{setBudget(run?.budget_usd??2);setError("");picked.current=false;setTab(defaultTab(run?.status??""))},[run?.id]);
@@ -227,15 +222,15 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
   useEffect(()=>{if(!picked.current)setTab(defaultTab(run?.status??""))},[run?.status]);
   useEffect(()=>{if(run?.status!=="running")return;const timer=window.setInterval(()=>setNow(Date.now()),1000);return()=>window.clearInterval(timer)},[run?.status]);
   if(!run)return <section className="panel detail"><div className="empty big">在左侧选择一个任务，或点右上角的“＋ 新任务”。</div></section>;
-  const needsConfirm=run.status==="awaiting_confirmation"||run.status==="paused";
-  const canResume=run.status==="failed"||run.status==="cancelled";
+  const needsConfirm=(run.status==="awaiting_confirmation"||run.status==="paused")&&!run.waiting_diagnosis_id&&!run.maintenance_id;
+  const canResume=(run.status==="failed"||run.status==="cancelled"||run.status==="incomplete")&&!run.waiting_diagnosis_id&&!run.maintenance_id;
   const planner=run.plan.planning_method==="model"&&run.plan.planner_model_id?`由 ${run.plan.planner_model_id} 规划`:"规则规划";
   const nodes=run.plan.nodes,done=nodes.filter(node=>node.status==="succeeded").length;
   const stopped=nodes.filter(node=>node.status==="failed"||node.status==="cancelled"||node.status==="running");
   const spentRatio=run.budget_usd>0?Math.min(1,run.actual_cost_usd/run.budget_usd):0;
   const elapsed=elapsedOf(run,now);
   function pick(next:Tab){picked.current=true;setTab(next)}
-  const canPause=run.status==="running"||run.status==="queued";
+  const canPause=run.status==="running"||run.status==="queued"||!!run.maintenance_id;
   const diagnosing=(run.diagnoses??[]).some(item=>item.status==="running");
   const canDiagnose=nodes.some(node=>(node.attempts?.length??0)>0)||run.status==="failed"||run.status==="paused";
   const stillRunning=nodes.filter(node=>node.status==="running").length;
@@ -244,14 +239,14 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
   return <section className="panel detail task-page">
     <div className="task-header">
       <div className="task-title">
-        <p className="eyebrow">{planner}{run.project_dir&&<span className="project-path" title={run.project_dir}> · 📁 {run.project_dir}</span>}</p>
+        <p className="eyebrow">{run.parent_run_id&&<span className="change-of">需求变更 · 基于{parent?<button type="button" className="link-button" onClick={()=>onOpenRun(parent)}>「{parent.plan.summary}」</button>:"之前的任务"} · </span>}{planner}{run.project_dir&&<span className="project-path" title={run.project_dir}> · 📁 {run.project_dir}</span>}</p>
         <h3>{run.plan.summary}</h3>
       </div>
       <div className="task-actions">
-        <span className={`pill ${run.status}`}>{statusLabel(run.status)}</span>
-        {run.status==="succeeded"&&tab!=="result"&&<button type="button" className="primary" onClick={()=>pick("result")}>查看结果</button>}
+        <span className={`pill ${run.status}`}>{run.waiting_diagnosis_id?"等待回复":run.maintenance_id?"平台修复生效中":statusLabel(run.status)}</span>
+        {(run.status==="succeeded"||run.status==="incomplete")&&tab!=="result"&&<button type="button" className="primary" onClick={()=>pick("result")}>查看结果</button>}
         {canPause&&<button type="button" className="ghost" disabled={busy} onClick={()=>act(onPause)} title="不再启动新步骤；正在运行的步骤会跑完">暂停</button>}
-        {canDiagnose&&<button type="button" className="ghost" disabled={busy||diagnosing} onClick={()=>act(onDiagnose)} title="排查原因；对已停止的失败步骤执行修复或切换模型，并在现有预算内继续">{diagnosing?"诊断中…":"诊断"}</button>}
+        {canDiagnose&&<button type="button" className="ghost" disabled={busy||diagnosing||!!run.maintenance_id} onClick={()=>act(onDiagnose)} title="排查原因；对已停止的失败步骤执行修复或切换模型，并在现有预算内继续">{diagnosing?"诊断中…":"诊断"}</button>}
         {canCancelRun(run)&&<button type="button" className="danger" disabled={cancellingId!==null} onClick={()=>onCancel(run)}>{cancellingId===run.id?"取消中…":"取消任务"}</button>}
         <DeleteMissionButton mission={run} deletingId={deletingId} onDelete={onDelete}/>
       </div>
@@ -266,20 +261,23 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
     {needsConfirm&&<div className="action-bar">
       <p>{run.status==="paused"?(stillRunning?`任务已暂停：正在运行的 ${stillRunning} 个步骤会跑完，之后不再启动新步骤。`:run.error??"任务已暂停。确认项目状态和预算后可以继续执行。"):"确认计划和预算后，任务将自动执行，无需再次确认。"}</p>
       <label className="budget-field">预算上限 <span>$</span><BudgetInput value={budget} onChange={setBudget} aria-label="确认时的预算上限（美元）"/></label>
+      <NetworkSwitch run={run} onNetwork={onNetwork}/>
       <button className="primary" disabled={busy||diagnosing||cancellingId!==null||!(budget>0)} onClick={confirm}>{busy?"提交中…":run.status==="paused"?"按此预算继续":"确认并开始执行"}</button>
     </div>}
     {canResume&&<div className="action-bar resume-bar">
-      <p>{run.status==="failed"?<>任务在 <b>{stopped.map(node=>`「${node.title}」`).join("、")||"某个步骤"}</b> 失败。</>:"任务已取消。"}可以从{run.status==="failed"?"失败":"中断"}的地方继续：已完成的 {done} 个步骤保留不动，其余步骤重新执行，重试次数和返工轮数重新计算。</p>
+      {run.status==="incomplete"?<p><b>{nodes.filter(node=>node.status==="unable").map(node=>`「${node.title}」`).join("、")}</b> 在当前环境中无法完成，原因见结果页。解决后（比如打开“允许联网”、提供凭据）可以继续：已完成的 {done} 个步骤保留不动，只重做没完成的步骤。</p>:
+      <p>{run.status==="failed"?<>任务在 <b>{stopped.map(node=>`「${node.title}」`).join("、")||"某个步骤"}</b> 失败。</>:"任务已取消。"}可以从{run.status==="failed"?"失败":"中断"}的地方继续：已完成的 {done} 个步骤保留不动，其余步骤重新执行，重试次数和返工轮数重新计算。</p>}
       <label className="budget-field">预算上限 <span>$</span><BudgetInput value={budget} onChange={setBudget} aria-label="继续执行的预算上限（美元）"/></label>
-      <button className="primary" disabled={busy||diagnosing||deletingId!==null||!(budget>0)} onClick={confirm}>{busy?"提交中…":run.status==="failed"?"从失败处继续":"继续执行"}</button>
+      <NetworkSwitch run={run} onNetwork={onNetwork}/>
+      <button className="primary" disabled={busy||diagnosing||deletingId!==null||!(budget>0)} onClick={confirm}>{busy?"提交中…":run.status==="failed"?"从失败处继续":run.status==="incomplete"?"重做未完成的步骤":"继续执行"}</button>
     </div>}
     {error&&<div className="error" role="alert">{error}</div>}
     {run.error&&<div className="error">{run.error}</div>}
-    <DiagnosisCard run={run} models={models}/>
+    <DiagnosisPanel run={run} models={models} onReply={(id,body)=>onReply(run,id,body)}/>
     <nav className="task-tabs" aria-label="任务内容">{([["progress","进度"],["result","结果"],["details","详情"]] as const).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}</button>)}</nav>
     {tab==="progress"&&<PlanGraph apiBase={API} runId={run.id} runStatus={run.status} nodes={nodes} inProject={!!run.project_dir} models={models} onOpenProfile={onOpenModel} reworkRounds={run.rework_rounds}/>}
-    {tab==="result"&&<ResultPage apiBase={API} run={run} embedded/>}
-    {tab==="details"&&<TaskDetails run={run}/>}
+    {tab==="result"&&<ResultPage apiBase={API} run={run} embedded onChange={(prompt,budget,options)=>onChange(run,prompt,budget,options)}/>}
+    {tab==="details"&&<TaskDetails run={run} onNetwork={onNetwork}/>}
   </section>
 }
 
@@ -292,7 +290,7 @@ const NOTICE: Record<string,{text:string;tone:Toast["tone"]}> = {
 function App() {
   const [runs,setRuns]=useState<Run[]>([]),[models,setModels]=useState<Model[]>([]),[providerList,setProviderList]=useState<Provider[]>([]);
   const [view,setView]=useState<"missions"|"models">("missions"),[selectedModelId,setSelectedModelId]=useState("");
-  const [selected,setSelected]=useState<Run|null>(null),[selectedProvider,setSelectedProvider]=useState<Provider|null>(null),[prompt,setPrompt]=useState(""),[budget,setBudget]=useState(2),[useCli,setUseCli]=useState(true),[busy,setBusy]=useState(false),[projectDir,setProjectDir]=useState(savedProjectDir);
+  const [selected,setSelected]=useState<Run|null>(null),[selectedProvider,setSelectedProvider]=useState<Provider|null>(null),[prompt,setPrompt]=useState(""),[budget,setBudget]=useState(2),[useCli,setUseCli]=useState(true),[allowNetwork,setAllowNetwork]=useState(false),[busy,setBusy]=useState(false),[projectDir,setProjectDir]=useState(savedProjectDir);
   const [formError,setFormError]=useState(""),[offline,setOffline]=useState(false);
   const attachments=useAttachments(API),[dragging,setDragging]=useState(false);
   const [composerOpen,setComposerOpen]=useState(false),loaded=useRef(false);
@@ -348,9 +346,23 @@ function App() {
   },[runs]);
   useEffect(()=>{if(!toasts.length)return;const timer=window.setTimeout(()=>setToasts(current=>current.slice(1)),8000);return()=>window.clearTimeout(timer)},[toasts]);
   useEffect(()=>{if(!selectedProvider)return;const close=(event:KeyboardEvent)=>{if(event.key==="Escape")setSelectedProvider(null)};window.addEventListener("keydown",close);return()=>window.removeEventListener("keydown",close)},[selectedProvider]);
-  async function submit(e:FormEvent){e.preventDefault();setBusy(true);setFormError("");try{const r=await fetch(`${API}/api/tasks`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({prompt,budget_usd:budget,use_cli:useCli,project_dir:projectDir.trim()||null,attachments:attachments.ids})});if(!r.ok){const body=await r.json().catch(()=>({}));throw new Error(body.detail||`生成计划失败（${r.status}）`)}try{localStorage.setItem(PROJECT_KEY,projectDir.trim())}catch{}rememberProject(projectDir.trim());const task=await r.json();autoSelected.current=true;setSelected(task);setPrompt("");attachments.clear();setComposerOpen(false);await load(false)}catch(e){setFormError(errorText(e))}finally{setBusy(false)}}
+  /** 需求变更: plan a task that continues this one's results, then show it for confirmation. */
+  async function changeRequirement(run:Run,prompt:string,budget:number,options:ChangeOptions){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/followup`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({prompt,budget_usd:budget,...options})});const body=await r.json().catch(()=>({}));if(!r.ok)return body.detail||`生成变更计划失败（${r.status}）`;autoSelected.current=true;setSelected(body);await load(false);return null}catch(e){return errorText(e)}}
+  async function submit(e:FormEvent){e.preventDefault();setBusy(true);setFormError("");try{const r=await fetch(`${API}/api/tasks`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({prompt,budget_usd:budget,use_cli:useCli,allow_network:allowNetwork,project_dir:projectDir.trim()||null,attachments:attachments.ids})});if(!r.ok){const body=await r.json().catch(()=>({}));throw new Error(body.detail||`生成计划失败（${r.status}）`)}try{localStorage.setItem(PROJECT_KEY,projectDir.trim())}catch{}rememberProject(projectDir.trim());const task=await r.json();autoSelected.current=true;setSelected(task);setPrompt("");attachments.clear();setComposerOpen(false);await load(false)}catch(e){setFormError(errorText(e))}finally{setBusy(false)}}
   async function confirmRun(run:Run,runBudget:number){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/confirm`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({budget_usd:runBudget})});if(!r.ok){const body=await r.json().catch(()=>({}));return body.detail||`确认失败（${r.status}）`}await load(false);return null}catch(e){return errorText(e)}}
+  async function setNetwork(run:Run,allow:boolean){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/network`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({allow})});const body=await r.json().catch(()=>({}));if(!r.ok)return body.detail||`修改联网设置失败（${r.status}）`;loadRevision.current++;setRuns(current=>current.map(item=>item.id===run.id?body:item));setSelected(current=>current?.id===run.id?body:current);return null}catch(e){return errorText(e)}}
   async function postAction(run:Run,action:"pause"|"diagnose",label:string){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/${action}`,{method:"POST"});const body=await r.json().catch(()=>({}));if(!r.ok)return body.detail||`${label}失败（${r.status}）`;loadRevision.current++;setRuns(current=>current.map(item=>item.id===run.id?body:item));setSelected(current=>current?.id===run.id?body:current);return null}catch(e){return errorText(e)}}
+  async function replyToDiagnosis(run:Run,diagnosisId:string,body:{text:string;choice?:string}){
+    try{
+      const response=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/diagnoses/${encodeURIComponent(diagnosisId)}/reply`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+      const updated=await response.json().catch(()=>({}));
+      if(!response.ok)return updated.detail||`回复失败（${response.status}）`;
+      loadRevision.current++;
+      setRuns(current=>current.map(item=>item.id===run.id?updated:item));
+      setSelected(current=>current?.id===run.id?updated:current);
+      return null;
+    }catch(error){return errorText(error)}
+  }
   async function resumeRun(run:Run,runBudget:number){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/resume`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({budget_usd:runBudget})});if(!r.ok){const body=await r.json().catch(()=>({}));return body.detail||`继续失败（${r.status}）`}await load(false);return null}catch(e){return errorText(e)}}
   function requestCancelRun(run:Run){
     if(cancellingRunId||!canCancelRun(run))return;
@@ -415,9 +427,9 @@ function App() {
       <textarea value={prompt} onChange={e=>setPrompt(e.target.value)} onPaste={e=>{const pasted=[...e.clipboardData.files];if(pasted.length){e.preventDefault();attachments.add(pasted)}}} onKeyDown={e=>{if((e.ctrlKey||e.metaKey)&&e.key==="Enter"){e.preventDefault();e.currentTarget.form?.requestSubmit()}}} placeholder="描述你想要的结果，例如：修复登录页失败的测试、调研某个市场、实现一个新功能…" required minLength={3} aria-label="任务描述"/>
       <AttachmentTray attachments={attachments}/>
       <ProjectField apiBase={API} value={projectDir} onChange={setProjectDir} usedProjects={usedProjects}/>
-      <div className="formbar"><div className="controls"><AttachButton onFiles={attachments.add}/><label className="budget-field" title="执行花费达到上限时任务会自动暂停">预算上限 <span>$</span><BudgetInput value={budget} onChange={setBudget} required/></label><label className="switch" title="关闭后本任务只使用按量计费的 API 模型"><input type="checkbox" checked={useCli} onChange={e=>setUseCli(e.target.checked)}/><span/>允许使用会员 CLI</label><ModelFleet models={models} onOpenAll={()=>setView("models")} onOpen={openModelProfile} onToggle={toggleModel} onConfigure={configureModel}/></div><div className="submit-group"><small>Ctrl + Enter</small><button className="primary" disabled={busy||attachments.uploading||!(budget>0)}>{busy?"正在生成计划…":attachments.uploading?"附件上传中…":"生成执行计划 →"}</button></div></div>
+      <div className="formbar"><div className="controls"><AttachButton onFiles={attachments.add}/><label className="budget-field" title="执行花费达到上限时任务会自动暂停">预算上限 <span>$</span><BudgetInput value={budget} onChange={setBudget} required/></label><label className="switch" title="关闭后本任务只使用按量计费的 API 模型"><input type="checkbox" checked={useCli} onChange={e=>setUseCli(e.target.checked)}/><span/>允许使用会员 CLI</label><label className="switch" title={NETWORK_HINT}><input type="checkbox" checked={allowNetwork} onChange={e=>setAllowNetwork(e.target.checked)}/><span/>允许联网</label><ModelFleet models={models} onOpenAll={()=>setView("models")} onOpen={openModelProfile} onToggle={toggleModel} onConfigure={configureModel}/></div><div className="submit-group"><small>Ctrl + Enter</small><button className="primary" disabled={busy||attachments.uploading||!(budget>0)}>{busy?"正在生成计划…":attachments.uploading?"附件上传中…":"生成执行计划 →"}</button></div></div>
     </form>{formError&&<p className="form-error" role="alert">{formError}</p>}</section>}
-      <MissionDetail run={selected} models={models} onOpenModel={openModelProfile} deletingId={deletingRunId} cancellingId={cancellingRunId} onConfirm={confirmRun} onResume={resumeRun} onPause={run=>postAction(run,"pause","暂停")} onDiagnose={run=>postAction(run,"diagnose","诊断")} onCancel={requestCancelRun} onDelete={requestDeleteRun}/>
+      <MissionDetail run={selected} models={models} onOpenModel={openModelProfile} deletingId={deletingRunId} cancellingId={cancellingRunId} onConfirm={confirmRun} onResume={resumeRun} onPause={run=>postAction(run,"pause","暂停")} onDiagnose={run=>postAction(run,"diagnose","诊断")} onReply={replyToDiagnosis} onChange={changeRequirement} onNetwork={setNetwork} parent={selected?.parent_run_id?runs.find(item=>item.id===selected.parent_run_id):undefined} onOpenRun={run=>{autoSelected.current=true;setSelected(run)}} onCancel={requestCancelRun} onDelete={requestDeleteRun}/>
     </div>
     </div>
     </>}

@@ -72,6 +72,10 @@ class BenchmarkResult(BaseModel):
     collection_method: Literal["dataset", "api", "public_page"] = "dataset"
 
 
+# A leaderboard name ending in a snapshot date: "DeepSeek V4 Pro 0813", "... 20250813".
+SNAPSHOT = re.compile(r"(.*?)[\s_-]+(\d{4}|\d{8})")
+
+
 def normalized(value: str) -> str:
     # Formatting differences only: never drop snapshot dates, model tiers, or version digits.
     return re.sub(r"[\s._-]+", "", unicodedata.normalize("NFKC", value).casefold())
@@ -540,6 +544,32 @@ def match_results(
                     "matched_by": "model_id" if ids.get(key) else "display_name",
                 }
             )
+    # An undated alias (deepseek-v4-pro) serves the provider's newest snapshot, which a
+    # leaderboard may list with its date ("DeepSeek V4 Pro 0813"). Unless the catalog lists
+    # that newest snapshot itself, the alias takes its results.
+    taken = {row["id"] for rows in matched.values() for row in rows}
+    latest = {}
+    for result in results:
+        dated = SNAPSHOT.fullmatch(result.model_key.strip())
+        if not dated:
+            continue
+        key = (result.provider, normalized(dated[1]))
+        candidates = ids.get(key) or names.get(key) or set()
+        identifier = next(iter(candidates)) if len(candidates) == 1 else None
+        # An exact match from the same source wins over a snapshot.
+        if identifier is None or any(row["source"] == result.source for row in matched.get(identifier, [])):
+            continue
+        newest = latest.get((identifier, result.source))
+        if newest is None or int(dated[2]) > newest[0]:
+            newest = latest[identifier, result.source] = (int(dated[2]), [])
+        if int(dated[2]) == newest[0]:
+            newest[1].append(result)
+    for (identifier, _source), (_date, rows) in latest.items():
+        if any(result.id in taken for result in rows):
+            continue
+        matched.setdefault(identifier, []).extend(
+            {**result.model_dump(mode="json"), "matched_by": "latest_snapshot"} for result in rows
+        )
     for rows in matched.values():
         rows.sort(key=lambda row: (row["source"], row["version"], row["model_name"]))
     return matched

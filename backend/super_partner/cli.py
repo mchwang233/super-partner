@@ -73,7 +73,7 @@ def run(task_id: str, budget: Optional[float] = None, wait: bool = True):
     while True:
         data = httpx.get(f"{settings.api_base_url}/api/tasks/{task_id}").json()
         typer.echo(f"\r{data['status']}  ${data['actual_cost_usd']:.6f}", nl=False)
-        if data["status"] in {"succeeded", "failed", "cancelled", "paused"}:
+        if data["status"] in {"succeeded", "failed", "cancelled", "incomplete", "paused"}:
             typer.echo()
             typer.echo(data.get("final_result") or data.get("error") or "Paused")
             return

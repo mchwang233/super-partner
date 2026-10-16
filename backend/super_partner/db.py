@@ -146,8 +146,8 @@ class Database:
         """Delete a finished run and its events atomically, leaving workspace files alone."""
         with self.lock, self.connection:
             deleted = self.connection.execute(
-                "DELETE FROM runs WHERE id = ? AND status IN (?, ?, ?)",
-                (run_id, RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED),
+                "DELETE FROM runs WHERE id = ? AND status IN (?, ?, ?, ?)",
+                (run_id, RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.INCOMPLETE),
             )
             if not deleted.rowcount:
                 exists = self.connection.execute(

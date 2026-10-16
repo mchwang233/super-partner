@@ -8,7 +8,7 @@ from super_partner import attachments, environment, quality
 from super_partner.budget import BudgetExceeded
 from super_partner.config import settings
 from super_partner.db import Database
-from super_partner.executor import Executor
+from super_partner.executor import Executor, turns_for
 from super_partner.models import (
     CapabilityScore,
     Diagnosis,
@@ -101,7 +101,8 @@ async def test_paid_rounds_are_retained_on_failure_and_model_switch(tmp_path, mo
     finally:
         await providers.client.aclose()
     saved = database.get_run("r")
-    expected = .0021 if failure in {"outage", "turn_limit"} else .00105
+    # Out of turns, the model is paid for every turn plus the one asking for its progress summary.
+    expected = {"error": .00105, "outage": .0021, "turn_limit": .00105 * (turns_for(node()) + 1)}[failure]
     assert saved.actual_cost_usd == pytest.approx(expected)
     assert saved.actual_cost_usd == pytest.approx(sum(a.cost_usd for a in saved.plan.nodes[0].attempts))
     if failure == "outage":
@@ -167,7 +168,7 @@ async def test_parallel_requests_share_reservations(tmp_path):
         await asyncio.wait_for(requested.wait(), 2)
         second = asyncio.create_task(executor._complete(current, current.plan.nodes[0], "deepseek:primary", "second", tmp_path))
         await asyncio.sleep(.02)
-        assert len(requests) == 1 and 0 < requests[0]["max_tokens"] <= 4096
+        assert len(requests) == 1 and 0 < requests[0]["max_tokens"] < settings.api_agent_max_output_tokens
         release.set()
         await asyncio.wait_for(asyncio.gather(first, second), 2)
         assert len(requests) == 2 and requests[1]["max_tokens"] < requests[0]["max_tokens"]

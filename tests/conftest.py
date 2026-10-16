@@ -1,3 +1,5 @@
+import os
+
 import httpx
 import pytest
 from super_partner import secrets
@@ -27,7 +29,16 @@ def isolated_environment(tmp_path, monkeypatch):
     """No test reads the real tools folder, and failures are not diagnosed unless a test of
     diagnosis turns it on: a diagnosis would be one more call to every test's fake models."""
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
+    monkeypatch.setattr(settings, "workspace_root", tmp_path / "workspaces")
     monkeypatch.setattr(settings, "auto_diagnose", False)
+    monkeypatch.setattr(settings, "platform_self_repair", False)
+
+
+@pytest.fixture
+def network_enabled():
+    """Live network checks run only when the validation task permits networking."""
+    if os.environ.get("SUPER_PARTNER_VALIDATION_ALLOW_NETWORK") == "false":
+        pytest.skip("The task disabled network access for this validation")
 
 
 @pytest.fixture

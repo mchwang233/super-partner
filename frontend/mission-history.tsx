@@ -12,7 +12,7 @@ type MissionRecord = {
 /** Sidebar groups, most urgent first: what is running, what needs the user, what is done. */
 export const MISSION_GROUPS = [
   { id: "active", label: "进行中", statuses: ["queued", "running"] },
-  { id: "attention", label: "需要处理", statuses: ["awaiting_confirmation", "paused", "failed"] },
+  { id: "attention", label: "需要处理", statuses: ["awaiting_confirmation", "paused", "failed", "incomplete"] },
   { id: "done", label: "已结束", statuses: ["succeeded", "cancelled"] },
 ] as const;
 
@@ -41,8 +41,8 @@ function folder(path?: string | null) { return path ? path.replace(/\/+$/, "").s
 
 export const STATUS_LABELS: Record<string, string> = {
   draft: "草稿", awaiting_confirmation: "待确认", queued: "排队中", running: "运行中",
-  paused: "已暂停", succeeded: "已完成", failed: "失败", cancelled: "已取消",
-  pending: "等待中", blocked: "已阻塞",
+  paused: "已暂停", succeeded: "已完成", failed: "失败", cancelled: "已取消", incomplete: "未能完成",
+  pending: "等待中", blocked: "未执行", unable: "无法完成",
 };
 
 export function statusLabel(status: string): string {
@@ -58,7 +58,7 @@ export function formatUsd(value: number): string {
 }
 
 export function canDeleteMission(status: string): boolean {
-  return ["succeeded", "failed", "cancelled"].includes(status);
+  return ["succeeded", "failed", "cancelled", "incomplete"].includes(status);
 }
 
 export function canCancelMission(status: string): boolean {

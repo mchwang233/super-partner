@@ -44,6 +44,14 @@ CLAUDE_SANDBOX_SETTINGS = json.dumps({"sandbox": {
     "enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
 }})
 
+# A task that allows the network: sandboxed commands may reach any domain except this machine,
+# whose services (this application's API among them) stay closed.
+CLAUDE_NETWORK_SETTINGS = json.dumps({"sandbox": {
+    "enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
+    "network": {"allowedDomains": ["*"], "deniedDomains": ["localhost", "127.0.0.1", "::1"]},
+}})
+CODEX_NETWORK = ("-c", "sandbox_workspace_write.network_access=true")
+
 # Repairing the environment: Claude Code without its sandbox and without asking for approval.
 # The whole CLI runs under bubblewrap instead, which only blocks gaining root (see repair_command).
 CLAUDE_REPAIR_SETTINGS = json.dumps({"sandbox": {"enabled": False}})
@@ -116,6 +124,15 @@ async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
+def _with_network(model_id: str, args: list[str]) -> list[str]:
+    """Open the CLI's sandbox to the internet. Gemini and Qwen run unsandboxed already."""
+    if model_id == "cli:claude":
+        return [CLAUDE_NETWORK_SETTINGS if arg == CLAUDE_SANDBOX_SETTINGS else arg for arg in args]
+    if model_id == "cli:codex":
+        return [args[0], *CODEX_NETWORK, *args[1:]]
+    return args
+
+
 def _with_attachments(model_id: str, args: list[str], attachments: list) -> list[str]:
     """Let the CLI open attached files, which live outside its working directory."""
     if not attachments:
@@ -178,13 +195,17 @@ class CliChannelRegistry:
 
     async def complete(
         self, model_id: str, prompt: str, cwd: Path, timeout: int = 900, attachments=(), repair: bool = False,
+        network: bool = False,
     ) -> str:
-        """Run a CLI in ``cwd``. With ``repair`` it leaves its sandbox to fix the environment."""
+        """Run a CLI in ``cwd``. With ``repair`` it leaves its sandbox to fix the environment;
+        with ``network`` its sandbox lets commands reach the internet."""
         spec = CLI_SPECS[model_id]
         executable = shutil.which(spec.executable)
         if not executable:
             raise RuntimeError(f"{spec.executable} is no longer installed")
         args = list(REPAIR_ARGS.get(spec.id, spec.invoke_args) if repair else spec.invoke_args)
+        if network and not repair:
+            args = _with_network(spec.id, args)
         args = _with_attachments(spec.id, args, list(attachments))
         if spec.id in {"cli:gemini", "cli:qwen"}:
             args[1] = prompt

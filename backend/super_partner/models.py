@@ -34,6 +34,13 @@ class RunStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    # Everything that could be done is done, but some steps cannot be done here (no network,
+    # missing credentials or permissions); each such step says why.
+    INCOMPLETE = "incomplete"
+
+
+# A task in one of these states has stopped and can be resumed, changed or deleted.
+FINISHED = {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.INCOMPLETE}
 
 
 class NodeStatus(str, Enum):
@@ -43,6 +50,8 @@ class NodeStatus(str, Enum):
     FAILED = "failed"
     BLOCKED = "blocked"
     CANCELLED = "cancelled"
+    # The step's goal cannot be reached in this environment; unable_reason says why.
+    UNABLE = "unable"
 
 
 class RiskLevel(str, Enum):
@@ -73,6 +82,8 @@ class ModelProfile(BaseModel):
     display_name: str
     enabled: bool = True
     context_window: Optional[int] = Field(default=None, gt=0)
+    # Most output tokens one request may ask for; each API call asks for this much.
+    max_output_tokens: Optional[int] = Field(default=None, gt=0)
     input_per_million: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     output_per_million: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     cached_input_per_million: Optional[float] = None
@@ -112,6 +123,15 @@ class ModelProfile(BaseModel):
         )
 
 
+class ToolCall(BaseModel):
+    """One tool call of an API model at work: in which turn, which tool, on what, and whether
+    it went through (a command exiting 0, a tool without an error)."""
+    turn: int
+    tool: str
+    detail: str = ""
+    ok: bool = True
+
+
 class NodeAttempt(BaseModel):
     """One run of a node: what model did it, and whether its result was accepted."""
     model_id: Optional[str] = None
@@ -120,6 +140,11 @@ class NodeAttempt(BaseModel):
     reason: Optional[str] = None
     reviewer_model_id: Optional[str] = None
     cost_usd: float = 0.0
+    # API models acting through tools: turns used, whether they ran out (the result is then the
+    # model's progress summary), and every tool call.
+    turns: int = 0
+    turn_limit: bool = False
+    tool_calls: list[ToolCall] = Field(default_factory=list)
     finished_at: datetime = Field(default_factory=utcnow)
 
 
@@ -166,6 +191,8 @@ class TaskNode(BaseModel):
     feedback: Optional[str] = None
     review_passed: Optional[bool] = None
     review: Optional[str] = None
+    # Why the step cannot be done here, and what would make it possible.
+    unable_reason: Optional[str] = None
     # Short form of a long result, handed to downstream nodes instead of the full text.
     summary: Optional[str] = None
     changed_files: list[str] = Field(default_factory=list)
@@ -211,6 +238,12 @@ class Attachment(BaseModel):
     media_type: str
 
 
+class DiagnosisMessage(BaseModel):
+    text: str
+    choice: Optional[str] = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class Diagnosis(BaseModel):
     """A strong model's analysis of why a task is stuck, with advice for the next attempt."""
     id: str
@@ -227,6 +260,12 @@ class Diagnosis(BaseModel):
     verdict: Optional[str] = None
     # A concrete human-only dependency is required before a BLOCKED diagnosis pauses a task.
     user_action: Optional[str] = None
+    scope: str = "environment"  # task | environment | super_partner
+    repair_id: Optional[str] = None
+    reply_to: Optional[str] = None
+    question: Optional[str] = None
+    choices: list[str] = Field(default_factory=list)
+    messages: list[DiagnosisMessage] = Field(default_factory=list)
     error: Optional[str] = None
     cost_usd: float = 0.0
     created_at: datetime = Field(default_factory=utcnow)
@@ -240,6 +279,8 @@ class ExecutionRun(BaseModel):
     plan: TaskPlan
     budget_usd: float
     use_cli: bool = True
+    # Commands may reach the internet (never this machine's local services); off by default.
+    allow_network: bool = False
     project_dir: Optional[str] = None
     attachments: list[Attachment] = Field(default_factory=list)
     # Times a verification node sent work back; capped by max_rework_rounds.
@@ -247,11 +288,24 @@ class ExecutionRun(BaseModel):
     # Repository the output was last published to.
     github_url: Optional[str] = None
     diagnoses: list[Diagnosis] = Field(default_factory=list)
+    # Only tasks deliberately held for an application repair may resume after its restart.
+    maintenance_id: Optional[str] = None
+    waiting_diagnosis_id: Optional[str] = None
+    # A requirement change continues a finished task: the task it builds on, the scratch folder
+    # they share (when there is no project), and what the planner and steps are told about it.
+    parent_run_id: Optional[str] = None
+    workspace_id: Optional[str] = None
+    background: Optional[str] = None
     actual_cost_usd: float = 0.0
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     final_result: Optional[str] = None
     error: Optional[str] = None
+
+    @property
+    def folder_id(self) -> str:
+        """Name of the scratch folder under workspace_root; shared along a chain of changes."""
+        return self.workspace_id or self.id
 
 
 class Event(BaseModel):

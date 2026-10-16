@@ -135,6 +135,22 @@ def strongest_for(
     ))
 
 
+def stronger_than(
+    node: TaskNode, models: list[ModelProfile], configured: set[str], current: Optional[str],
+    needs_vision: bool = False,
+) -> Optional[ModelProfile]:
+    """The best other model for a node its current model keeps failing at (running out of
+    turns, say). The API-first policy does not apply: a membership CLI is often the way out."""
+    available = [m for m in eligible_for_node(node, models, configured, needs_vision) if m.id != current]
+    if not available:
+        return None
+    return min(available, key=lambda model: (
+        model.scores.score_for(node.capability) < node.quality_threshold,
+        -model.scores.score_for(node.capability), -model.scores.reliability,
+        model.channel != "cli", node_cost(node, model),
+    ))
+
+
 def pick_reviewer(
     models: list[ModelProfile], configured: set[str], exclude: Optional[str], tokens: int,
 ) -> Optional[ModelProfile]:

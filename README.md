@@ -205,6 +205,30 @@ Commands can write only to the working directory (the task's scratch folder or t
 and `/tmp`, and have no network access, so installing packages or fetching URLs fails. The
 planner is told these limits so acceptance criteria stay achievable.
 
+### Allowing the network for one task
+
+Tasks are offline by default. **允许联网** (on the new-task form, the plan confirmation and
+resume bars, and the task's 详情 tab; `allow_network` on `POST /api/tasks`, or
+`PUT /api/tasks/{id}/network` with `{"allow": true}`) lets that task's commands reach the
+internet from its next model call on. A requirement change inherits the setting.
+
+- API models' commands get their own network namespace from `pasta` (passt): the internet is
+  reachable, but no host port is forwarded and the host's loopback is not mapped, so this
+  application's API and other local services stay out of reach. A proxy in the server's
+  `HTTP(S)_PROXY`/`ALL_PROXY` on a loopback address is the one port forwarded, and those
+  variables are kept. Without `pasta` the sandbox shares the host's network instead, local
+  services included.
+- Claude Code's sandbox allows every domain except `localhost`/`127.0.0.1`/`::1`; Codex gets
+  `sandbox_workspace_write.network_access=true`. Gemini and Qwen run unsandboxed anyway.
+- Platform repair validation follows the same task's **允许联网** setting, read again before
+  each validation round. Enabled checks use the same network isolation and proxy settings as
+  task commands; disabled checks remain offline and explicitly skip tests that require a live
+  network. Source files, real task data, and credentials retain their existing isolation.
+- When a step fails because it must reach the internet while it runs, the diagnosis asks
+  instead of guessing, offering **允许本任务联网**; picking it turns the setting on and the
+  step is retried. Missing packages are still installed by the diagnosis into the shared tools
+  folder, so a task does not need the network just to get its dependencies.
+
 ## API models act through tools
 
 When a node runs on an API model, the model gets five tools and works in a loop until it
@@ -233,11 +257,24 @@ answers without calling one: `list_dir`, `read_file`, `write_file`, `edit_file` 
 
   Only API models' commands get these ports; the membership CLIs' sandboxes stay offline.
 - Every received usage report is charged immediately, including rounds before a failure,
-  model switch, cancellation, or the `api_agent_max_turns` (40) limit. Before each API request,
+  model switch, cancellation, or the turn limit. Before each API request,
   execution, review, and diagnosis calls share reservations for a conservative input estimate
   and a bounded output token count. Calls wait for competing reservations to be released;
   insufficient remaining funds pause the task without consuming a quality retry. Final
   replies are checked too. Usage that a provider never reports cannot be reconstructed.
+- **Turns.** A turn is one model request, which may hold several tool calls; the prompt says
+  so and asks the model to batch independent calls and write each file whole. A node gets
+  `api_agent_max_turns` (40) turns when easy, 1.5× when normal and 2× when hard. Five turns
+  before the limit the model is told to wrap up; at the limit it gets one more request, without
+  further tool calls, to answer with a progress summary (done, not done, what next). That
+  summary goes through the usual review and reaches the next attempt as its previous result;
+  with review off it counts as rejected. `read_file` returns up to 1200 lines per call.
+- **Tool-call log.** Every tool call of an attempt is recorded on it (turn, tool, file or
+  command, whether it went through) and shown, folded, under the attempt in the plan view;
+  diagnoses get a per-tool count and the latest attempt's calls.
+- **Out of turns twice.** When a node's last two attempts ran out of turns on the same model,
+  the next retry goes to the strongest other eligible model, a membership CLI included, even
+  under the API-first policy.
 - Models marked as not supporting tools, and the offline demo model, only answer with text
   and are not routed to project nodes. `SUPER_PARTNER_API_AGENT=false` turns tools off.
 
@@ -287,11 +324,44 @@ from there.
 stuck: a membership CLI when one is available to the task (it can read the working files and
 costs nothing extra), otherwise the best planning model. It gets the request, the plan, every
 attempt with its reviewer's reasons, feedback, changed files, results and recent events, and
-writes a report (问题定位 / 根本原因 / 建议操作) plus a `NEXT_STEP:` instruction for the failing
+writes a report (问题定位 / 根本原因 / 处理结果与下一步) plus a `NEXT_STEP:` instruction for the failing
 step. For a paused or failed step, this button uses the environment repair and model-switching
 flow below, then automatically continues within the already approved budget. A running task
 without a stopped step receives analysis only. Cancelling a task stops its manual diagnosis
 as well; deletion waits for both execution and diagnosis to finish.
+
+**Interactive diagnosis.** Every completed report, including older reports without choices,
+has a reply form. Select a proposed option, write your own explanation, or submit both.
+Replies are stored with the original report and become context for the next diagnosis;
+the next diagnosis starts automatically, using the existing budget. Failed submissions keep
+the draft and selection. Replies are accepted after the current diagnosis or activation finishes.
+When a requirement or user preference really blocks progress, the model emits a Chinese
+`QUESTION: ...`, an optional `OPTIONS: ["...", "..."]` JSON array, and `STATUS: NEEDS_INPUT`.
+The task waits for an actual answer; no option is selected automatically. Routine authorized
+repairs continue without an extra question. The reply endpoint is
+`POST /api/tasks/{run_id}/diagnoses/{diagnosis_id}/reply` with `text` and/or `choice`.
+
+**Repairing Super Partner itself.** Diagnosis distinguishes task mistakes, shared environment
+problems, and defects in this application's scheduler, provider handling, persistence, API or
+web UI. `STATUS: PLATFORM_REPAIR` automatically starts a separate source-editing phase.
+It copies application source and tests into `<data_dir>/platform-repairs/<id>/source`,
+preserving existing local edits as its baseline. The repair model works in that copy and must
+add a regression check. The controller independently checks Python syntax, compatibility with
+a temporary copy of existing database records, backend tests, frontend tests and a frontend
+build. A failed check feeds back into a bounded repair attempt; it is not treated as success.
+
+For an editable source checkout started with `start.sh` under a systemd user manager, passing
+repairs activate automatically. New work waits while in-flight steps and requests finish;
+an independent worker checks for concurrent source edits, saves a database backup, applies
+the patch, restarts this checkout's API service, and checks the new process's health. Failed
+activation rolls source files back. Durable task markers allow only tasks held by this repair
+to continue after successful activation, within their original budgets; cancelled tasks,
+explicit user pauses and unanswered diagnosis questions stay stopped. Source changes, check
+results and activation outcomes are recorded in shared recovery history for all projects.
+The configuration switches are `SUPER_PARTNER_PLATFORM_SELF_REPAIR` (default `true`) and
+the optional `SUPER_PARTNER_PLATFORM_ROOT` for the source checkout. Other installation or
+service-manager layouts must provide a supported editable checkout before automatic activation
+is available. No model assertion alone marks a platform repair as active.
 
 Stored model selections are checked again at confirmation and before execution. Disabled
 models and models that lost their credentials are replaced under current routing rules.
@@ -365,6 +435,28 @@ Each node in the plan view shows its check result, retries, the upstream results
 received, the files it changed, and every attempt with its model, reviewer, cost and reason.
 
 ## Task results
+
+**未能完成 (incomplete)** is the honest end of a task whose goal cannot be reached here, instead
+of a success that only prepared it (deployment scripts written, but nothing deployed without a
+network). Every step is told to do what it can and end with `UNABLE: <what, why, what would
+make it possible>` rather than simulate the outcome, and reviewers are told to judge the effect
+the task asks for, not the preparation, and to name such a limit in an `unable` field. Either
+way the attempt is `unable`: the per-failure diagnosis tries to lift the limit (installing
+software, or asking to allow the network), retries a wrong claim, and otherwise the step ends
+as **无法完成** with its reason, the user action the diagnosis named, and its report. Steps that
+need its result are skipped (`blocked`), the rest of the task carries on, and the task ends as
+`incomplete`, its result opening with what could not be done and why, followed by what was
+done. "重做未完成的步骤" (resume) runs those steps again once the limit is lifted; a requirement
+change works on it like on any finished task.
+
+**需求变更** on the result page of a finished, failed or cancelled task adds to it instead of
+starting over (`POST /api/tasks/{id}/followup` with the new requirement and a budget). The new
+task links back to it (`parent_run_id`), works in the same project or the same scratch folder
+(`workspace_id`), and is planned knowing the original request, plan, an excerpt of the result
+and the files that exist; each of its steps is told to build on them and keep what the change
+does not touch, and only goes to models that can edit files. Like any task it waits for
+confirmation before it runs. A change of a change keeps the first folder and the earlier
+background.
 
 **查看完整结果** on a finished task opens a result page with the final result, the output
 files (viewable in place), and every step's output. For a task without a project the output

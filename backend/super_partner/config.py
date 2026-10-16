@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     # only return text and cannot be routed to nodes that change a project.
     api_agent: bool = True
     api_agent_max_turns: int = Field(default=40, ge=1, le=200)
+    # Output tokens per request for a model whose own ceiling the catalog does not give; a known
+    # ceiling is used as is. Reasoning models spend their thinking from this too, so a small cap
+    # can end a turn before it writes anything. A model that rejects the cap is retried with a
+    # smaller one; the task budget can lower it further.
+    api_agent_max_output_tokens: int = Field(default=32768, ge=1024, le=262144)
+    # Seconds to wait for one API response; long outputs take minutes to generate.
+    api_request_timeout: float = Field(default=600, ge=30)
     # Local TCP ports that API models' sandboxed commands may still reach, such as an EDA
     # license server: lmgrd's port plus its vendor daemon's, which must be pinned in the license
     # file (VENDOR snpslmd port=...). All other network access stays blocked. Needs socat.
@@ -34,6 +41,10 @@ class Settings(BaseSettings):
     subtasks_prefer_api: bool = True
     # Diagnose a task automatically when one of its nodes runs out of attempts.
     auto_diagnose: bool = True
+    # Diagnose and repair this application's source, separately from task workspaces.
+    platform_self_repair: bool = True
+    platform_root: Optional[Path] = None
+    platform_repair_attempts: int = Field(default=2, ge=1, le=3)
     # Have another model check each node's result against its acceptance criteria.
     review_nodes: bool = True
     # Runs per node (first try plus retries) before it fails; retries go to the strongest model.

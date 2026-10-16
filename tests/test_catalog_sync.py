@@ -29,7 +29,7 @@ def catalog():
                     "name": "New Model",
                     "release_date": "2026-10-01",
                     "modalities": {"input": ["text", "image"], "output": ["text"]},
-                    "limit": {"context": 100000},
+                    "limit": {"context": 100000, "output": 64000},
                     "cost": {"input": 1.25, "output": 5},
                     "tool_call": True,
                     "reasoning": True,
@@ -98,7 +98,7 @@ async def test_sync_preserves_enabled_scores_verified_prices_and_history(sync, c
         updated = sync.models[original.id]
         assert not updated.enabled and updated.scores == original.scores
         assert updated.input_per_million == 42 and updated.pricing_verified
-        assert updated.context_window == 100000
+        assert updated.context_window == 100000 and updated.max_output_tokens == 64000
         assert seed_catalog(sync.db)[original.id] == updated
         old_id = "openai:new-model"
         del catalog["openai"]["models"]["new-model"]

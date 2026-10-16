@@ -1,12 +1,13 @@
-import React, { useEffect, useState } from "react";
+import React, { FormEvent, useEffect, useRef, useState } from "react";
 import { fileSize } from "./attachments";
 import { isMarkdownFile, MarkdownView } from "./markdown";
 import { statusLabel } from "./mission-history";
 
 type ResultRun = {
-  id: string; status: string; prompt?: string; created_at?: string; project_dir?: string | null;
+  id: string; status: string; prompt?: string; created_at?: string; project_dir?: string | null; budget_usd?: number;
+  allow_network?: boolean; use_cli?: boolean;
   final_result?: string | null; github_url?: string | null;
-  plan: { summary: string; nodes: { id: string; title: string; status: string; model_id: string; result?: string | null }[] };
+  plan: { summary: string; nodes: { id: string; title: string; status: string; model_id: string; result?: string | null; unable_reason?: string | null }[] };
 };
 type Listing = { root: string; in_project: boolean; files: { path: string; size: number }[]; github_url?: string | null };
 
@@ -19,8 +20,52 @@ async function request(url: string, init?: RequestInit) {
   return body;
 }
 
+export type ChangeOptions = { allow_network: boolean; use_cli: boolean };
+export type ChangeRequest = (prompt: string, budget: number, options: ChangeOptions) => Promise<string | null>;
+const CHANGEABLE = new Set(["succeeded", "failed", "cancelled", "incomplete"]);
+
+/** 需求变更: describe what to add or change; a new task continues from these results. */
+function ChangePanel({ run, onSubmit, onClose }: { run: ResultRun; onSubmit: ChangeRequest; onClose: () => void }) {
+  const [text, setText] = useState(""), [budget, setBudget] = useState(String(run.budget_usd ?? 2));
+  const [busy, setBusy] = useState(false), [error, setError] = useState("");
+  // The change starts with the earlier task's settings.
+  const [network, setNetwork] = useState(!!run.allow_network), [cli, setCli] = useState(run.use_cli ?? true);
+  const box = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => { box.current?.focus(); }, []);
+  const amount = Number(budget), ready = text.trim().length >= 3 && amount > 0 && !busy;
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!ready) return;
+    setBusy(true); setError("");
+    try { const problem = await onSubmit(text.trim(), amount, { allow_network: network, use_cli: cli }); if (problem) setError(problem); }
+    catch (failure) { setError(errorText(failure)); }
+    finally { setBusy(false); }
+  }
+  return <form className="change-panel" onSubmit={submit} aria-label="需求变更">
+    <div className="change-head">
+      <b>需求变更</b>
+      <small>在当前结果上继续：沿用同一个{run.project_dir ? "项目" : "工作目录"}和已有文件，先生成计划，你确认后再执行。</small>
+    </div>
+    <textarea ref={box} aria-label="新的需求" rows={4} maxLength={20000} value={text} onChange={event => setText(event.target.value)}
+      onKeyDown={event => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }}
+      placeholder="要新增或修改什么？例如：给待办加上到期提醒；把登录改成邮箱验证码；修复手机上按钮重叠。" />
+    <div className="change-actions">
+      <label className="budget-field">预算上限 <span>$</span><input type="number" min="0.01" step="any" inputMode="decimal" aria-label="需求变更的预算上限（美元）" value={budget} onChange={event => setBudget(event.target.value)} /></label>
+      <label className="switch" title="关闭后只使用按量计费的 API 模型"><input type="checkbox" checked={cli} onChange={event => setCli(event.target.checked)} /><span />允许使用会员 CLI</label>
+      <label className="switch" title="执行命令时可以访问互联网（下载依赖、调用外部接口、部署），本机上的服务仍然访问不到"><input type="checkbox" checked={network} onChange={event => setNetwork(event.target.checked)} /><span />允许联网</label>
+      <span className="change-buttons">
+        <button type="button" className="ghost" onClick={onClose} disabled={busy}>取消</button>
+        <button type="submit" className="primary" disabled={!ready}>{busy ? "正在生成计划…" : "生成变更计划"}</button>
+      </span>
+    </div>
+    {error && <p className="error" role="alert">{error}</p>}
+  </form>;
+}
+
 /** A full page for a task's output: final result, files, each step's output, save and publish. */
-export function ResultPage({ apiBase, run, onBack, embedded = false }: { apiBase: string; run: ResultRun; onBack?: () => void; embedded?: boolean }) {
+export function ResultPage({ apiBase, run, onBack, onChange, embedded = false }: { apiBase: string; run: ResultRun; onBack?: () => void; onChange?: ChangeRequest; embedded?: boolean }) {
+  const [changing, setChanging] = useState(false);
+  useEffect(() => setChanging(false), [run.id]);
   const [listing, setListing] = useState<Listing | null>(null), [listError, setListError] = useState("");
   const [tab, setTab] = useState<"result" | "files" | "steps">("result");
   const [file, setFile] = useState<string | null>(null), [text, setText] = useState(""), [fileError, setFileError] = useState("");
@@ -68,12 +113,17 @@ export function ResultPage({ apiBase, run, onBack, embedded = false }: { apiBase
         </div>
       </>}
       <div className="result-actions">
+        {onChange && CHANGEABLE.has(run.status) && <button type="button" className="primary change-button" aria-expanded={changing}
+          onClick={() => setChanging(open => !open)} title="在这个结果的基础上增加或修改需求">✎ 需求变更</button>}
         <a className="button-link primary" href={`${base}/archive`} download>⬇ 另存为 ZIP</a>
         <button type="button" className="ghost" onClick={copy} disabled={!run.final_result}>{copied ? "已复制" : "复制结果"}</button>
         <button type="button" className="ghost github-button" onClick={() => setPublishing(true)} disabled={!canPublish}
           title={run.project_dir ? "项目任务的改动在你自己的仓库里，请在项目中提交并推送" : run.status !== "succeeded" ? "任务完成后才能上传" : "把输出提交到 GitHub 仓库"}>上传到 GitHub</button>
       </div>
     </div>
+    {run.status === "incomplete" && <p className="result-incomplete" role="status"><b>任务没有全部完成。</b>{" "}
+      {run.plan.nodes.filter(node => node.status === "unable").length} 个步骤在当前环境中做不到，最终结果开头写明了原因和需要你做什么；已完成的部分照常保留。</p>}
+    {changing && onChange && <ChangePanel run={run} onSubmit={onChange} onClose={() => setChanging(false)} />}
     {githubUrl && <p className="result-published">已上传到 <a href={githubUrl} target="_blank" rel="noreferrer">{githubUrl}</a></p>}
     <p className="result-location">输出位置：<code>{listing?.root ?? "…"}</code>{listing?.in_project && "（只列出任务改动过的文件）"}</p>
     <nav className="result-tabs" aria-label="结果内容">
@@ -97,6 +147,7 @@ export function ResultPage({ apiBase, run, onBack, embedded = false }: { apiBase
     {tab === "steps" && <ol className="result-steps">{run.plan.nodes.map((node, index) => <li key={node.id}>
       <details open={run.plan.nodes.length <= 3}>
         <summary><b>{String(index + 1).padStart(2, "0")} {node.title}</b><span className={`state ${node.status}`}>{statusLabel(node.status)}</span><small>{node.model_id}</small></summary>
+        {node.unable_reason && <div className="unable-reason"><h5>无法完成的原因</h5><MarkdownView text={node.unable_reason} /></div>}
         {node.result ? <MarkdownView text={node.result} onLink={openLinked} /> : <pre>（无输出）</pre>}
       </details>
     </li>)}</ol>}

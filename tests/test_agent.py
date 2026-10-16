@@ -44,12 +44,24 @@ async def test_file_tools_stay_inside_the_working_directory(tmp_path):
 
 
 @needs_bwrap
-async def test_commands_run_sandboxed_without_keys_network_or_writes_outside(tmp_path, monkeypatch):
+@pytest.mark.parametrize("override_home", [False, True])
+async def test_commands_run_sandboxed_without_keys_network_or_writes_outside(tmp_path, monkeypatch, override_home):
+    import os
+    import pwd
+
+    if override_home:
+        other_home = tmp_path / "temporary-home"
+        other_home.mkdir()
+        monkeypatch.setenv("HOME", str(other_home))
     monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-leak")
     root = Path(settings.workspace_root).resolve() / "_agent_test"
     root.mkdir(parents=True, exist_ok=True)
     try:
         ws = agent.Workspace(root)
+        args = ws.sandbox_args("true")
+        assert str(Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()) in [
+            args[index + 1] for index, value in enumerate(args[:-1]) if value == "--tmpfs"
+        ]
         output = await ws.call("run_command", {"command": (
             "echo made > inside.txt; cat inside.txt; echo key=${OPENAI_API_KEY:-none}; "
             # Above the working directory is a throwaway in-memory home: writes never reach disk.
@@ -101,6 +113,62 @@ async def test_only_listed_host_ports_reach_the_sandbox(monkeypatch):
         import shutil
         shutil.rmtree(root, ignore_errors=True)
 
+
+
+@needs_bwrap
+@pytest.mark.skipif(not agent.network_available(), reason="pasta is not installed")
+async def test_a_task_allowing_the_network_reaches_out_but_not_local_services(monkeypatch, network_enabled):
+    import asyncio
+
+    async def greet(reader, writer):
+        writer.write(b"hello-from-proxy\n")
+        await writer.drain()
+        writer.close()
+
+    proxy = await asyncio.start_server(greet, "127.0.0.1", 0)
+    service = await asyncio.start_server(greet, "127.0.0.1", 0)
+    port, other = (server.sockets[0].getsockname()[1] for server in (proxy, service))
+    for name in agent.PROXY_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{port}")
+    root = Path(settings.workspace_root).resolve() / "_agent_network_test"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        ws = agent.Workspace(root, network=True)
+        assert agent.proxy_ports() == [port] and "--unshare-net" not in ws.sandbox_args("true")
+        output = await ws.call("run_command", {"command": (
+            # A route out exists, the user's local proxy is forwarded, other local ports are not.
+            "awk '$2 == \"00000000\" {f = 1} END {exit !f}' /proc/net/route && echo routed || echo no-route; "
+            f"timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}; cat <&3' || echo proxy-failed; "
+            f"timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{other}' 2>/dev/null && echo local-open || echo local-blocked; "
+            "echo proxy=$HTTPS_PROXY"
+        )})
+        assert "\nrouted" in output and "hello-from-proxy" in output and "local-blocked" in output
+        assert f"proxy=http://127.0.0.1:{port}" in output
+        assert "allows the internet" in ws.instructions() and "no network" not in ws.instructions()
+        # Without the task's permission there is no route out at all.
+        output = await agent.Workspace(root).call("run_command", {"command": (
+            "awk '$2 == \"00000000\" {f = 1} END {exit !f}' /proc/net/route && echo routed || echo no-route"
+        )})
+        assert "no-route" in output
+    finally:
+        proxy.close()
+        service.close()
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_cli_sandboxes_open_to_the_internet_only_for_a_task_allowing_it():
+    from super_partner import cli_channels
+
+    claude = list(cli_channels.CLI_SPECS["cli:claude"].invoke_args)
+    opened = cli_channels._with_network("cli:claude", claude)
+    settings_arg = json.loads(opened[opened.index("--settings") + 1])
+    assert settings_arg["sandbox"]["network"]["allowedDomains"] == ["*"]
+    assert "127.0.0.1" in settings_arg["sandbox"]["network"]["deniedDomains"]
+    assert settings_arg["sandbox"]["allowUnsandboxedCommands"] is False
+    codex = cli_channels._with_network("cli:codex", list(cli_channels.CLI_SPECS["cli:codex"].invoke_args))
+    assert codex[:3] == ["exec", "-c", "sandbox_workspace_write.network_access=true"] and "workspace-write" in codex
 
 
 @needs_bwrap
@@ -258,3 +326,51 @@ def test_a_cli_failure_reports_the_reason_from_its_json_output():
     assert _failure_detail(b"plain words", b"") == "plain words"
     assert _failure_detail(b"ignored", b"bad flag\n") == "bad flag"
     assert _failure_detail(b"", b"") == "no output"
+
+
+def tool_turn_response(text=None, call=True):
+    message = {"content": text}
+    if call:
+        message["tool_calls"] = [{"id": "c1", "type": "function", "function": {"name": "list_dir", "arguments": "{}"}}]
+    return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": "tool_calls" if call else "stop"}],
+                                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+
+
+async def run_turns(tmp_path, monkeypatch, max_turns, answer_at):
+    """A model that lists the directory every turn until request ``answer_at``."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    bodies = []
+
+    def respond(request):
+        bodies.append(json.loads(request.content))
+        return tool_turn_response("进度：完成了一半", call=len(bodies) < answer_at)
+
+    registry = registry_with(respond)
+    log = []
+    try:
+        result = await registry.complete("deepseek:deepseek-chat", "do it", tmp_path, act=True,
+                                         max_turns=max_turns, tool_log=log)
+    finally:
+        await registry.client.aclose()
+    return result, bodies, log
+
+
+async def test_out_of_turns_the_model_is_asked_for_a_progress_summary(tmp_path, monkeypatch):
+    result, bodies, log = await run_turns(tmp_path, monkeypatch, max_turns=3, answer_at=4)
+    assert (result.text, result.turns, result.turn_limit) == ("进度：完成了一半", 3, True)
+    assert len(bodies) == 4 and [call["turn"] for call in log] == [1, 2, 3]
+    assert log[0] == {"turn": 1, "tool": "list_dir", "detail": ".", "ok": True}
+    assert "You have at most 3 turns" in json.dumps(bodies[0], ensure_ascii=False)
+    assert "No turns of tool calls are left" in json.dumps(bodies[3]["messages"][-1], ensure_ascii=False)
+
+
+async def test_five_turns_before_the_limit_the_model_is_told_to_wrap_up(tmp_path, monkeypatch):
+    result, bodies, _log = await run_turns(tmp_path, monkeypatch, max_turns=8, answer_at=5)
+    assert not result.turn_limit and result.turns == 5
+    assert "Only 5 turns of tool calls are left" in json.dumps(bodies[3]["messages"][-1], ensure_ascii=False)
+    assert "Only 5 turns" not in json.dumps(bodies[2]["messages"][-1], ensure_ascii=False)
+
+
+async def test_a_model_that_keeps_calling_tools_after_the_limit_fails_with_the_turn_limit(tmp_path, monkeypatch):
+    with pytest.raises(ProviderError, match="在 2 轮工具调用后仍未完成"):
+        await run_turns(tmp_path, monkeypatch, max_turns=2, answer_at=99)

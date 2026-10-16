@@ -67,7 +67,7 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
     constructor() { super(); channels.push(this); }
   };
   const state = {
-    records, models, actions: [], resumes: [], publishes: [], uploads: [], attachmentDeletes: [], taskBodies: [],
+    records, models, actions: [], resumes: [], publishes: [], uploads: [], attachmentDeletes: [], taskBodies: [], diagnosisReplies: [], followups: [], network: [],
     deletes: [], cancels: [], confirms: [], taskPosts: 0, quota: [], quotaResets: [], nativePicker: true, pickerStarts: [], nativeConfirms: 0, holdNextRead: false, releaseRead: null,
   };
   const json = value => new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
@@ -77,6 +77,15 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
   };
   state.cancelResponse = async id => {
     const updated = { ...state.records.find(run => run.id === id), status: "cancelled" };
+    state.records = state.records.map(run => run.id === id ? updated : run);
+    return json(updated);
+  };
+  state.replyResponse = async (id, diagnosisId, body) => {
+    const current = state.records.find(run => run.id === id);
+    const diagnoses = current.diagnoses.map(item => item.id === diagnosisId
+      ? { ...item, messages: [...(item.messages ?? []), { ...body, created_at: "2026-10-15T10:00:00Z" }] } : item);
+    diagnoses.push({ id: "reply-diagnosis", trigger: "manual", status: "running", model_id: "cli:claude", reply_to: diagnosisId, created_at: "2026-10-15T10:00:01Z" });
+    const updated = { ...current, diagnoses };
     state.records = state.records.map(run => run.id === id ? updated : run);
     return json(updated);
   };
@@ -97,10 +106,33 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
       }
       return json(state.quota);
     }
+    if (options.method === "PUT" && path.endsWith("/network")) {
+      const id = decodeURIComponent(path.split("/")[3]);
+      const { allow } = JSON.parse(options.body);
+      state.network.push({ id, allow });
+      state.records = state.records.map(item => item.id === id ? { ...item, allow_network: allow } : item);
+      return json(state.records.find(item => item.id === id));
+    }
+    if (options.method === "POST" && path.endsWith("/followup")) {
+      const parentId = decodeURIComponent(path.split("/")[3]);
+      const body = JSON.parse(options.body);
+      state.followups.push({ parentId, ...body });
+      const child = { ...mission("change-task", "awaiting_confirmation"), prompt: body.prompt, parent_run_id: parentId, budget_usd: body.budget_usd };
+      child.plan = { ...child.plan, summary: "增加到期提醒" };
+      state.records = [child, ...state.records];
+      return json(child);
+    }
     if (options.method === "POST" && path.endsWith("/cancel")) {
       const id = decodeURIComponent(path.slice("/api/tasks/".length, -"/cancel".length));
       state.cancels.push(id);
       return state.cancelResponse(id, options.signal);
+    }
+    if (options.method === "POST" && path.endsWith("/reply")) {
+      const id = decodeURIComponent(path.split("/")[3]);
+      const diagnosisId = decodeURIComponent(path.split("/")[5]);
+      const body = JSON.parse(options.body);
+      state.diagnosisReplies.push({ id, diagnosisId, ...body });
+      return state.replyResponse(id, diagnosisId, body);
     }
     if (options.method === "POST" && (path.endsWith("/pause") || path.endsWith("/diagnose"))) {
       const action = path.endsWith("/pause") ? "pause" : "diagnose";
@@ -954,4 +986,197 @@ test("unverified nodes show the missing verification instead of a pass", async t
   const { document } = await setup(t, [run], [], { openComposer: false });
   assert.equal(document.querySelector(".plan-check").textContent, "✗ 尚未验证");
   assert.doesNotMatch(document.querySelector(".plan-node").textContent, /✓ 验证通过/);
+});
+
+function interactiveDiagnosis(choices = ["保留兼容", "允许升级接口"]) {
+  const run = mission("interactive-task", "paused");
+  run.waiting_diagnosis_id = "question-1";
+  run.diagnoses = [{ id: "question-1", trigger: "auto", status: "done", verdict: "needs_input",
+    report: "需要确认兼容性要求。", question: "旧版接口是否需要继续兼容？", choices,
+    created_at: "2026-10-15T10:00:00Z" }];
+  return run;
+}
+
+async function fillDiagnosisReply(context, value) {
+  const { window, document, act } = context;
+  const textarea = document.querySelector('[aria-label="补充你的想法"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(textarea, value);
+    textarea.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  return textarea;
+}
+
+test("diagnosis accepts both a deliberate choice and Chinese free text, then continues", async t => {
+  const context = await setup(t, [interactiveDiagnosis()], [], { openComposer: false });
+  const { document, state, click, button } = context;
+  const form = document.querySelector('[aria-label="回复诊断"]');
+  assert.match(form.textContent, /旧版接口是否需要继续兼容/);
+  assert.equal(form.querySelector('input:checked'), null);
+  assert.equal(button("发送并继续诊断").disabled, true);
+  assert.equal(button("按此预算继续"), undefined);
+  await click(form.querySelector('input[value="保留兼容"]'));
+  await fillDiagnosisReply(context, "已有三个项目依赖旧接口，不要改调用方。中文与 emoji ✅");
+  await click(button("发送并继续诊断"));
+  assert.deepEqual(state.diagnosisReplies, [{ id: "interactive-task", diagnosisId: "question-1", choice: "保留兼容", text: "已有三个项目依赖旧接口，不要改调用方。中文与 emoji ✅" }]);
+  // The reply and the follow-up diagnosis join the same conversation, with no reply box meanwhile.
+  assert.match(document.querySelector(".diagnosis-running").textContent, /你的回复继续诊断/);
+  assert.match(document.querySelector('[aria-label="你的诊断回复"]').textContent, /保留兼容.*已有三个项目/s);
+  assert.equal(document.querySelector('[aria-label="上一次诊断"]'), null);
+  assert.equal(document.querySelector('[aria-label="回复诊断"]'), null);
+  assert.match(document.querySelector(".dx-chip").textContent, /分析中/);
+});
+
+test("diagnosis permits a free-text alternative without selecting a proposed option", async t => {
+  const context = await setup(t, [interactiveDiagnosis()], [], { openComposer: false });
+  await fillDiagnosisReply(context, "我希望增加兼容开关，由每个项目自己选择。");
+  await context.click(context.button("发送并继续诊断"));
+  assert.equal(context.state.diagnosisReplies[0].choice, undefined);
+  assert.equal(context.state.diagnosisReplies[0].text, "我希望增加兼容开关，由每个项目自己选择。");
+});
+
+test("a failed reply keeps the selected option and text for retry", async t => {
+  const context = await setup(t, [interactiveDiagnosis()], [], { openComposer: false });
+  const { state, document, click, button } = context;
+  state.replyResponse = async () => new Response(JSON.stringify({ detail: "当前诊断仍在进行" }), { status: 409 });
+  await click(document.querySelector('input[value="保留兼容"]'));
+  await fillDiagnosisReply(context, "补充的要求不要丢失");
+  await click(button("发送并继续诊断"));
+  assert.equal(document.querySelector('[aria-label="补充你的想法"]').value, "补充的要求不要丢失");
+  assert.equal(document.querySelector('input[value="保留兼容"]').checked, true);
+  assert.match(document.querySelector('[role="alert"]').textContent, /当前诊断仍在进行/);
+});
+
+test("diagnosis reply remains available for legacy reports without choices", async t => {
+  const run = interactiveDiagnosis([]);
+  delete run.waiting_diagnosis_id;
+  delete run.diagnoses[0].question;
+  run.diagnoses[0].verdict = "blocked";
+  const context = await setup(t, [run], [], { openComposer: false });
+  assert.equal(context.document.querySelectorAll('.diagnosis-choices input').length, 0);
+  await fillDiagnosisReply(context, "这个权限已经配置好了，请继续检查。");
+  await context.click(context.button("发送并继续诊断"));
+  assert.equal(context.state.diagnosisReplies.length, 1);
+});
+
+
+test("the diagnosis waiting for an answer is highlighted, and a picked option can be unpicked", async t => {
+  const context = await setup(t, [interactiveDiagnosis()], [], { openComposer: false });
+  const { document, click, button } = context;
+  assert.ok(document.querySelector(".diagnosis-card").classList.contains("waiting"));
+  assert.match(document.querySelector(".dx-chip").textContent, /等你回复/);
+  assert.match(document.querySelector(".dx-question").textContent, /旧版接口是否需要继续兼容/);
+  const option = () => document.querySelector('input[value="允许升级接口"]');
+  await click(option());
+  assert.equal(option().checked, true);
+  assert.equal(button("发送并继续诊断").disabled, false);
+  await click(option());
+  assert.equal(option().checked, false);
+  assert.equal(button("发送并继续诊断").disabled, true);
+});
+
+
+test("an attempt shows its turns, whether it ran out, and where its tool calls went", async t => {
+  const run = mission("turns-task", "running");
+  run.plan.nodes = [{ id: "a", title: "Frontend", dependencies: [], model_id: "deepseek:deepseek-flash", status: "pending", estimated_cost_usd: 0, feedback: "继续",
+    attempts: [{ model_id: "deepseek:deepseek-flash", outcome: "rejected", reason: "只交了进度总结", cost_usd: .2, turns: 60, turn_limit: true,
+      tool_calls: [{ turn: 1, tool: "read_file", detail: "easylife/static/app.js", ok: true },
+                   { turn: 2, tool: "run_command", detail: "python3 -m unittest", ok: false },
+                   { turn: 3, tool: "run_command", detail: "node --check app.js", ok: true }] }] }];
+  const { document, click } = await setup(t, [run], [], { openComposer: false });
+  await click(document.querySelector(".plan-node-title"));
+  const panel = document.querySelector(".node-progress");
+  assert.equal(panel.querySelector(".attempt-turns.limit").textContent, "60 轮 · 轮次用完");
+  const log = panel.querySelector(".tool-log");
+  assert.equal(log.querySelector("summary").textContent, "工具调用 3 次：读文件 1 · 运行命令 2（失败 1）");
+  assert.equal(log.querySelectorAll("li.bad").length, 1);
+  assert.match(log.querySelector("li.bad").textContent, /第 2 轮.*运行命令.*python3 -m unittest.*失败/);
+  assert.deepEqual([...panel.querySelectorAll(".plan-attempts b")].map(b => b.textContent), ["第 1 次 · 验收未通过"]);
+});
+
+
+test("a finished task's result page starts a requirement change that builds on it", async t => {
+  const parent = { ...mission("todo-task", "succeeded"), budget_usd: 3 };
+  parent.plan = { ...parent.plan, summary: "待办网页" };
+  const context = await setup(t, [parent], [], { openComposer: false });
+  const { window, document, state, act, click, button } = context;
+  const change = button("✎ 需求变更");
+  assert.ok(change);
+  await click(change);
+  const panel = document.querySelector('[aria-label="需求变更"]');
+  assert.match(panel.textContent, /沿用同一个工作目录/);
+  assert.equal(button("生成变更计划").disabled, true);
+  const box = panel.querySelector('[aria-label="新的需求"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(box, "增加到期提醒");
+    box.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  assert.equal(panel.querySelector('[aria-label="需求变更的预算上限（美元）"]').value, "3");
+  await click(button("生成变更计划"));
+  assert.deepEqual(state.followups, [{ parentId: "todo-task", prompt: "增加到期提醒", budget_usd: 3, allow_network: false, use_cli: false }]);
+
+  // The new task opens for confirmation, and links back to the task it continues.
+  assert.match(document.querySelector(".task-title h3").textContent, /增加到期提醒/);
+  const back = document.querySelector(".change-of .link-button");
+  assert.match(back.textContent, /待办网页/);
+  await click(back);
+  assert.match(document.querySelector(".task-title h3").textContent, /待办网页/);
+});
+
+test("a running task offers no requirement change", async t => {
+  const { button } = await setup(t, [mission("busy-task", "running")], [], { openComposer: false });
+  assert.equal(button("✎ 需求变更"), undefined);
+});
+
+test("network access is opt-in per task, at planning and before running", async t => {
+  const context = await setup(t, [mission("plan-task", "awaiting_confirmation")], [], { openComposer: false });
+  const { document, state, click } = context;
+  const bar = document.querySelector(".action-bar");
+  const toggle = bar.querySelector(".network-switch input");
+  assert.equal(toggle.checked, false);
+  assert.match(bar.querySelector(".network-switch").title, /本机上的服务仍然访问不到/);
+  await click(toggle);
+  assert.deepEqual(state.network, [{ id: "plan-task", allow: true }]);
+  assert.equal(document.querySelector(".action-bar .network-switch input").checked, true);
+});
+
+test("an incomplete task says what could not be done and why, and offers to redo only that", async t => {
+  const run = { ...mission("deploy-task", "incomplete"), final_result: "## 未能完成\n\n### 部署上线\n\n沙箱不能联网，没有实际部署。",
+    error: "1 个步骤无法完成：部署上线（沙箱不能联网）" };
+  run.plan = { ...run.plan, summary: "网站", nodes: [
+    { id: "build", title: "构建网站", status: "succeeded", model_id: "x:api", result: "构建完成", dependencies: [] },
+    { id: "deploy", title: "部署上线", status: "unable", model_id: "x:api", result: "脚本已就绪", dependencies: ["build"],
+      unable_reason: "沙箱不能联网，没有实际部署。\n\n需要你处理：允许本任务联网" },
+    { id: "check", title: "检查线上页面", status: "blocked", model_id: "x:api", dependencies: ["deploy"] },
+  ] };
+  const { document, state, click, button } = await setup(t, [run], [], { openComposer: false });
+  assert.equal(document.querySelector(".task-actions .pill").textContent, "未能完成");
+  // The result opens first, led by the plain statement of what is missing.
+  assert.match(document.querySelector(".result-incomplete").textContent, /任务没有全部完成。.*1 个步骤在当前环境中做不到/);
+  assert.match(document.querySelector(".result-text").textContent, /沙箱不能联网，没有实际部署/);
+  assert.match(document.querySelector(".resume-bar").textContent, /「部署上线」 在当前环境中无法完成/);
+  assert.ok(button("✎ 需求变更"));
+  await click(button("重做未完成的步骤"));
+  assert.equal(state.resumes.length, 1);
+  assert.equal(state.resumes[0].id, "deploy-task");
+});
+
+test("a requirement change starts with the earlier task's network and CLI settings, and can change them", async t => {
+  const parent = { ...mission("net-task", "succeeded"), allow_network: true, use_cli: true };
+  const { window, document, state, act, click, button } = await setup(t, [parent], [], { openComposer: false });
+  await click(button("✎ 需求变更"));
+  const panel = document.querySelector('[aria-label="需求变更"]');
+  const [cli, network] = [...panel.querySelectorAll(".switch input")];
+  assert.equal(cli.checked, true);
+  assert.equal(network.checked, true);
+  assert.match(panel.textContent, /允许联网/);
+  await click(network);
+  const box = panel.querySelector('[aria-label="新的需求"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(box, "改成离线版本");
+    box.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await click(button("生成变更计划"));
+  assert.equal(state.followups[0].allow_network, false);
+  assert.equal(state.followups[0].use_cli, true);
 });

@@ -8,12 +8,30 @@ export type PlanNode = {
   capability?: string; dependencies?: string[]; needs_workspace?: boolean; result?: string;
   difficulty?: string; quality_threshold?: number; routing_note?: string | null; started_at?: string | null;
   acceptance_criteria?: string; verifies?: string[]; attempts?: NodeAttempt[]; failed_attempts?: number;
-  feedback?: string | null; review_passed?: boolean | null; review?: string | null; summary?: string | null;
+  feedback?: string | null; unable_reason?: string | null; review_passed?: boolean | null; review?: string | null; summary?: string | null;
   changed_files?: string[]; inputs?: { node_id: string; form: string; changed_files: number }[];
 };
-type NodeAttempt = { model_id?: string | null; outcome: string; reason?: string | null; reviewer_model_id?: string | null; cost_usd: number; finished_at?: string };
+type ToolCall = { turn: number; tool: string; detail?: string; ok?: boolean };
+type NodeAttempt = { model_id?: string | null; outcome: string; reason?: string | null; reviewer_model_id?: string | null; cost_usd: number; finished_at?: string;
+  turns?: number; turn_limit?: boolean; tool_calls?: ToolCall[] };
+const TOOL_LABELS: Record<string, string> = { list_dir: "列目录", read_file: "读文件", write_file: "写文件", edit_file: "改文件", run_command: "运行命令" };
 
-const OUTCOME_LABELS: Record<string, string> = { passed: "通过", rejected: "验收未通过", unverified: "尚未验证", superseded: "上游返工，结果失效", budget: "预算不足", cancelled: "已中止", error: "执行出错", verify_failed: "验证发现问题", quota: "额度用完", unavailable: "模型服务暂时不可用" };
+/** Where an API model's turns went: calls per tool, then every call, folded by default. */
+function ToolLog({ calls }: { calls: ToolCall[] }) {
+  const counts = new Map<string, [number, number]>();
+  for (const call of calls) {
+    const [n, bad] = counts.get(call.tool) ?? [0, 0];
+    counts.set(call.tool, [n + 1, bad + (call.ok === false ? 1 : 0)]);
+  }
+  return <details className="tool-log">
+    <summary>工具调用 {calls.length} 次：{[...counts].map(([tool, [n, bad]]) => `${TOOL_LABELS[tool] ?? tool} ${n}${bad ? `（失败 ${bad}）` : ""}`).join(" · ")}</summary>
+    <ol>{calls.map((call, index) => <li key={index} className={call.ok === false ? "bad" : undefined}>
+      <span className="tool-turn">第 {call.turn} 轮</span><span className="tool-name">{TOOL_LABELS[call.tool] ?? call.tool}</span><code>{call.detail}</code>{call.ok === false && <em>失败</em>}
+    </li>)}</ol>
+  </details>;
+}
+
+const OUTCOME_LABELS: Record<string, string> = { passed: "通过", rejected: "验收未通过", unverified: "尚未验证", superseded: "上游返工，结果失效", budget: "预算不足", cancelled: "已中止", error: "执行出错", verify_failed: "验证发现问题", quota: "额度用完", unavailable: "模型服务暂时不可用", unable: "无法完成" };
 const INPUT_LABELS: Record<string, string> = { full: "完整结果", summary: "摘要", truncated: "截断的结果" };
 
 /** One line on the card saying where the node stands right now. */
@@ -21,6 +39,8 @@ function nodeLine(node: PlanNode, nodes: PlanNode[], number: Map<string, string>
   const attempts = node.attempts ?? [], last = attempts[attempts.length - 1];
   if (node.status === "succeeded") return { tone: "ok", text: node.verifies?.length ? "✓ 验证通过" : node.review_passed ? "✓ 验收通过" : "✓ 完成" };
   if (node.status === "failed") return { tone: "bad", text: `✗ ${last ? OUTCOME_LABELS[last.outcome] ?? "失败" : "失败"}` };
+  if (node.status === "unable") return { tone: "bad", text: "⊘ 当前环境无法完成" };
+  if (node.status === "blocked") return { tone: "muted", text: "前置步骤无法完成，未执行" };
   if (node.status === "running") return { tone: node.feedback ? "warn" : "run", text: node.feedback ? `↻ 第 ${attempts.length + 1} 次尝试中` : "执行中…" };
   if (node.status === "cancelled") return { tone: "muted", text: "已取消" };
   if (node.feedback) return { tone: "warn", text: `↻ 待重做（${last ? OUTCOME_LABELS[last.outcome] ?? last.outcome : "返工"}）` };
@@ -241,6 +261,7 @@ function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, o
         {lines.length ? <ol>{lines.map(({ event, text }) => <li key={event.id} className={event.kind.replace(".", "-")}><time>{clock(event.created_at)}</time><span>{text}</span></li>)}</ol> : <p className="muted">还没有执行记录。</p>}
       </section>
       <div className="node-progress-side">
+        {node.unable_reason && <section className="unable-reason"><h5>无法完成的原因</h5><MarkdownView text={node.unable_reason} /></section>}
         {node.acceptance_criteria && <section><h5>验收标准</h5><p>{node.acceptance_criteria}</p></section>}
         {node.review && <section><h5>验收意见</h5><p>{node.review}</p></section>}
         {node.feedback && node.status !== "succeeded" && <section><h5>需要修改</h5><p>{node.feedback}</p></section>}
@@ -250,8 +271,10 @@ function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, o
     </div>
     {!!attempts.length && <section className="node-progress-attempts"><h5>尝试记录</h5><ol className="plan-attempts">{attempts.map((attempt, index) => <li key={index} className={attempt.outcome}>
       <b>第 {index + 1} 次 · {OUTCOME_LABELS[attempt.outcome] ?? attempt.outcome}</b>
-      <small>{attempt.model_id ?? "未知模型"}{attempt.reviewer_model_id ? ` · 验收：${attempt.reviewer_model_id}` : ""} · {formatUsd(attempt.cost_usd)}{attempt.finished_at ? ` · ${clock(attempt.finished_at)}` : ""}</small>
+      <small>{attempt.model_id ?? "未知模型"}{attempt.reviewer_model_id ? ` · 验收：${attempt.reviewer_model_id}` : ""} · {formatUsd(attempt.cost_usd)}{attempt.finished_at ? ` · ${clock(attempt.finished_at)}` : ""}
+        {!!attempt.turns && <span className={`attempt-turns${attempt.turn_limit ? " limit" : ""}`}>{attempt.turns} 轮{attempt.turn_limit ? " · 轮次用完" : ""}</span>}</small>
       {attempt.reason && <p>{attempt.reason}</p>}
+      {!!attempt.tool_calls?.length && <ToolLog calls={attempt.tool_calls} />}
     </li>)}</ol></section>}
     {node.result && <section className="node-progress-output"><h5>{node.status === "failed" ? "错误信息" : "输出"}</h5><MarkdownView text={node.result} markdown={node.status !== "failed"} /></section>}
   </section>;

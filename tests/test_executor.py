@@ -178,7 +178,7 @@ def process_alive(pid: int) -> bool:
     """True unless the process is gone or a zombie awaiting reaping by its new parent."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 

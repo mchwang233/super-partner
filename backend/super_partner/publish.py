@@ -37,7 +37,7 @@ class PublishError(RuntimeError):
 
 
 def output_root(run: ExecutionRun) -> Path:
-    return Path(run.project_dir) if run.project_dir else (settings.workspace_root / run.id)
+    return Path(run.project_dir) if run.project_dir else (settings.workspace_root / run.folder_id)
 
 
 def output_files(run: ExecutionRun) -> list[dict]:
@@ -82,8 +82,12 @@ def result_markdown(run: ExecutionRun) -> str:
     """A readable record of the task: request, final result, and each step's output."""
     lines = [f"# {run.plan.summary}", "", f"> {run.prompt}", "", "## 最终结果", "", run.final_result or "（无）", ""]
     for index, node in enumerate(run.plan.nodes, 1):
-        status = {NodeStatus.SUCCEEDED: "已完成", NodeStatus.FAILED: "失败"}.get(node.status, node.status.value)
-        lines += [f"## {index:02d} {node.title}（{status} · {node.model_id or '未分配'}）", "", node.result or "（无输出）", ""]
+        status = {NodeStatus.SUCCEEDED: "已完成", NodeStatus.FAILED: "失败", NodeStatus.UNABLE: "无法完成",
+                  NodeStatus.BLOCKED: "未执行"}.get(node.status, node.status.value)
+        lines += [f"## {index:02d} {node.title}（{status} · {node.model_id or '未分配'}）", ""]
+        if node.unable_reason:
+            lines += [f"**无法完成的原因**：{node.unable_reason}", ""]
+        lines += [node.result or "（无输出）", ""]
     return "\n".join(lines)
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,16 +30,43 @@ class ProviderResult:
     output_tokens: int
     used_model_id: str | None = None
     accounted_cost_usd: float = 0.0
+    # Turns of tool calls an acting API model took, and whether it hit its limit, so this text
+    # is the progress summary it was asked for at the end rather than a finished answer.
+    turns: int = 0
+    turn_limit: bool = False
 
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504, 529}
+# The floor a cap the model rejects is retried down to.
+PLAIN_OUTPUT_TOKENS = 4096
+OUTPUT_LIMIT_REJECTED = re.compile(r"max_(?:completion_)?tokens|max_?output|output tokens", re.IGNORECASE)
+
+
+# Turns before the limit at which the model is told to wrap up.
+WRAP_UP_TURNS = 5
+MAX_LOGGED_CALLS = 300
+TURN_LIMIT_MARK = "在 {limit} 轮工具调用后仍未完成"
+
+
+def _turn_note(left: int) -> str:
+    """Appended to the last tool result as the turns run out."""
+    if left == WRAP_UP_TURNS:
+        return (f"[System notice] Only {left} turns of tool calls are left. Do not start new work: finish "
+                "the change in hand, run one final check, then answer without calling a tool.")
+    if left == 0:
+        return ("[System notice] No turns of tool calls are left. Do not call any tool. Answer now with a "
+                "progress summary: what is done (files, checks and their results), what is not done yet, "
+                "and exactly what the next attempt should do.")
+    return ""
 
 
 class ProviderRegistry:
-    def __init__(self, db: Optional[Database] = None) -> None:
-        self.client = httpx.AsyncClient(timeout=120)
+    def __init__(self, db: Optional[Database] = None, models: Optional[dict] = None) -> None:
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(settings.api_request_timeout, connect=30))
         self.cli = CliChannelRegistry()
         self.quota = QuotaTracker(db)
+        # The live catalog (updated in place by catalog sync), for each model's output ceiling.
+        self.models = models if models is not None else {}
         self.max_attempts = 4
         self.retry_base_delay = 1.0
         self.retry_max_delay = 30.0
@@ -74,11 +102,14 @@ class ProviderRegistry:
         self, model_id: str, prompt: str, workspace=None, cli_timeout: int = 900,
         allow_api_fallback: bool = True, attachments: tuple[Attachment, ...] | list[Attachment] = (),
         act: bool = False, spend_ok: Optional[Callable[[str, int, int], bool]] = None,
-        repair: bool = False,
+        repair: bool = False, max_turns: Optional[int] = None, tool_log: Optional[list] = None,
+        network: bool = False, review_workspace: Optional[Path] = None, review_files: list[str] = (),
     ) -> ProviderResult:
         """One model call. With ``act``, an API model works on ``workspace`` through tools
         (see agent.py) until it is done; ``spend_ok(model_id, input, output)`` can stop it.
-        ``repair`` lets the model's commands leave the sandbox to fix the environment."""
+        ``repair`` lets the model's commands leave the sandbox to fix the environment;
+        ``network`` lets sandboxed commands reach the internet for a task that allows it.
+        ``review_workspace`` gives API reviewers only safe file reads, independently of act/repair."""
         provider, model = model_id.split(":", 1)
         attachments = list(attachments)
         if provider == "cli":
@@ -86,7 +117,7 @@ class ProviderRegistry:
                 text = await self.cli.complete(
                     model_id, prompt + files.describe(attachments, with_paths=True),
                     workspace or settings.workspace_root, timeout=cli_timeout,
-                    attachments=attachments, repair=repair,
+                    attachments=attachments, repair=repair, **({"network": True} if network else {}),
                 )
                 return ProviderResult(
                     text=text, input_tokens=0, output_tokens=0, used_model_id=model_id,
@@ -104,7 +135,8 @@ class ProviderRegistry:
                     raise ProviderError(f"{exc}; no API fallback is configured") from exc
                 result = await self.complete(
                     fallback, prompt, workspace, cli_timeout, attachments=attachments,
-                    act=act, spend_ok=spend_ok,
+                    act=act, spend_ok=spend_ok, network=network,
+                    review_workspace=review_workspace, review_files=review_files,
                 )
                 result.used_model_id = fallback
                 return result
@@ -118,7 +150,16 @@ class ProviderRegistry:
                 else f"Completed by {model_id}: {prompt[:800]}"
             )
             return ProviderResult(text=text, input_tokens=max(1, len(prompt) // 4), output_tokens=max(1, len(text) // 4), used_model_id=model_id)
-        agent = agent_tools.Workspace(Path(workspace or settings.workspace_root), host=repair) if act else None
+        if review_workspace is not None:
+            agent = agent_tools.Workspace(
+                Path(review_workspace), read_only=True, readable_files=review_files,
+                max_turns=max_turns or 8, log=tool_log,
+            )
+        else:
+            agent = agent_tools.Workspace(
+                Path(workspace or settings.workspace_root), host=repair, max_turns=max_turns, log=tool_log,
+                network=network,
+            ) if act else None
         if provider == "anthropic":
             return await self._anthropic(model, prompt, images, agent, spend_ok)
         if provider == "google":
@@ -179,38 +220,86 @@ class ProviderRegistry:
     async def _loop(self, provider: str, model: str, prompt: str, images, agent, spend_ok, step):
         """Call the model, run the tools it asks for, and call again until it stops asking.
 
-        ``step(state)`` makes one request and returns (text, tool_calls, input, output);
-        ``tool_calls`` are (id, name, arguments) and their results go back via ``state``.
-        Without a workspace this is a single plain call.
+        ``step(state)`` makes one request and returns (text, tool_calls, input, output,
+        truncated); ``tool_calls`` are (id, name, arguments) and their results go back via
+        ``state``. ``truncated`` means the output hit its token cap. Without a workspace this is
+        a single plain call.
         """
         model_id = f"{provider}:{model}"
-        tools = agent_tools.tools_for(agent_tools.sandbox_available()) if agent else []
+        tools = agent_tools.tools_for(agent_tools.sandbox_available(), read_only=agent.read_only) if agent else []
         if agent:
             prompt = f"{agent.instructions()}\n\n{prompt}"
         state = {"prompt": prompt, "images": images, "tools": tools, "history": None, "results": None}
-        total_in = total_out = 0
+        total_in = total_out = turn = 0
+        limit = (agent.max_turns or settings.api_agent_max_turns) if agent else 1
         try:
-            for _turn in range(settings.api_agent_max_turns if agent else 1):
+            # One turn past the limit: the model's chance to answer with a progress summary.
+            for turn in range(1, limit + 2 if agent else 2):
+                final = bool(agent) and turn > limit
                 if spend_ok and not spend_ok(model_id, total_in, total_out):
                     raise BudgetExceeded("已达到任务可用的预算，模型调用被中止。")
-                text, calls, used_in, used_out = await step(state)
+                text, calls, used_in, used_out, truncated = await step(state)
                 total_in, total_out = total_in + used_in, total_out + used_out
                 if record := getattr(spend_ok, "record", None):
                     await record(model_id, used_in, used_out)
                 if spend_ok and not spend_ok(model_id, total_in, total_out):
                     raise BudgetExceeded("已达到任务可用的预算，模型调用被中止。")
+                if truncated and not calls and (agent or not text):
+                    # A cut-off turn is not an answer; returning it would look like a model that
+                    # finished without doing anything.
+                    raise ProviderError(
+                        f"{model_id} 的输出达到单轮上限 {state.get('limit')} 个 token 被截断"
+                        "（output truncated by length），没有给出完整回答或工具调用。"
+                    )
                 if not calls or not agent:
-                    return ProviderResult(text or "", total_in, total_out, model_id)
-                state["results"] = [(call_id, name, await agent.call(name, args)) for call_id, name, args in calls]
-            raise ProviderError(f"{model_id} 在 {settings.api_agent_max_turns} 轮工具调用后仍未完成。")
+                    return ProviderResult(text or "", total_in, total_out, model_id, turns=min(turn, limit), turn_limit=final)
+                if final:
+                    raise ProviderError(f"{model_id} {TURN_LIMIT_MARK.format(limit=limit)}，最后也没有交出进度总结。")
+                results = []
+                for call_id, name, args in calls:
+                    output = await agent.call(name, args)
+                    results.append((call_id, name, output))
+                    if agent.log is not None and len(agent.log) < MAX_LOGGED_CALLS:
+                        agent.log.append({"turn": turn, "tool": name, "detail": agent_tools.describe_call(name, args),
+                                          "ok": not output.startswith("Error:") and (name != "run_command" or output.startswith("exit code 0"))})
+                if note := _turn_note(limit - turn):
+                    call_id, name, output = results[-1]
+                    results[-1] = (call_id, name, f"{output}\n\n{note}")
+                state["results"] = results
+            raise AssertionError("unreachable")
         except (Exception, asyncio.CancelledError) as exc:
-            exc.usage = ProviderResult("", total_in, total_out, model_id)
+            exc.usage = ProviderResult("", total_in, total_out, model_id, turns=min(turn, limit))
             raise
 
+    def output_ceiling(self, model_id: str) -> int:
+        model = self.models.get(model_id)
+        return getattr(model, "max_output_tokens", None) or settings.api_agent_max_output_tokens
+
     @staticmethod
-    async def _limit_request(spend_ok, model_id: str, body: dict, maximum: int = 4096) -> int:
+    async def _limit_request(spend_ok, model_id: str, body: dict, maximum: int = PLAIN_OUTPUT_TOKENS) -> int:
         reserve = getattr(spend_ok, "reserve", None)
         return await reserve(model_id, body, maximum) if reserve else maximum
+
+    async def _send(self, provider: str, model_id: str, url: str, body: dict, put, state, spend_ok, **kwargs):
+        """POST ``body`` with an output cap set by ``put(body, limit)``.
+
+        The cap is the model's own output ceiling from the catalog, or
+        ``api_agent_max_output_tokens`` when that is unknown; a model that rejects it is
+        retried with half, down to the plain cap, and later turns keep the cap that worked.
+        The budget reservation can only lower it.
+        """
+        maximum = state.get("maximum") or self.output_ceiling(model_id)
+        while True:
+            state["limit"] = await self._limit_request(spend_ok, model_id, body, maximum)
+            put(body, state["limit"])
+            response = await self._post(provider, url, json=body, **kwargs)
+            if (
+                response.status_code == 400 and state["limit"] > PLAIN_OUTPUT_TOKENS
+                and OUTPUT_LIMIT_REJECTED.search(response.text)
+            ):
+                maximum = state["maximum"] = max(PLAIN_OUTPUT_TOKENS, state["limit"] // 2)
+                continue
+            return response
 
     async def _openai_compatible(
         self, provider: str, model: str, prompt: str, images: list[Attachment] = (), agent=None, spend_ok=None,
@@ -239,20 +328,29 @@ class ProviderRegistry:
             body = {"model": model, "messages": state["history"]}
             if state["tools"]:
                 body["tools"] = [{"type": "function", "function": tool} for tool in state["tools"]]
-            body["max_completion_tokens" if provider == "openai" else "max_tokens"] = await self._limit_request(spend_ok, f"{provider}:{model}", body)
-            response = await self._post(provider, url, headers={"Authorization": f"Bearer {os.environ[env]}"}, json=body)
+            field = "max_completion_tokens" if provider == "openai" else "max_tokens"
+            response = await self._send(
+                provider, f"{provider}:{model}", url, body, lambda body, limit: body.update({field: limit}),
+                state, spend_ok, headers={"Authorization": f"Bearer {os.environ[env]}"},
+            )
             if response.is_error:
                 raise ProviderError(f"{provider} returned {response.status_code}: {response.text[:300]}")
             data = response.json()
             usage = data.get("usage") or {}
-            message = data["choices"][0]["message"]
+            choice = data["choices"][0]
+            message = choice["message"]
             calls = message.get("tool_calls") or []
             if calls:
-                state["history"].append({"role": "assistant", "content": message.get("content"), "tool_calls": calls})
+                reply = {"role": "assistant", "content": message.get("content"), "tool_calls": calls}
+                if message.get("reasoning_content"):
+                    # DeepSeek's (and Kimi's) thinking mode needs it back within a tool loop.
+                    reply["reasoning_content"] = message["reasoning_content"]
+                state["history"].append(reply)
             return (
                 message.get("content"),
                 [(call["id"], call["function"]["name"], _arguments(call["function"].get("arguments"))) for call in calls],
                 usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
+                choice.get("finish_reason") == "length",
             )
 
         return await self._loop(provider, model, prompt, images, agent, spend_ok, step)
@@ -271,17 +369,16 @@ class ProviderRegistry:
                     {"type": "tool_result", "tool_use_id": call_id, "content": output}
                     for call_id, _name, output in state["results"]
                 ]})
-            body = {"model": model, "max_tokens": 8192 if state["tools"] else 4096, "messages": state["history"]}
+            body = {"model": model, "messages": state["history"]}
             if state["tools"]:
                 body["tools"] = [
                     {"name": tool["name"], "description": tool["description"], "input_schema": tool["parameters"]}
                     for tool in state["tools"]
                 ]
-            body["max_tokens"] = await self._limit_request(spend_ok, f"anthropic:{model}", body, body["max_tokens"])
-            response = await self._post(
-                "anthropic", "https://api.anthropic.com/v1/messages",
+            response = await self._send(
+                "anthropic", f"anthropic:{model}", "https://api.anthropic.com/v1/messages", body,
+                lambda body, limit: body.update(max_tokens=limit), state, spend_ok,
                 headers={"x-api-key": os.environ[PROVIDER_ENV["anthropic"]], "anthropic-version": "2023-06-01"},
-                json=body,
             )
             if response.is_error:
                 raise ProviderError(f"anthropic returned {response.status_code}: {response.text[:300]}")
@@ -294,6 +391,7 @@ class ProviderRegistry:
             return (
                 text, [(block["id"], block["name"], block.get("input") or {}) for block in calls],
                 data["usage"]["input_tokens"], data["usage"]["output_tokens"],
+                data.get("stop_reason") == "max_tokens",
             )
 
         return await self._loop("anthropic", model, prompt, images, agent, spend_ok, step)
@@ -313,16 +411,18 @@ class ProviderRegistry:
             body = {"contents": state["history"]}
             if state["tools"]:
                 body["tools"] = [{"functionDeclarations": state["tools"]}]
-            body["generationConfig"] = {"maxOutputTokens": await self._limit_request(spend_ok, f"google:{model}", body)}
-            response = await self._post(
-                "google", f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                params={"key": os.environ[PROVIDER_ENV["google"]]}, json=body,
+            response = await self._send(
+                "google", f"google:{model}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", body,
+                lambda body, limit: body.update(generationConfig={"maxOutputTokens": limit}), state, spend_ok,
+                params={"key": os.environ[PROVIDER_ENV["google"]]},
             )
             if response.is_error:
                 raise ProviderError(f"google returned {response.status_code}: {response.text[:300]}")
             data = response.json()
             usage = data.get("usageMetadata", {})
-            content = data["candidates"][0]["content"]
+            candidate = data["candidates"][0]
+            content = candidate.get("content") or {}
             parts = content.get("parts") or []
             calls = [part["functionCall"] for part in parts if "functionCall" in part]
             if calls:
@@ -331,6 +431,7 @@ class ProviderRegistry:
             return (
                 text, [(call["name"], call["name"], call.get("args") or {}) for call in calls],
                 usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0),
+                candidate.get("finishReason") == "MAX_TOKENS",
             )
 
         return await self._loop("google", model, prompt, images, agent, spend_ok, step)

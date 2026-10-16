@@ -470,3 +470,17 @@ async def test_compressed_responses_are_decoded_once(catalog):
         response = await catalog._get(client, SUPERCLUE_URL)
     assert response.text == text
     assert "content-encoding" not in response.headers
+
+
+def test_an_undated_alias_takes_the_newest_snapshot_the_catalog_does_not_list():
+    rows = parse_bfcl(bfcl_csv("Sample-1 0601 (FC)"), BFCL_PAGE)
+    rows += parse_bfcl(bfcl_csv("Sample-1 0813 (FC)"), BFCL_PAGE)
+    alias = model()
+    matched = match_results([alias], rows)
+    assert [row["model_name"] for row in matched[alias.id]] == ["Sample-1 0813 (FC)"]
+    assert matched[alias.id][0]["matched_by"] == "latest_snapshot"
+    # The newest snapshot listed in the catalog keeps its results; an older one is not the alias.
+    dated = model("openai:sample-1-0813")
+    matched = match_results([alias, dated], rows)
+    assert [row["model_name"] for row in matched[dated.id]] == ["Sample-1 0813 (FC)"]
+    assert alias.id not in matched

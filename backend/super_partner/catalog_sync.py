@@ -92,10 +92,12 @@ def public_models(payload: dict, provider: str) -> dict[str, dict]:
         if not isinstance(cost, dict) or not isinstance(limit, dict):
             raise TypeError("Invalid model limits or prices")
         context = number(limit.get("context"), positive=True)
+        output = number(limit.get("output"), positive=True)
         result[identifier] = {
             "display_name": str(entry.get("name") or key)[:200],
             "description": str(entry.get("description") or "")[:2000] or None,
             "context_window": int(context) if context else None,
+            "max_output_tokens": int(output) if output else None,
             "input_per_million": number(cost.get("input")),
             "output_per_million": number(cost.get("output")),
             "cached_input_per_million": number(cost.get("cache_read")),
@@ -242,6 +244,9 @@ class CatalogSync:
                 )
                 if context:
                     data["context_window"] = int(context)
+                output = number(entry.get("outputTokenLimit"), positive=True)
+                if output:
+                    data["max_output_tokens"] = int(output)
                 # Creation timestamps are not release dates. Do not present them as such.
                 if entry.get("lifecycle") in {"deprecated", "retired"}:
                     data["catalog_status"] = entry["lifecycle"]

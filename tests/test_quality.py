@@ -128,6 +128,49 @@ async def test_failed_verification_sends_the_work_back_with_its_findings(tmp_pat
     assert report.status == NodeStatus.SUCCEEDED
 
 
+async def test_a_rejected_rework_keeps_the_verifications_findings_and_the_reviewer_sees_them(tmp_path):
+    verdicts = iter(["VERDICT: FAIL: invalid token must return 403", "VERDICT: PASS"])
+    reviews = iter([
+        {"passed": True, "reason": "ok"},
+        {"passed": False, "reason": "reminder_sent is set without SMTP", "fix": "keep it unsent"},
+        {"passed": True, "reason": "ok"},
+    ])
+    providers = Script(
+        lambda model_id, prompt: next(verdicts) if "You are verifying" in prompt else "impl",
+        lambda prompt: next(reviews),
+    )
+    impl = node("impl")
+    impl.instructions = "invalid token returns 404"
+    run = await run_plan(tmp_path, [impl, node("check", ["impl"], verifies=["impl"])], providers)
+
+    assert run.status == RunStatus.SUCCEEDED and run.rework_rounds == 1
+    impl_prompts = [p for _, p in providers.calls if p.startswith("Task: invalid token")]
+    assert len(impl_prompts) == 3
+    # The retry after the reviewer's rejection still carries the verification's rework.
+    assert "must return 403" in impl_prompts[2] and "keep it unsent" in impl_prompts[2]
+    reviews_seen = [p for _, p in providers.calls if quality.REVIEW_MARKER in p and "invalid token returns 404" in p]
+    assert "must return 403" in reviews_seen[1] and "supersede" in reviews_seen[1]
+    assert "must return 403" in reviews_seen[2]
+
+
+def test_retry_feedback_keeps_only_the_original_rework():
+    rework = "验证（Check）发现问题：invalid token must return 403"
+    once = quality.retry_feedback(rework, "first rejection")
+    twice = quality.retry_feedback(f"{once}\n诊断建议：advice", "second rejection")
+    assert once == f"{rework}\n本次验收意见：first rejection"
+    assert twice == f"{rework}\n本次验收意见：second rejection"
+    assert quality.retry_feedback("an earlier rejection", "new rejection") == "new rejection"
+    assert quality.retry_feedback(None, "new rejection") == "new rejection"
+
+
+def test_review_prompt_shows_rework_and_discounts_sandbox_errors():
+    reworked = node("a", feedback="验证（Check）发现问题：invalid token must return 403")
+    prompt = quality.review_prompt(reworked, "done", [], "", False)
+    assert "invalid token must return 403" in prompt and "supersede" in prompt
+    assert "sandbox" in prompt and "socket" in prompt
+    assert "Rework requirements" not in quality.review_prompt(node("a"), "done", [], "", False)
+
+
 async def test_rework_stops_after_the_configured_rounds(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "max_rework_rounds", 1)
     providers = Script(lambda model_id, prompt: "VERDICT: FAIL: still broken" if "You are verifying" in prompt else "impl")
@@ -212,3 +255,75 @@ def test_planner_keeps_acceptance_criteria_and_only_verifies_its_dependencies():
     a, _, c = plan.nodes
     assert a.acceptance_criteria == "tests pass"
     assert c.verifies == [a.id]
+
+
+def test_review_sees_changed_contents_in_a_workspace_without_git(tmp_path):
+    (tmp_path / "static").mkdir()
+    (tmp_path / "static" / "app.js").write_text('go("#/todos/" + todo.id);\n')
+    (tmp_path / ".review").mkdir()
+    (tmp_path / ".review" / "notes.txt").write_text("reviewer scratch")
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG\0\0binary")
+    changed = ["static/app.js", ".review/notes.txt", "logo.png"]
+    evidence = quality.change_evidence(tmp_path, changed)
+    prompt = quality.review_prompt(node("a"), "done", changed, evidence, False)
+    assert 'go("#/todos/" + todo.id);' in prompt and "static/app.js" in evidence
+    assert "reviewer scratch" not in evidence and "PNG" not in evidence
+
+
+def test_review_evidence_includes_untracked_files_in_a_git_workspace(tmp_path):
+    import subprocess
+    git = ["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git[:3], "init", "-q"], check=True)
+    (tmp_path / "old.py").write_text("x = 1\n")
+    subprocess.run([*git, "add", "old.py"], check=True)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True)
+    (tmp_path / "old.py").write_text("x = 2\n")
+    (tmp_path / "new.py").write_text("brand_new = True\n")
+    evidence = quality.change_evidence(tmp_path, ["new.py", "old.py"])
+    assert "+x = 2" in evidence and "brand_new = True" in evidence
+
+
+def test_review_evidence_is_clipped(tmp_path):
+    (tmp_path / "big.txt").write_text("y" * (quality.MAX_DIFF_CHARS * 2))
+    evidence = quality.change_evidence(tmp_path, ["big.txt"])
+    assert len(evidence) < quality.MAX_DIFF_CHARS + 200 and "clipped" in evidence
+
+
+async def test_review_of_a_scratch_task_sees_the_workspace_files(tmp_path):
+    """A task without a project folder works in its scratch folder; the reviewer must still see it."""
+    def work(model_id, prompt):
+        static = settings.workspace_root / "run" / "easylife" / "static"
+        static.mkdir(parents=True, exist_ok=True)
+        (static / "app.js").write_text("renderTodos(todos);\n")
+        return "done"
+
+    providers = Script(work)
+    run = await run_plan(tmp_path, [node("a")], providers)
+    review = next(p for _, p in providers.calls if quality.REVIEW_MARKER in p)
+    assert run.status == RunStatus.SUCCEEDED
+    assert "easylife/static/app.js" in review and "renderTodos(todos);" in review
+
+
+async def test_review_of_an_attempt_that_changed_nothing_sees_the_files_it_names(tmp_path):
+    workspace = settings.workspace_root / "run"
+    (workspace / "easylife" / "static").mkdir(parents=True)
+    (workspace / "easylife" / "static" / "index.html").write_text("<div id=todo-list></div>\n")
+    (workspace / "tests").mkdir()
+    (workspace / "tests" / "test_api.py").write_text("def test_login(): pass\n")
+    (workspace / ".env").write_text("SECRET=1\n")
+    providers = Script(lambda model_id, prompt: "Checked easylife/static/index.html and .env; all present.")
+    await run_plan(tmp_path, [node("a")], providers)
+    review = next(p for _, p in providers.calls if quality.REVIEW_MARKER in p)
+    assert "Files changed: (none)" in review
+    assert "<div id=todo-list></div>" in review
+    assert "files in the workspace" in review and "tests/test_api.py" in review
+    assert "SECRET=1" not in review
+
+
+def test_mentioned_files_stay_inside_the_workspace(tmp_path):
+    root = tmp_path / "ws"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "main.py").write_text("x")
+    (tmp_path / "outside.txt").write_text("x")
+    text = f"See src/main.py, {root}/src/main.py, ../outside.txt and missing/file.py."
+    assert quality.mentioned_files(root, text) == ["src/main.py"]
