@@ -39,6 +39,7 @@ def candidates(models: list[ModelProfile], configured: set[str], exclude=()) -> 
     eligible = [
         model for model in models
         if model.enabled and model.routing_ready and model.id in configured and model.id not in exclude
+        and model.id not in settings.helper_only_models
         and model.provider != "mock" and (model.channel != "cli" or model.id in SESSION_CLIS)
     ]
     return sorted(eligible, key=lambda model: (

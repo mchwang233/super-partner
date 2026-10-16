@@ -30,6 +30,7 @@ def eligible_for_node(
         if model.enabled
         and model.routing_ready
         and model.id in configured
+        and model.id not in settings.helper_only_models
         and model.context_window >= node.estimated_input_tokens + node.estimated_output_tokens
         # Work on the project's files needs a CLI agent, or an API model working through tools.
         and (not node.needs_workspace or can_act(model))

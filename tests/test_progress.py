@@ -152,3 +152,54 @@ async def test_the_executor_asks_another_model_and_records_the_check(tmp_path, m
     assert checker == "cli:claude" and "run node --check" in prompt and "turn 9" in prompt
     event = [e for e in database.events("r") if e.kind == "node.progress_check"][-1]
     assert event.data["stop"] is True and event.data["reason"] == reason
+
+
+async def test_a_request_the_model_never_answers_is_checked_while_it_waits(tmp_path, monkeypatch, often):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+
+    async def respond(request):
+        await asyncio.sleep(30)  # a provider that hangs
+        return httpx.Response(200, json=reply({"content": "late"}))
+
+    async def watch(evidence):
+        return "一直等不到模型回复" if "nothing back yet" in evidence else None
+
+    registry = ProviderRegistry()
+    registry.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        with pytest.raises(ProviderError, match="一直等不到模型回复"):
+            await asyncio.wait_for(registry.complete("deepseek:deepseek-flash", "work", tmp_path, act=True,
+                                                     watch=watch), 5)
+    finally:
+        await registry.client.aclose()
+
+
+async def test_a_reply_past_its_deadline_fails_at_once_and_its_model_steps_aside(tmp_path, monkeypatch):
+    from super_partner.quota import ModelUnavailable
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    monkeypatch.setattr(settings, "api_reply_deadline", 0.2)
+    sent = []
+
+    async def respond(request):
+        sent.append(request)
+        await asyncio.sleep(30)
+        return httpx.Response(200, json=reply({"content": "late"}))
+
+    registry = ProviderRegistry()
+    registry.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        with pytest.raises(ModelUnavailable, match="分钟没有回复"):
+            await asyncio.wait_for(registry.complete("deepseek:deepseek-flash", "work", tmp_path, act=True), 5)
+    finally:
+        await registry.client.aclose()
+    assert len(sent) == 1  # not sent again
+
+
+def test_helper_only_models_never_run_or_lead_a_task():
+    from super_partner import supervisor
+    from super_partner.routing import eligible_for_node
+    from test_turns import model
+    helper, worker = model("glm:glm-5.3-flash", 95), model("x:api", 80)
+    step = TaskNode(id="n", title="t", instructions="i", capability="coding")
+    assert [m.id for m in eligible_for_node(step, [helper, worker], {helper.id, worker.id})] == ["x:api"]
+    assert [m.id for m in supervisor.candidates([helper, worker], {helper.id, worker.id})] == ["x:api"]

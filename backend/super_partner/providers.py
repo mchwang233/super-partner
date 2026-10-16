@@ -294,7 +294,12 @@ class ProviderRegistry:
         for attempt in range(1, self.max_attempts + 1):
             delay = self.retry_base_delay * 2 ** (attempt - 1)
             try:
-                response = await self.client.post(url, **kwargs)
+                response = await asyncio.wait_for(self.client.post(url, **kwargs), settings.api_reply_deadline)
+            except asyncio.TimeoutError as exc:
+                # Sending it again would most likely hang again: fail now so another model takes over
+                # (quota.UNAVAILABLE matches "request failed").
+                raise ProviderError(f"{provider} request failed: {settings.api_reply_deadline / 60:g} 分钟没有回复，"
+                                    "已停止这次请求") from exc
             except httpx.TransportError as exc:
                 if attempt == self.max_attempts:
                     raise ProviderError(f"{provider} request failed: {exc}") from exc
@@ -337,6 +342,26 @@ class ProviderRegistry:
         limit = (agent.max_turns or settings.api_agent_max_turns or (None if watch else UNWATCHED_TURNS)) if agent else 1
         interval = settings.progress_check_minutes * 60
         next_check, seen = time.monotonic() + interval, []
+
+        async def stepped(state):
+            """``step(state)``, with the check still made while one request takes long: a
+            provider that never answers is otherwise only noticed after its read timeout and
+            retries, many minutes later."""
+            nonlocal next_check
+            pending, started = asyncio.ensure_future(step(state)), time.monotonic()
+            try:
+                while watch:
+                    done, _ = await asyncio.wait({pending}, timeout=max(0.0, next_check - time.monotonic()))
+                    if done:
+                        break
+                    waiting = progress.WAITING.format(minutes=(time.monotonic() - started) / 60)
+                    if reason := await watch(f"{progress.api_evidence(turn, seen)}\n{waiting}"):
+                        raise ProviderError(f"{model_id} {progress.STOPPED}{reason}")
+                    next_check = time.monotonic() + interval
+                return await pending
+            finally:
+                if not pending.done():
+                    pending.cancel()
         try:
             # One turn past the limit: the model's chance to answer with a progress summary.
             for turn in itertools.count(1) if limit is None else range(1, limit + 2 if agent else 2):
@@ -344,14 +369,14 @@ class ProviderRegistry:
                 if spend_ok and not spend_ok(model_id, total_in, total_out):
                     raise BudgetExceeded("已达到任务可用的预算，模型调用被中止。")
                 try:
-                    text, calls, used_in, used_out, truncated = await step(state)
+                    text, calls, used_in, used_out, truncated = await stepped(state)
                 except ProviderError as exc:
                     if not (resumed and turn == 1 and " returned 400" in str(exc)):
                         raise
                     # The provider would not take the continued conversation: start afresh.
                     state = conversation.state = fresh
                     resumed = False
-                    text, calls, used_in, used_out, truncated = await step(state)
+                    text, calls, used_in, used_out, truncated = await stepped(state)
                 state["calls"] = calls
                 total_in, total_out = total_in + used_in, total_out + used_out
                 if record := getattr(spend_ok, "record", None):

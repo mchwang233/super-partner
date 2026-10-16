@@ -22,6 +22,8 @@ class Stopped(RuntimeError):
 
 # How the error of a stopped attempt reads.
 STOPPED = "进度检查判断这次尝试卡住，已停止："
+# Told to the checker when the model has not answered its latest request yet.
+WAITING = "It is now waiting for its model's reply to one request: {minutes:.0f} minutes so far, nothing back yet."
 # A work package past twice its expected turns goes to the task's lead (supervisor.overrun_message),
 # and again at every further multiple; how the error reads when the lead stops it.
 OVERRUN_FACTOR = 2
@@ -52,7 +54,8 @@ def check_prompt(node: TaskNode, minutes: float, evidence: str) -> str:
         "Long work that keeps moving (new files, fixes, checks that change) is fine: let it continue. "
         "It is stuck when it repeats the same calls or commands, fails the same way again and again "
         "without changing approach, waits on something that will not come (a server that never "
-        "starts, a prompt nobody answers), or has drifted away from the step. When in doubt, continue.\n"
+        "starts, a prompt nobody answers, a model reply that has not come for more than 8 minutes), "
+        "or has drifted away from the step. When in doubt, continue.\n"
         "End with exactly one line: `VERDICT: CONTINUE` or `VERDICT: STOP: <why, in Chinese>`."
     )
 

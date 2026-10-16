@@ -41,12 +41,17 @@ class Settings(BaseSettings):
     api_agent_max_output_tokens: int = Field(default=32768, ge=1024, le=262144)
     # How hard DeepSeek's reasoning models think (its `reasoning_effort`); "none" turns thinking
     # off. Higher is slower and spends more output tokens, and gets harder problems right.
-    # A project brief (briefing.py) written by a cheap model and given to every step, so models
-    # do not each read the project again; and the full text of the files a step most likely needs.
+    # A project brief (briefing.py) written by a cheap model for the lead to plan from.
     project_brief: bool = True
+    # Models used only for helper work (the project brief, reviews, progress checks), never to
+    # run a task's steps or lead it: glm-5.3-flash leaves tool-calling requests unanswered.
+    helper_only_models: list[str] = Field(default_factory=lambda: ["glm:glm-5.3-flash"])
     deepseek_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] = "max"
     # Seconds to wait for one API response; long outputs take minutes to generate.
     api_request_timeout: float = Field(default=600, ge=30)
+    # A response not complete after this many seconds, even if data keeps arriving, fails at
+    # once without a retry: its model counts as unavailable for a while, and another takes over.
+    api_reply_deadline: float = Field(default=300, ge=30)
     # Local TCP ports that API models' sandboxed commands may still reach, such as an EDA
     # license server: lmgrd's port plus its vendor daemon's, which must be pinned in the license
     # file (VENDOR snpslmd port=...). All other network access stays blocked. Needs socat.
