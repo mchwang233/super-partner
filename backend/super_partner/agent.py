@@ -24,12 +24,19 @@ from urllib.parse import urlsplit
 
 from . import environment
 from .config import settings
-from .quality import review_path
+from .quality import SKIP_DIRS, review_path
 from .secrets import SECRET_ENV
 
 # Large enough that a long file is read in one or two calls instead of many.
 MAX_TOOL_OUTPUT = 48_000
-MAX_READ_LINES = 1200
+# A source file is read whole in one call: each extra call is another full model turn.
+MAX_READ_LINES = 3000
+MAX_READ_CHARS = 120_000
+# The project map at the start of an attempt (project_map).
+MAX_MAPPED_FILES = 300
+MAX_COUNTED_BYTES = 1_000_000
+BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tar", ".woff",
+                   ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".wav", ".so", ".pyc", ".db", ".sqlite", ".sqlite3"}
 MAX_LISTED = 500
 COMMAND_TIMEOUT = 120
 MAX_COMMAND_TIMEOUT = 300
@@ -105,7 +112,10 @@ NETWORK_NOTE = (
 BATCH_NOTE = (
     "A turn may hold several tool calls, so batch independent ones: read all the files you need at "
     "once, write several files at once, and write each file whole in a single write_file call "
-    "instead of in pieces. Do not re-check work that already passed."
+    "instead of in pieces. read_file returns up to " + str(MAX_READ_LINES) + " lines, so read a file "
+    "whole in one call rather than in ranges, and do not read a file again unless it changed. "
+    "run_command returns the command's output to you, so do not redirect output to files to read "
+    "them afterwards. Do not re-check work that already passed."
 )
 TURN_NOTE = "\n\nYou have at most {limit} turns of tool calls. " + BATCH_NOTE
 REVIEW_INSTRUCTIONS = (
@@ -193,11 +203,52 @@ def tools_for(sandboxed: bool, read_only: bool = False) -> list[dict]:
     )]
 
 
-def _clip(text: str, tail: bool = False) -> str:
-    if len(text) <= MAX_TOOL_OUTPUT:
+def _clip(text: str, tail: bool = False, limit: int = MAX_TOOL_OUTPUT) -> str:
+    if len(text) <= limit:
         return text
-    note = f"[... {len(text) - MAX_TOOL_OUTPUT} more characters clipped]"
-    return note + "\n" + text[-MAX_TOOL_OUTPUT:] if tail else text[:MAX_TOOL_OUTPUT] + "\n" + note
+    note = f"[... {len(text) - limit} more characters clipped]"
+    return note + "\n" + text[-limit:] if tail else text[:limit] + "\n" + note
+
+
+def project_map(root: Path) -> str:
+    """The files of a working directory with their line counts, given at the start of an
+    attempt so the model reads what it needs straight away instead of exploring folder by
+    folder. Binary files are summed up per folder; hidden and build folders are left out."""
+    texts, binaries, more = [], {}, 0
+    for folder, dirs, names in os.walk(root):
+        dirs[:] = sorted(name for name in dirs if name not in SKIP_DIRS and not name.startswith("."))
+        for name in sorted(names):
+            if name.startswith("."):
+                continue
+            path = Path(folder, name)
+            relative = path.relative_to(root).as_posix()
+            try:
+                size = path.stat().st_size
+                if path.suffix.lower() in BINARY_SUFFIXES:
+                    raise ValueError
+                if size > MAX_COUNTED_BYTES:
+                    texts.append(f"{relative} ({size // 1024} KB)")
+                    continue
+                data = path.read_bytes()
+                if b"\0" in data[:4096]:
+                    raise ValueError
+            except ValueError:
+                binaries.setdefault(Path(relative).parent.as_posix(), []).append(path.suffix.lower() or name)
+                continue
+            except OSError:
+                continue
+            if len(texts) >= MAX_MAPPED_FILES:
+                more += 1
+                continue
+            count = data.count(b"\n") + (bool(data) and not data.endswith(b"\n"))
+            texts.append(f"{relative} ({count} lines)")
+    if not texts and not binaries:
+        return ""
+    lines = [*texts, *(f"{folder}/: {len(kinds)} binary files ({', '.join(sorted(set(kinds)))})"
+                       for folder, kinds in sorted(binaries.items()))]
+    if more:
+        lines.append(f"... {more} more files")
+    return "Files in the working directory (hidden folders not listed):\n" + "\n".join(lines)
 
 
 class Workspace:
@@ -309,7 +360,7 @@ class Workspace:
         if tail:
             start = max(1, total - len(chunk) + 1)
         note = f"\n[lines {start}-{start + len(chunk) - 1} of {total}]" if total > len(chunk) else ""
-        return _clip("\n".join(chunk), tail=tail) + note
+        return _clip("\n".join(chunk), tail=tail, limit=MAX_READ_CHARS) + note
 
     def write_file(self, raw, content) -> str:
         self._require_write()

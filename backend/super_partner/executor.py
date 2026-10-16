@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import quality, supervisor
+from . import progress, quality, supervisor
+from .agent import project_map
 from .budget import BudgetExceeded, RequestBudget
 from .cli_channels import CLI_SPECS
 from .config import settings
@@ -16,7 +17,7 @@ from .leading import Leading
 from .models import Diagnosis, Event, ExecutionRun, NodeAttempt, NodeStatus, Outcome, RunStatus
 from .platform_repair import PlatformRepairs
 from .projects import git_snapshot
-from .providers import ProviderRegistry
+from .providers import Conversation, ProviderRegistry
 from .quota import ModelUnavailable, failure_kind
 from .recovery import retry_model, turns_for
 from .review import Reviewing
@@ -28,6 +29,11 @@ TURN_LIMIT_HINT = "轮工具调用后仍未完成"
 
 # Diagnosis report kept with a step that cannot be done.
 MAX_UNABLE_REPORT = 1500
+# A step's conversation is continued while it is under this share of its model's context window
+# (counting roughly three characters a token); a longer one starts afresh with notes.
+CONTINUE_SHARE = 0.5
+CHARS_PER_TOKEN = 3
+DEFAULT_CONTEXT = 128_000
 
 
 class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
@@ -50,6 +56,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         self.node_tasks: dict[tuple[str, str], asyncio.Task] = {}
         # Tool calls of each node's attempt in progress, written onto the attempt when it ends.
         self.tool_logs: dict[tuple[str, str], list[dict]] = {}
+        # Each step's conversation with its API model, continued by its next attempt.
+        self.conversations: dict[tuple[str, str], Conversation] = {}
         self.reservations: dict[str, dict] = {}
         self.budget_events: dict[str, asyncio.Event] = {}
         # Shared environment repairs must not overwrite one another across projects.
@@ -156,6 +164,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
                 run.final_result = self._final_result(run)
                 self._save(run)
                 self.emit(run.id, "run.succeeded", actual_cost_usd=run.actual_cost_usd)
+                self._forget(run_id)
                 return
         except asyncio.CancelledError:
             await self._stop_nodes(running)
@@ -277,6 +286,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
                 raise self.providers.quota.error(node.model_id)
             result, changed, cost, workspace = await self._work(
                 run, node, node.model_id or "mock:local", prompt, self._fallback_allowed(run, node),
+                self._conversation(run, node),
             )
             work_accounted = result.accounted_cost_usd
             latest = self.db.get_run(run_id)
@@ -313,6 +323,29 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
                                accounted=getattr(exc, "accounted_cost_usd", 0.0))
         finally:
             self.node_tasks.pop((run_id, node_id), None)
+
+    def _conversation(self, run: ExecutionRun, node) -> Conversation:
+        """The step's conversation with its model, set to continue when its last attempt can be
+        continued: same model, not stopped as stuck, nothing upstream redone since, and still
+        well within the model's context window. Otherwise a new one."""
+        key = (run.id, node.id)
+        held, last = self.conversations.get(key), node.attempts[-1] if node.attempts else None
+        model = self.model_lookup.get(node.model_id)
+        upstream = [item.attempts[-1].finished_at for item in run.plan.nodes
+                    if item.id in node.dependencies and item.attempts]
+        if (held and last and held.model_id == node.model_id
+                and last.outcome not in {Outcome.SUPERSEDED, Outcome.CANCELLED}
+                and progress.STOPPED not in (last.reason or "")
+                and not any(finished > last.finished_at for finished in upstream)
+                and held.size() < CONTINUE_SHARE * CHARS_PER_TOKEN * (getattr(model, "context_window", None) or DEFAULT_CONTEXT)):
+            held.followup = quality.continue_prompt(node, run)
+            return held
+        self.conversations[key] = Conversation()
+        return self.conversations[key]
+
+    def _forget(self, run_id: str) -> None:
+        for key in [key for key in self.conversations if key[0] == run_id]:
+            del self.conversations[key]
 
     def refresh_model(self, run, node):
         """Revalidate a stored selection immediately before confirming or executing it."""
@@ -387,9 +420,11 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
             self.emit(run.id, "node.model_switched", node_id=node.id, model_id=exc.model_id,
                       next_model_id=node.model_id, until=exc.until.isoformat(), **context)
 
-    async def _work(self, run: ExecutionRun, node, model_id: str, prompt: str, fallback: bool):
+    async def _work(self, run: ExecutionRun, node, model_id: str, prompt: str, fallback: bool,
+                    conversation: Optional[Conversation] = None):
         """Have ``model_id`` do ``node`` in its working folder: the user's project or the
-        task's scratch folder. Returns (result, changed files, cost, working folder)."""
+        task's scratch folder. Returns (result, changed files, cost, working folder).
+        ``conversation`` continues the step's last attempt when it holds a followup."""
         in_project = bool(run.project_dir and node.needs_workspace)
         if in_project:
             prompt = (
@@ -404,6 +439,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
         act = bool(model and model.channel != "cli" and can_act(model))
         uses_files = model_id.startswith("cli:") or act
         before = await asyncio.to_thread(quality.file_state, workspace) if uses_files else {}
+        if act and (files := await asyncio.to_thread(project_map, workspace)):
+            # Read what it needs straight away instead of exploring folder by folder.
+            prompt = f"{prompt}\n\n{files}"
         async with contextlib.AsyncExitStack() as stack:
             if in_project:
                 # CLI agents editing the same checkout concurrently would clobber each other.
@@ -413,6 +451,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
                 run, node, model_id, prompt, workspace, allow_api_fallback=fallback and not in_project,
                 attachments=run.attachments, act=act, max_turns=turns_for(node), tool_log=log,
                 watch=self._progress_watch(run, node, model_id),
+                **({"conversation": conversation} if conversation else {}),
             )
             try:
                 after = await asyncio.to_thread(quality.file_state, workspace) if uses_files else {}

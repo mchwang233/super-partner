@@ -91,17 +91,10 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
     if node.feedback:
         previous = f"\n\nYour previous result:\n{node.result[:limit]}" if node.result else ""
         sections.append(f"A previous attempt was not accepted. Fix these problems:\n{node.feedback}{previous}")
-    replied = sorted((d for d in run.diagnoses if d.messages), key=lambda d: d.messages[-1].created_at)
-    if replied:
-        clarifications = []
-        for diagnosis in replied[-5:]:
-            for message in diagnosis.messages[-3:]:
-                clarifications.append(
-                    f"Question: {diagnosis.question or 'Additional instructions'}\n"
-                    f"User's choice: {message.choice or '(free text)'}\nUser's reply: {message.text}"
-                )
-        sections.append("User clarifications during diagnosis; preserve these when continuing the original task:\n"
-                        + "\n\n".join(clarifications))
+    if notes := attempt_notes(node):
+        sections.append(notes)
+    if clarifications := _clarifications(run):
+        sections.append(clarifications)
     upstream = []
     for dependency in node.dependencies:
         item = by_id.get(dependency)
@@ -122,13 +115,73 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
         sections.append("Other steps of this task, not yours: " + "; ".join(others[:MAX_OTHER_STEPS]))
     sections.append(UNABLE_RULE)
     if node.verifies:
-        checked = ", ".join(by_id[item].title for item in node.verifies if item in by_id)
-        sections.append(
-            f"You are verifying: {checked}. Check the work against its requirements. End your answer "
-            "with one final line, exactly `VERDICT: PASS` if it is acceptable, or "
-            "`VERDICT: FAIL: <the specific problems to fix>`."
-        )
+        sections.append(_verdict_rule(node, by_id))
     return "\n\n".join(sections), inputs
+
+
+def _verdict_rule(node: TaskNode, by_id: dict) -> str:
+    checked = ", ".join(by_id[item].title for item in node.verifies if item in by_id)
+    return (f"You are verifying: {checked}. Check the work against its requirements. End your answer "
+            "with one final line, exactly `VERDICT: PASS` if it is acceptable, or "
+            "`VERDICT: FAIL: <the specific problems to fix>`.")
+
+
+def _clarifications(run: ExecutionRun) -> str:
+    replied = sorted((d for d in run.diagnoses if d.messages), key=lambda d: d.messages[-1].created_at)
+    clarifications = [
+        f"Question: {diagnosis.question or 'Additional instructions'}\n"
+        f"User's choice: {message.choice or '(free text)'}\nUser's reply: {message.text}"
+        for diagnosis in replied[-5:] for message in diagnosis.messages[-3:]
+    ]
+    return ("User clarifications during diagnosis; preserve these when continuing the original task:\n"
+            + "\n\n".join(clarifications)) if clarifications else ""
+
+
+def attempt_notes(node: TaskNode) -> str:
+    """What the step's last attempt did, from its tool calls, so a new attempt that cannot
+    continue its conversation (another model, say) starts from there instead of from nothing."""
+    if not node.attempts or not node.attempts[-1].tool_calls:
+        return ""
+    attempt = node.attempts[-1]
+
+    def files(*tools):
+        return list(dict.fromkeys(call.detail.split(" (", 1)[0] for call in attempt.tool_calls
+                                  if call.tool in tools and call.ok))
+    changed = files("write_file", "edit_file")
+    read = [path for path in files("read_file") if path not in changed]
+    commands = [f"{'ok' if call.ok else 'failed'}: {call.detail}" for call in attempt.tool_calls
+                if call.tool == "run_command"][-MAX_NOTED_COMMANDS:]
+    lines = [(f"What the previous attempt did ({attempt.model_id}, {attempt.turns} turns), which ended: "
+              f"{(attempt.reason or attempt.outcome)[:300]}")]
+    if changed:
+        lines.append("Files it wrote or edited (still in the working directory): " + ", ".join(changed[:MAX_NOTED_FILES]))
+    if read:
+        lines.append("Files it read: " + ", ".join(read[:MAX_NOTED_FILES]))
+    if commands:
+        lines.append("Its last commands:\n" + "\n".join(commands))
+    lines.append("Continue from its changes rather than starting over, and read only what you need.")
+    return "\n".join(lines)
+
+
+def continue_prompt(node: TaskNode, run: ExecutionRun) -> str:
+    """The message that continues a step's conversation with its model in a new attempt."""
+    attempt = node.attempts[-1]
+    sections = [(f"This step continues in a new attempt. Your previous attempt ended "
+                 f"({attempt.outcome}): {(attempt.reason or '')[:500]}")]
+    if node.feedback:
+        sections.append(f"Fix these problems:\n{node.feedback}")
+    if clarifications := _clarifications(run):
+        sections.append(clarifications)
+    sections.append("Everything you changed is still in the working directory. Do not redo finished work, and "
+                    "do not read files again that you have already read unless they changed. Finish the step, "
+                    "then answer without calling a tool with a summary of what you did and verified.")
+    if node.verifies:
+        sections.append(_verdict_rule(node, {item.id: item for item in run.plan.nodes}))
+    return "\n\n".join(sections)
+
+
+MAX_NOTED_FILES = 40
+MAX_NOTED_COMMANDS = 12
 
 
 def rework_feedback(feedback: Optional[str]) -> str:

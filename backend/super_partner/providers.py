@@ -39,6 +39,38 @@ class ProviderResult:
     turn_limit: bool = False
 
 
+@dataclass
+class Conversation:
+    """An acting API model's conversation for one step, kept so that the step's next attempt
+    with the same model continues it, with ``followup`` as the next message, instead of
+    starting over and reading the project again. Only OpenAI-compatible providers continue
+    one; with others, or another model, the attempt starts afresh."""
+    model_id: str | None = None
+    # Set by the caller before an attempt that should continue the conversation.
+    followup: str | None = None
+    # The tool loop's state (see _loop): its history, and the last turn's calls, their
+    # results or the final answer, whichever had not reached the history when it ended.
+    state: dict | None = None
+
+    def size(self) -> int:
+        """Characters of the conversation so far, to tell whether continuing it still fits."""
+        return len(json.dumps((self.state or {}).get("history") or [], ensure_ascii=False))
+
+
+# What a tool call that never ran returns when its conversation is continued.
+NOT_RUN = "Not run: the attempt was interrupted before this call ran."
+
+
+def _reopen(state: dict, followup: str) -> None:
+    """Make an OpenAI-format conversation that ended (finished, interrupted, or cut off before
+    its tool calls ran) ready to take ``followup`` as the next user message."""
+    if not state.get("results") and state.get("calls") and (state["history"] or [{}])[-1].get("tool_calls"):
+        state["results"] = [(call_id, name, NOT_RUN) for call_id, name, _args in state["calls"]]
+    if final := state.pop("final", None):
+        state["history"].append({"role": "assistant", "content": final})
+    state["calls"], state["followup"] = None, followup
+
+
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504, 529}
 # The floor a cap the model rejects is retried down to.
 PLAIN_OUTPUT_TOKENS = 4096
@@ -149,14 +181,15 @@ class ProviderRegistry:
         act: bool = False, spend_ok: Optional[Callable[[str, int, int], bool]] = None,
         repair: bool = False, max_turns: Optional[int] = None, tool_log: Optional[list] = None,
         network: bool = False, review_workspace: Optional[Path] = None, review_files: list[str] = (),
-        watch: Optional[progress.Watch] = None,
+        watch: Optional[progress.Watch] = None, conversation: Optional[Conversation] = None,
     ) -> ProviderResult:
         """One model call. With ``act``, an API model works on ``workspace`` through tools
         (see agent.py) until it is done; ``spend_ok(model_id, input, output)`` can stop it.
         ``repair`` lets the model's commands leave the sandbox to fix the environment;
         ``network`` lets sandboxed commands reach the internet for a task that allows it.
         ``review_workspace`` gives API reviewers only safe file reads, independently of act/repair.
-        ``watch`` checks a long call from time to time instead of a turn limit or a timeout."""
+        ``watch`` checks a long call from time to time instead of a turn limit or a timeout.
+        ``conversation`` keeps an acting model's conversation so a later attempt can continue it."""
         provider, model = model_id.split(":", 1)
         attachments = list(attachments)
         if provider == "cli":
@@ -217,7 +250,8 @@ class ProviderRegistry:
             return await self._anthropic(model, prompt, images, agent, spend_ok)
         if provider == "google":
             return await self._gemini(model, prompt, images, agent, spend_ok)
-        return await self._openai_compatible(provider, model, prompt, images, agent, spend_ok)
+        return await self._openai_compatible(provider, model, prompt, images, agent, spend_ok,
+                                             conversation if agent else None)
 
     async def test_provider(self, provider: str) -> str:
         urls = {
@@ -270,19 +304,29 @@ class ProviderRegistry:
             await asyncio.sleep(min(delay, self.retry_max_delay))
         raise AssertionError("unreachable")
 
-    async def _loop(self, provider: str, model: str, prompt: str, images, agent, spend_ok, step):
+    async def _loop(self, provider: str, model: str, prompt: str, images, agent, spend_ok, step,
+                    conversation: Optional[Conversation] = None):
         """Call the model, run the tools it asks for, and call again until it stops asking.
 
         ``step(state)`` makes one request and returns (text, tool_calls, input, output,
         truncated); ``tool_calls`` are (id, name, arguments) and their results go back via
         ``state``. ``truncated`` means the output hit its token cap. Without a workspace this is
-        a single plain call.
+        a single plain call. With ``conversation`` (OpenAI format only), the state is kept
+        there, and a conversation of this model with a ``followup`` is continued with it.
         """
         model_id = f"{provider}:{model}"
         tools = agent_tools.tools_for(agent_tools.sandbox_available(), read_only=agent.read_only) if agent else []
         if agent:
             prompt = f"{agent.instructions()}\n\n{prompt}"
-        state = {"prompt": prompt, "images": images, "tools": tools, "history": None, "results": None}
+        state = fresh = {"prompt": prompt, "images": images, "tools": tools, "history": None, "results": None}
+        resumed = bool(conversation and conversation.model_id == model_id and conversation.followup
+                       and conversation.state and conversation.state.get("history"))
+        if resumed:
+            state = conversation.state
+            state["tools"] = tools
+            _reopen(state, conversation.followup)
+        if conversation:
+            conversation.model_id, conversation.state, conversation.followup = model_id, state, None
         total_in = total_out = turn = 0
         # Without a limit (the default) a long attempt is checked instead (progress.py).
         watch = getattr(agent, "watch", None)
@@ -295,7 +339,16 @@ class ProviderRegistry:
                 final = bool(agent) and limit is not None and turn > limit
                 if spend_ok and not spend_ok(model_id, total_in, total_out):
                     raise BudgetExceeded("已达到任务可用的预算，模型调用被中止。")
-                text, calls, used_in, used_out, truncated = await step(state)
+                try:
+                    text, calls, used_in, used_out, truncated = await step(state)
+                except ProviderError as exc:
+                    if not (resumed and turn == 1 and " returned 400" in str(exc)):
+                        raise
+                    # The provider would not take the continued conversation: start afresh.
+                    state = conversation.state = fresh
+                    resumed = False
+                    text, calls, used_in, used_out, truncated = await step(state)
+                state["calls"] = calls
                 total_in, total_out = total_in + used_in, total_out + used_out
                 if record := getattr(spend_ok, "record", None):
                     await record(model_id, used_in, used_out)
@@ -309,6 +362,7 @@ class ProviderRegistry:
                         "（output truncated by length），没有给出完整回答或工具调用。"
                     )
                 if not calls or not agent:
+                    state["final"] = text
                     return ProviderResult(text or "", total_in, total_out, model_id, turns=_turns(turn, limit), turn_limit=final)
                 if final:
                     raise ProviderError(f"{model_id} {TURN_LIMIT_MARK.format(limit=limit)}，最后也没有交出进度总结。")
@@ -373,6 +427,7 @@ class ProviderRegistry:
 
     async def _openai_compatible(
         self, provider: str, model: str, prompt: str, images: list[Attachment] = (), agent=None, spend_ok=None,
+        conversation: Optional[Conversation] = None,
     ) -> ProviderResult:
         urls = {
             "openai": "https://api.openai.com/v1/chat/completions",
@@ -393,8 +448,10 @@ class ProviderRegistry:
                         "url": f"data:{item.media_type};base64,{files.image_data(item)}",
                     }} for item in state["images"]),
                 ] if state["images"] else state["prompt"]}]
-            for call_id, _name, output in state["results"] or []:
+            for call_id, _name, output in state.pop("results", None) or []:
                 state["history"].append({"role": "tool", "tool_call_id": call_id, "content": output})
+            if followup := state.pop("followup", None):
+                state["history"].append({"role": "user", "content": followup})
             body = {"model": model, "messages": state["history"], **self._reasoning(provider, model)}
             if state["tools"]:
                 body["tools"] = [{"type": "function", "function": tool} for tool in state["tools"]]
@@ -423,7 +480,7 @@ class ProviderRegistry:
                 choice.get("finish_reason") == "length",
             )
 
-        return await self._loop(provider, model, prompt, images, agent, spend_ok, step)
+        return await self._loop(provider, model, prompt, images, agent, spend_ok, step, conversation)
 
     async def _anthropic(self, model: str, prompt: str, images: list[Attachment] = (), agent=None, spend_ok=None) -> ProviderResult:
         async def step(state):

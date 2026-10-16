@@ -224,7 +224,7 @@ async def test_rework_cancels_and_reexecutes_inflight_consumers(tmp_path):
     calls = {key: 0 for key in ["a", "b", "v", "c"]}
     cancelled = []
 
-    async def work(current, item, mid, prompt, fallback):
+    async def work(current, item, mid, prompt, fallback, conversation=None):
         calls[item.id] += 1
         if item.id == "a":
             text = "a-v2"

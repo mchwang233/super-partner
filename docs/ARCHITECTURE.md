@@ -39,11 +39,11 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Repairing Super Partner itself (flow) | `self_repair.py` (mixed into `Executor`) | `_fix_platform`, `_activate_platform`, `_hold_for_platform`, `restore_platform` |
 | Changing a running task's plan at the lead's decision | `replan.py` | `change_plan`, `PlanError` |
 | What happens after a failure without a lead (fallback: retry model, meaning of a diagnosis) | `recovery.py` | `retry_model`, `failed_models`, `after_diagnosis`, `turns_for`, `MODEL_FAILURES` |
-| Prompts for steps and reviews, verdict parsing | `quality.py` | `node_prompt`, `review_prompt`, `parse_review`, `UNABLE_RULE`, `unable_claim`, `retry_feedback` |
+| Prompts for steps and reviews, verdict parsing | `quality.py` | `node_prompt`, `continue_prompt`, `attempt_notes`, `review_prompt`, `parse_review`, `UNABLE_RULE`, `unable_claim`, `retry_feedback` |
 | Diagnosis prompts and parsing | `diagnosis.py` | `prompt`, `repair_prompt`, `platform_instructions`, `parse`, `STATUS` |
-| API model calls, output caps, tool loop | `providers.py` | `ProviderRegistry.complete`, `_send`, `output_ceiling`, `_loop` |
+| API model calls, output caps, tool loop | `providers.py` | `ProviderRegistry.complete`, `_send`, `output_ceiling`, `_loop`, `Conversation` (a step's next attempt continues it; chosen by `Executor._conversation`) |
 | CLI model calls and their sandboxes | `cli_channels.py` | `CliChannelRegistry.complete`, `_with_network`, `repair_command` |
-| Tools and sandbox for API models | `agent.py` | `Workspace`, `sandbox_args`, `network_prefix` |
+| Tools and sandbox for API models | `agent.py` | `Workspace`, `project_map` (file list given at the start of an attempt), `sandbox_args`, `network_prefix` |
 | Checking long attempts instead of turn limits and timeouts | `progress.py` | `check_prompt`, `parse`, `api_evidence`, `cli_evidence`, `Stopped`; the check itself is `Executor._progress_watch` (review.py) |
 | Per-request budget reservations | `budget.py` | `RequestBudget.reserve` |
 | Quota / outage detection and cooldown | `quota.py` | `QuotaTracker.classify`, `mark`, `exhausted` |
