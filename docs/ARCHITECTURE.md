@@ -23,11 +23,14 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Area | Module | Key names |
 |---|---|---|
 | HTTP API, task lifecycle endpoints | `api.py` | `create_task`, `follow_up_task`, `resume_task`, `reopen_node`, `reply_to_diagnosis`, `set_network_access` |
-| Records and statuses | `models.py` | `RunStatus`, `NodeStatus`, `FINISHED`, `TaskNode`, `NodeAttempt`, `Diagnosis`, `ExecutionRun` |
+| Records and statuses | `models.py` | `RunStatus`, `NodeStatus`, `Outcome` (attempt outcomes), `DiagnosisStatus`, `FINISHED`, `TaskNode`, `NodeAttempt`, `Diagnosis`, `ExecutionRun` |
 | Storage (SQLite, JSON bodies) | `db.py` | `Database.save_run`, `get_run`, events |
 | Planning | `planner.py` | `autonomous_plan`, `_validate_plan` |
 | Model choice | `routing.py` | `route_node` (first pick), `strongest_for` (retry), `stronger_than` (escalation), `pick_reviewer`, `diagnosers` |
-| Scheduling, attempts, diagnosis flow, platform repair flow | `executor.py` | see "Executor" below |
+| Scheduling, attempts, step outcomes | `executor.py` | `Executor`; see "Executor" below |
+| Reviewing a result | `review.py` (mixed into `Executor`) | `_check`, `_reviewer`, `MAX_BACKUPS` |
+| Diagnosing failures and acting on them | `diagnosing.py` (mixed into `Executor`) | `_repair`, `_diagnose_with`, `_repair_done`, `begin_diagnosis`, `_run_diagnosis` |
+| Repairing Super Partner itself (flow) | `self_repair.py` (mixed into `Executor`) | `_fix_platform`, `_activate_platform`, `_hold_for_platform`, `restore_platform` |
 | What happens after a failure (retry model, meaning of a diagnosis) | `recovery.py` | `retry_model`, `failed_models`, `after_diagnosis`, `turns_for`, `MODEL_FAILURES` |
 | Prompts for steps and reviews, verdict parsing | `quality.py` | `node_prompt`, `review_prompt`, `parse_review`, `UNABLE_RULE`, `unable_claim`, `retry_feedback` |
 | Diagnosis prompts and parsing | `diagnosis.py` | `prompt`, `repair_prompt`, `platform_instructions`, `parse`, `STATUS` |
@@ -42,20 +45,23 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Results listing, ZIP, GitHub publish | `publish.py` | `SKIP`, `result_markdown` |
 | Settings (env `SUPER_PARTNER_*`) | `config.py` | `settings` |
 
-## Executor (`executor.py`)
+## Executor
+
+`Executor` (`executor.py`) mixes in `Reviewing` (`review.py`), `Diagnosing` (`diagnosing.py`) and
+`SelfRepair` (`self_repair.py`); they share its state (`db`, `locks`, `_complete`, `_save`, `emit`).
 
 - `execute` / `_dispatch`: the run loop; starts ready nodes up to `max_parallel_nodes`.
 - `_execute_node`: one attempt; exceptions map to outcomes (`budget`, `error`, quota → `_switch_model`).
-- `_check`: review or verification verdict; `quality.Verdict(passed, reason, fix, unable, ...)`.
-- `_finish`: appends the `NodeAttempt`; outcome is one of `passed`, `rejected`, `verify_failed`,
-  `unverified`, `unable`, `error`, `budget`, `superseded`, `cancelled`, `quota`, `unavailable`.
-- After a failure: `_repair` (when `auto_diagnose`) then `_repair_done`, which carries out
+- `_check` (review.py): review or verification verdict; `quality.Verdict(passed, reason, fix, unable, ...)`.
+- `_finish`: appends the `NodeAttempt` with an `Outcome`.
+- After a failure: `_repair` (when `auto_diagnose`) then `_repair_done` (diagnosing.py), which carries out
   `recovery.after_diagnosis(outcome, status)`: hold for a platform repair, ask the user, switch
   model, retry after an environment fix, mark unable (`_mark_unable`), pause, or retry.
 - `_retry_or_fail`: counts the failure and fails the node or retries it on
   `recovery.retry_model` (a model that failed the node twice in a row gives way).
 - `_send_back`: a failed verification reopens the verified steps (rework rounds).
-- `_fix_platform` → `platform_repair.check` → `_activate_platform`: self-repair, applied by restart.
+- `_fix_platform` → `platform_repair.check` → `_activate_platform` (self_repair.py): self-repair,
+  applied by restart.
 
 ## Tests
 

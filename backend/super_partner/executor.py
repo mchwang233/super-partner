@@ -2,55 +2,37 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
-import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from uuid import uuid4
 
-from . import agent as agent_tools
-from . import environment, quality
+from . import quality
 from .budget import BudgetExceeded, RequestBudget
 from .cli_channels import CLI_SPECS
 from .config import settings
 from .db import Database
-from .diagnosis import interaction, repair_prompt, user_action
-from .diagnosis import parse as parse_diagnosis
-from .diagnosis import prompt as diagnosis_prompt
-from .models import Diagnosis, Event, ExecutionRun, NodeAttempt, NodeStatus, RunStatus
-from .platform_repair import PlatformRepairs, RepairError, repair_guide
+from .diagnosing import Diagnosing
+from .models import Diagnosis, Event, ExecutionRun, NodeAttempt, NodeStatus, Outcome, RunStatus
+from .platform_repair import PlatformRepairs
 from .projects import git_snapshot
 from .providers import ProviderRegistry
 from .quota import ModelUnavailable, failure_kind
-from .recovery import MAX_ENVIRONMENT_FIXES, after_diagnosis, retry_model, turns_for
-from .routing import (
-    NoEligibleModelError,
-    can_act,
-    diagnosers,
-    eligible_for_node,
-    node_cost,
-    pick_diagnoser,
-    pick_reviewer,
-    route_node,
-)
+from .recovery import retry_model, turns_for
+from .review import Reviewing
+from .routing import NoEligibleModelError, can_act, eligible_for_node, node_cost, route_node
+from .self_repair import SelfRepair
 
 # How a model call that ran out of turns reads in an attempt's reason (providers.TURN_LIMIT_MARK).
 TURN_LIMIT_HINT = "轮工具调用后仍未完成"
 
-
 # Diagnosis report kept with a step that cannot be done.
 MAX_UNABLE_REPORT = 1500
-# Models tried in turn for one repair when the previous one fails.
-MAX_DIAGNOSERS = 3
-# Reviewers tried in turn when one is out of quota.
-MAX_BACKUPS = 3
-# A membership CLI installing software can take a while.
-REPAIR_TIMEOUT = 1800
 
 
-class Executor:
+class Executor(Reviewing, Diagnosing, SelfRepair):
+    """Runs a task's steps: scheduling, attempts, retries and step outcomes. Reviewing
+    (review.py), diagnosing (diagnosing.py) and self-repair (self_repair.py) are mixed in."""
+
     def __init__(self, db: Database, providers: ProviderRegistry, model_lookup: dict):
         self.db = db
         self.providers = providers
@@ -298,7 +280,7 @@ class Executor:
             if latest:
                 current = next(n for n in latest.plan.nodes if n.id == node_id)
                 if len(current.attempts) == len(node.attempts):
-                    current.attempts.append(NodeAttempt(model_id=node.model_id, outcome="superseded" if current.generation != generation else "cancelled",
+                    current.attempts.append(NodeAttempt(model_id=node.model_id, outcome=Outcome.SUPERSEDED if current.generation != generation else Outcome.CANCELLED,
                                                         reason="上游返工或任务取消，调用已停止。", cost_usd=getattr(exc, "accounted_cost_usd", 0.0)))
                 self._save(latest)
                 if current.generation != generation:
@@ -428,80 +410,6 @@ class Executor:
         cost = self._actual_cost(result, node, None if model_id == node.model_id else model_id)
         return result, quality.changed_files(before, after), cost, workspace
 
-    async def _check(self, run: ExecutionRun, node, text: str, changed: list[str], workspace: Optional[Path]) -> quality.Verdict:
-        """Accept or reject a result: verification nodes give their own verdict; others are
-        reviewed by another model against the node's acceptance criteria. A result whose model
-        says part of the task cannot be done here is not accepted, whatever else it did."""
-        claim = quality.unable_claim(text)
-        if claim:
-            return quality.Verdict(False, f"无法完成：{claim}", fix=claim, unable=claim)
-        if node.verifies:
-            verdict = quality.verification_verdict(text)
-            if verdict is None:
-                return quality.Verdict(False, "验证结果没有给出 VERDICT 结论，尚未验证。", fix="实际执行验证并以 VERDICT: PASS 或 VERDICT: FAIL: 原因结束。", verified=False)
-            passed, problems = verdict
-            return quality.Verdict(passed, "验证通过。" if passed else f"验证发现问题：{problems or '未说明'}", fix=problems)
-        if not settings.review_nodes:
-            return quality.Verdict(True, "未开启验收。")
-        summarize = len(text) > settings.handoff_max_chars
-        # Even an attempt with fresh edits can depend on code from earlier attempts. Keep it
-        # and the task's explicit references in view, including cited verification logs.
-        references = quality.mentioned_files(workspace, "\n".join(filter(None, [
-            text, node.result, node.instructions, node.acceptance_criteria, node.feedback,
-        ]))) if workspace else []
-        evidence_files = list(dict.fromkeys([*changed, *node.changed_files, *references]))
-        prompt = quality.review_prompt(
-            node, text, changed,
-            await asyncio.to_thread(quality.change_evidence, workspace, evidence_files, referenced=references) if workspace else "",
-            summarize,
-        )
-        folder = settings.workspace_root / run.folder_id / ".review"
-        folder.mkdir(parents=True, exist_ok=True)
-        # A reviewer out of quota leaves routing, so the next pick is a backup.
-        attempted, review_cost, payload = set(), 0.0, None
-        problem = "没有可用的验收模型，尚未验收。"
-        for _ in range(MAX_BACKUPS):
-            reviewer = pick_reviewer(list(self.model_lookup.values()), self._configured(run) - attempted,
-                                     node.model_id, len(prompt) // 3 + 1000)
-            if reviewer is None:
-                break
-            attempted.add(reviewer.id)
-            try:
-                reply = await self._complete(
-                    run, node, reviewer.id, prompt, folder, cli_timeout=300, allow_api_fallback=False,
-                    review_workspace=workspace if can_act(reviewer) else None, review_files=references,
-                )
-                review_cost += reply.accounted_cost_usd
-                payload = quality.parse_review(reply.text)
-                if payload is not None:
-                    break
-                problem = "验收回复无法解析，尚未验收。"
-            except asyncio.CancelledError as exc:
-                exc.accounted_cost_usd = getattr(exc, "accounted_cost_usd", 0.0) + review_cost
-                raise
-            except BudgetExceeded as exc:
-                exc.accounted_cost_usd = getattr(exc, "accounted_cost_usd", 0.0) + review_cost
-                raise
-            except ModelUnavailable as exc:
-                review_cost += getattr(exc, "accounted_cost_usd", 0.0)
-                continue
-            except Exception as exc:
-                review_cost += getattr(exc, "accounted_cost_usd", 0.0)
-                problem = f"验收模型调用失败（{str(exc)[:200]}），尚未验收。"
-        else:
-            payload = None
-        if not attempted or reviewer is None or payload is None:
-            return quality.Verdict(False, problem, fix="重新验收，取得明确的验收结论。",
-                                   cost_usd=review_cost, accounted_cost_usd=review_cost, verified=False)
-        summary = payload.get("summary") if summarize and isinstance(payload.get("summary"), str) else None
-        unable = payload.get("unable") if isinstance(payload.get("unable"), str) and payload["unable"].strip() else None
-        passed = payload["passed"] and not unable
-        reason = str(payload.get("reason") or ("验收通过。" if passed else "验收未通过。"))
-        return quality.Verdict(
-            passed, f"无法完成：{unable.strip()}" if unable else reason,
-            fix=str(payload.get("fix") or unable or ""), summary=summary, unable=unable.strip()[:1000] if unable else None,
-            reviewer_model_id=reviewer.id, cost_usd=review_cost, accounted_cost_usd=review_cost,
-        )
 
     async def _finish(self, run_id: str, node_id: str, result, verdict: quality.Verdict, inputs, changed, cost: float, outcome: Optional[str],
                       generation: Optional[int] = None, accounted: float = 0.0) -> None:
@@ -516,11 +424,12 @@ class Executor:
             # A verification that ran out of turns has not finished, which says nothing against
             # the work it verifies: it is retried itself rather than sending that work back.
             unfinished = bool(getattr(result, "turn_limit", False)) and TURN_LIMIT_HINT in (verdict.reason or "")
-            outcome = outcome or ("unable" if verdict.unable else "unverified" if not verdict.verified
-                                  else "passed" if verdict.passed else "verify_failed" if node.verifies and not unfinished
-                                  else "rejected")
+            outcome = outcome or (Outcome.UNABLE if verdict.unable else Outcome.UNVERIFIED if not verdict.verified
+                                  else Outcome.PASSED if verdict.passed
+                                  else Outcome.VERIFY_FAILED if node.verifies and not unfinished
+                                  else Outcome.REJECTED)
             if stale:
-                outcome = "superseded"
+                outcome = Outcome.SUPERSEDED
             spent = round(cost + verdict.cost_usd, 6)
             log = self.tool_logs.pop((run_id, node_id), None) or []
             node.attempts.append(NodeAttempt(
@@ -541,19 +450,19 @@ class Executor:
             if result is not None:
                 node.result, node.summary = result.text, verdict.summary
                 node.changed_files = list(dict.fromkeys([*node.changed_files, *changed]))
-            if outcome == "budget":
+            if outcome == Outcome.BUDGET:
                 node.status = NodeStatus.PENDING
                 self._pause_for_budget(run)
-            elif outcome == "passed":
+            elif outcome == Outcome.PASSED:
                 node.status, node.feedback, node.failed_attempts = NodeStatus.SUCCEEDED, None, 0
                 self.emit(run_id, "node.succeeded", node_id=node.id, cost_usd=spent,
                           selected_model_id=node.model_id, used_model_id=result.used_model_id if result else None)
-            elif outcome == "verify_failed":
+            elif outcome == Outcome.VERIFY_FAILED:
                 self._send_back(run, node, verdict)
             elif settings.auto_diagnose:
                 # Every failed attempt is diagnosed first; _repair_done then retries or pauses.
                 node.status = NodeStatus.RUNNING
-            elif outcome == "unable":
+            elif outcome == Outcome.UNABLE:
                 # Without a diagnosis to change the environment, another attempt meets the same limit.
                 self._mark_unable(run, node, verdict.unable)
             else:
@@ -563,276 +472,25 @@ class Executor:
                 self.emit(run_id, "approval.required", reason="budget_exceeded", actual_cost_usd=run.actual_cost_usd)
             # A verification out of rework rounds is a failure too.
             diagnose = settings.auto_diagnose and (
-                node.status == NodeStatus.RUNNING or (outcome == "verify_failed" and node.status == NodeStatus.FAILED)
+                node.status == NodeStatus.RUNNING or (outcome == Outcome.VERIFY_FAILED and node.status == NodeStatus.FAILED)
             )
             self._save(run)
         if diagnose:
             await self._repair(run_id, node_id, verdict, outcome)
 
-    async def _repair(self, run_id: str, node_id: str, verdict: quality.Verdict, outcome: str,
-                      diagnosis_id: Optional[str] = None) -> None:
-        """After a failed attempt, a strong model (a membership CLI when possible) looks for
-        what blocks the node outside the task (missing software, sandbox or machine limits,
-        configuration) and repairs it. Its status decides the rest (see _repair_done).
 
-        Runs inside the node's task, so the run waits for it instead of moving on.
-        """
-        lock = self.locks.setdefault(run_id, asyncio.Lock())
-        while True:
-            async with lock:
-                run = self.db.get_run(run_id)
-                if not run or run.status == RunStatus.CANCELLED:
-                    return
-                if diagnosis_id:
-                    node = next(item for item in run.plan.nodes if item.id == node_id)
-                    diagnosis = next(item for item in run.diagnoses if item.id == diagnosis_id)
-                    break
-                busy = self.diagnosing.get(run_id)
-                if not busy or busy.done():
-                    node = next(item for item in run.plan.nodes if item.id == node_id)
-                    diagnosis_id = self.begin_diagnosis(run, "auto", node_id)
-                    diagnosis = run.diagnoses[-1]
-                    if diagnosis_id:
-                        self.diagnosing[run_id] = asyncio.current_task()
-                    self._save(run)
-                    break
-            # Another diagnosis (manual, or another node's repair) is running; this one follows it.
-            await asyncio.wait([busy])
-        if not diagnosis_id:
-            return await self._repair_done(run_id, node_id, diagnosis.id, None, None, 0.0, verdict, outcome)
-        workspace = Path(run.project_dir) if run.project_dir and node.needs_workspace else settings.workspace_root / run.folder_id
-        workspace.mkdir(parents=True, exist_ok=True)
-        events = [f"{event.created_at:%H:%M:%S} {event.kind} {event.data}" for event in self.db.events(run_id)]
-        cost = 0.0
-        try:
-            async with self.repair_lock:
-                shared = environment.prepare()
-                before = await asyncio.to_thread(quality.file_state, shared)
-                prompt = repair_prompt(run, node, str(workspace), str(shared), agent_tools.sandbox_ports(),
-                                       events, self.db.shared_repairs(limit=5), self.platform.context())
-                if self.platform_pending:
-                    text, extra = await self._fix_platform(run, diagnosis, node, "")
-                    result = None
-                else:
-                    result, _model_id, cost = await self._diagnose_with(run, diagnosis, node, prompt, workspace, repair=True)
-                    text = result.text
-                    if parse_diagnosis(text)[2] == "platform_repair":
-                        try:
-                            text, extra = await self._fix_platform(run, diagnosis, node, text)
-                        except BaseException as exc:
-                            exc.accounted_cost_usd = getattr(exc, "accounted_cost_usd", 0.0) + cost
-                            raise
-                        cost += extra
-                after = await asyncio.to_thread(quality.file_state, shared)
-                shared_files = quality.changed_files(before, after)
-        except asyncio.CancelledError as exc:
-            if diagnosis.trigger != "manual":
-                self.diagnosing.pop(run_id, None)
-            # Stopped by a cancel or shutdown; the record must not stay "running".
-            stopped = self.db.get_run(run_id)
-            for item in stopped.diagnoses if stopped else []:
-                if item.id == diagnosis.id and item.status == "running":
-                    item.status, item.error = "failed", "修复被中断（任务取消或服务重启）。"
-                    item.cost_usd = round(max(cost, getattr(exc, "accounted_cost_usd", 0.0)), 6)
-                    item.finished_at = datetime.now(timezone.utc)
-                    self._save(stopped)
-            raise
-        except Exception as exc:
-            cost = max(cost, getattr(exc, "accounted_cost_usd", 0.0))
-            if diagnosis.trigger != "manual":
-                self.diagnosing.pop(run_id, None)
-            if isinstance(exc, BudgetExceeded):
-                async with self.locks.setdefault(run_id, asyncio.Lock()):
-                    current = self.db.get_run(run_id)
-                    target = next(n for n in current.plan.nodes if n.id == node_id)
-                    target.status = NodeStatus.PENDING
-                    record = next(d for d in current.diagnoses if d.id == diagnosis.id)
-                    if record.reply_to and current.waiting_diagnosis_id == record.reply_to:
-                        current.waiting_diagnosis_id = None
-                    record.status, record.error = "failed", str(exc)
-                    record.cost_usd = round(cost, 6)
-                    record.finished_at = datetime.now(timezone.utc)
-                    self._pause_for_budget(current)
-                    self.emit(run_id, "run.diagnosed", diagnosis_id=record.id, status=record.status)
-                return
-            return await self._repair_done(run_id, node_id, diagnosis.id, None, str(exc)[:500],
-                                           cost, verdict, outcome)
-        if diagnosis.trigger != "manual":
-            self.diagnosing.pop(run_id, None)
-        await self._repair_done(run_id, node_id, diagnosis.id, text, None, cost, verdict, outcome, shared_files)
 
-    async def _diagnose_with(self, run: ExecutionRun, diagnosis: Diagnosis, node, prompt: str, workspace: Path,
-                             repair: bool, edit: bool = False):
-        """Run a diagnosis on its model, or, if that fails (a CLI at its usage limit, say), on
-        the next diagnosers in turn. Returns the result and the model that gave it; switches are
-        recorded as events, and the last failure is raised."""
-        run_id, diagnosis_id = run.id, diagnosis.id
-        available = diagnosers(list(self.model_lookup.values()), self._configured(run))
-        if edit:
-            available = [model for model in available if can_act(model)]
-        allowed = {model.id for model in available}
-        candidates = ([diagnosis.model_id] * (diagnosis.model_id in allowed) + [
-            model.id for model in available
-            if model.id != diagnosis.model_id
-        ])[:MAX_DIAGNOSERS]
-        if not candidates:
-            raise RepairError("没有当前可用且具备所需能力的诊断模型。")
-        if candidates[0] != diagnosis.model_id:
-            latest = self.db.get_run(run_id)
-            record = next(d for d in latest.diagnoses if d.id == diagnosis_id)
-            record.model_id = candidates[0]
-            self._save(latest)
-            self.emit(run_id, "run.diagnosis_fallback", diagnosis_id=diagnosis_id, model_id=diagnosis.model_id,
-                      next_model_id=candidates[0], error="原诊断模型已不可用或不具备此次修复需要的工具能力。")
-        cost = 0.0
-        for index, model_id in enumerate(candidates):
-            model = self.model_lookup.get(model_id)
-            # Repairs act on the machine; an analysis only reads, which CLIs do on their own.
-            act = bool((repair or edit) and model and model.channel != "cli" and can_act(model))
-            run = self.db.get_run(run_id)
-            try:
-                result = await self._complete(
-                    run, node, model_id, prompt, workspace, cli_timeout=REPAIR_TIMEOUT if repair or edit else 600,
-                    allow_api_fallback=False, act=act,
-                    repair=repair,
-                )
-                return result, model_id, cost + result.accounted_cost_usd
-            except asyncio.CancelledError as exc:
-                exc.accounted_cost_usd = getattr(exc, "accounted_cost_usd", 0.0) + cost
-                raise
-            except Exception as exc:
-                cost += getattr(exc, "accounted_cost_usd", 0.0)
-                if isinstance(exc, BudgetExceeded) or index == len(candidates) - 1:
-                    exc.accounted_cost_usd = cost
-                    raise
-                following = candidates[index + 1]
-                async with self.locks.setdefault(run_id, asyncio.Lock()):
-                    run = self.db.get_run(run_id)
-                    for item in run.diagnoses:
-                        if item.id == diagnosis_id:
-                            item.model_id = following
-                    self._save(run)
-                self.emit(run_id, "run.diagnosis_fallback", diagnosis_id=diagnosis_id, model_id=model_id,
-                          next_model_id=following, error=str(exc)[:300])
 
-    async def _repair_done(self, run_id: str, node_id: str, diagnosis_id: str, text, error, cost: float,
-                           verdict: quality.Verdict, outcome: str, shared_files: Optional[list[str]] = None) -> None:
-        """Act on the diagnosis of a failed attempt; recovery.after_diagnosis decides what to do."""
-        async with self.locks.setdefault(run_id, asyncio.Lock()):
-            run = self.db.get_run(run_id)
-            if not run:
-                return
-            node = next(item for item in run.plan.nodes if item.id == node_id)
-            diagnosis = next(item for item in run.diagnoses if item.id == diagnosis_id)
-            if error and diagnosis.reply_to and run.waiting_diagnosis_id == diagnosis.reply_to:
-                run.waiting_diagnosis_id = None
-            if diagnosis.status == "running":
-                diagnosis.status, diagnosis.error = ("failed", error) if error else ("done", None)
-                diagnosis.cost_usd, diagnosis.finished_at = round(cost, 6), datetime.now(timezone.utc)
-            if text is not None:
-                diagnosis.report, diagnosis.advice, diagnosis.verdict = parse_diagnosis(text)
-                diagnosis.user_action = user_action(text)
-                diagnosis.question, diagnosis.choices = interaction(text)
-                # An answer without a status line still had its say; retrying is the safe reading.
-                diagnosis.verdict = diagnosis.verdict or "retry"
-                if diagnosis.verdict != "needs_input":
-                    run.waiting_diagnosis_id = None
-            # A known provider limit must not become a user-blocking environment problem,
-            # even if a diagnosis used the older BLOCKED response format.
-            known_failure = failure_kind(verdict.reason) if outcome == "error" else None
-            if diagnosis.status == "done" and known_failure and diagnosis.verdict not in {"platform_pending", "needs_input"}:
-                diagnosis.verdict = "quota_exhausted" if known_failure == "quota" else "model_unavailable"
-            if diagnosis.verdict == "blocked" and not diagnosis.user_action:
-                diagnosis.verdict = "retry"
-                diagnosis.advice = (diagnosis.advice or "") + (
-                    "\n诊断未指出必须由用户提供的权限、凭据、预算或决定；请执行可用的修复并验证结果，"
-                    "公共环境问题修复到共享工具目录。")
-            self.emit(run_id, "run.diagnosed", diagnosis_id=diagnosis_id, status=diagnosis.status,
-                      model_id=diagnosis.model_id, verdict=diagnosis.verdict)
-            if run.status == RunStatus.CANCELLED or node.status not in {NodeStatus.RUNNING, NodeStatus.FAILED}:
-                self._save(run)
-                return
-            status = diagnosis.verdict if diagnosis.status == "done" else None
-            action = after_diagnosis(outcome, status, has_model=bool(node.model_id),
-                                     environment_fixes=node.environment_fixes)
-            if action == "hold_for_platform":
-                node.status = NodeStatus.PENDING
-                node.environment_fixes += 1
-                self._hold_for_platform(run, force=diagnosis.trigger == "manual")
-            elif action == "ask_user":
-                node.status = NodeStatus.PENDING
-                run.status = RunStatus.PAUSED
-                diagnosis.question = diagnosis.question or "请补充你希望采用的方案或约束。"
-                run.error = diagnosis.question
-                run.waiting_diagnosis_id = diagnosis.id
-                run.maintenance_id = None
-                self.emit(run_id, "run.diagnosis_question", diagnosis_id=diagnosis.id,
-                          question=diagnosis.question, choices=diagnosis.choices)
-            elif action == "switch_model":
-                if not node.attempts:
-                    node.attempts.append(NodeAttempt(model_id=node.model_id, outcome="error", reason=verdict.reason))
-                failed_model = node.attempts[-1].model_id or node.model_id
-                kind = "quota" if status == "quota_exhausted" else "unavailable"
-                self.providers.quota.learn(failed_model, verdict.reason, kind, run.id, diagnosis.id)
-                exc = self.providers.quota.mark(failed_model, f"{verdict.reason}\n{diagnosis.report or ''}", kind)
-                # _finish already recorded this attempt. Reclassify it without duplicating
-                # its cost/history or consuming a quality retry.
-                node.attempts[-1].outcome = kind
-                node.review, node.review_passed = str(exc), None
-                self._route_after_unavailable(run, node, exc, diagnosis.id)
-            elif action == "retry_fixed":
-                if shared_files:
-                    self.db.save_shared_repair({
-                        "id": diagnosis.id, "run_id": run.id, "model_id": diagnosis.model_id,
-                        "files": shared_files, "report": diagnosis.report or "",
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    })
-                    self.emit(run.id, "run.repair_shared", diagnosis_id=diagnosis.id, files=shared_files)
-                node.environment_fixes += 1
-                node.feedback = quality.retry_feedback(
-                    node.feedback, f"{verdict.reason}\n环境已修复，请重新执行这一步：\n{diagnosis.report or ''}".strip())
-                node.status = NodeStatus.PENDING
-                if outcome == "verify_failed":
-                    # The verification had used up its rework rounds; it gets one more.
-                    run.rework_rounds = max(0, settings.max_rework_rounds - 1)
-                self.emit(run_id, "node.retry", node_id=node.id, reason="environment_fixed",
-                          model_id=node.model_id, attempt=len(node.attempts) + 1)
-            elif action == "unable":
-                # The diagnosis could not lift the limit (or needs the user to): the step ends as
-                # one that cannot be done here, with why, and the rest of the task goes on.
-                self._mark_unable(run, node, verdict.unable or (
-                    verdict.reason if outcome == "unable" else "诊断判断：这一步在当前环境中无法完成。"), diagnosis)
-            elif action == "pause":
-                node.status = NodeStatus.FAILED
-                self._pause_for_diagnosis(run, node, diagnosis, "遇到需要你处理的问题")
-            elif action == "pause_rework":
-                self._pause_for_diagnosis(run, node, diagnosis, f"返工 {run.rework_rounds} 轮后验证仍未通过")
-            else:
-                self._retry_or_fail(run, node, verdict, outcome)
-                if node.status == NodeStatus.PENDING and diagnosis.advice:
-                    node.feedback = f"{node.feedback}{quality.ADVICE_NOTE}{diagnosis.advice}"
-                elif node.status == NodeStatus.FAILED:
-                    why = f"重试 {node.failed_attempts} 次仍未通过" + (
-                        f"（诊断没有完成：{diagnosis.error or '没有可用的诊断模型'}）" if diagnosis.status != "done" else "")
-                    self._pause_for_diagnosis(run, node, diagnosis, why)
-            self._save(run)
-
-    def _pause_for_diagnosis(self, run: ExecutionRun, node, diagnosis: Diagnosis, why: str) -> None:
-        run.error = f"步骤「{node.title}」{why}，任务已暂停。请查看诊断报告，处理后点“按此预算继续”。"
-        if run.status == RunStatus.RUNNING:
-            run.status = RunStatus.PAUSED
-        self.emit(run.id, "approval.required", reason="diagnosis_unresolved",
-                  node_id=node.id, diagnosis_id=diagnosis.id)
 
     def _retry_or_fail(self, run: ExecutionRun, node, verdict: quality.Verdict, outcome: str) -> None:
         node.failed_attempts += 1
         problem = verdict.reason + (f"\n应修改：{verdict.fix}" if verdict.fix else "")
         if node.failed_attempts >= settings.max_node_attempts:
-            if outcome == "unable":
+            if outcome == Outcome.UNABLE:
                 self._mark_unable(run, node, verdict.unable or verdict.reason)
                 return
             node.status = NodeStatus.FAILED
-            if outcome == "error":
+            if outcome == Outcome.ERROR:
                 node.result = verdict.reason
             self.emit(run.id, "node.failed", node_id=node.id, error=verdict.reason, attempts=len(node.attempts))
             return
@@ -885,332 +543,15 @@ class Executor:
         self.emit(run.id, "run.rework", round=run.rework_rounds, verifier=verifier.id,
                   reopened=sorted(reopened), problems=verdict.fix or verdict.reason)
 
-    def begin_diagnosis(self, run: ExecutionRun, trigger: str, node_id: Optional[str] = None) -> Optional[str]:
-        """Record a new diagnosis on ``run`` (the caller saves it); None if one is running."""
-        task = self.diagnosing.get(run.id)
-        if task and not task.done():
-            return None
-        model = pick_diagnoser(list(self.model_lookup.values()), self._configured(run))
-        diagnosis = Diagnosis(id=uuid4().hex[:8], trigger=trigger, node_id=node_id, model_id=model.id if model else None)
-        if not model:
-            diagnosis.status, diagnosis.error = "failed", "没有可用的诊断模型：请启用一个会员 CLI 或 API 模型。"
-            diagnosis.finished_at = datetime.now(timezone.utc)
-        run.diagnoses.append(diagnosis)
-        self.emit(run.id, "run.diagnosis_started", diagnosis_id=diagnosis.id, trigger=trigger,
-                  node_id=node_id, model_id=diagnosis.model_id)
-        return diagnosis.id if model else None
 
-    def start_diagnosis(self, run_id: str, diagnosis_id: str) -> None:
-        self.diagnosing[run_id] = asyncio.create_task(self._diagnose(run_id, diagnosis_id))
 
-    async def _diagnose(self, run_id: str, diagnosis_id: str) -> None:
-        try:
-            await self._run_diagnosis(run_id, diagnosis_id)
-        except (Exception, asyncio.CancelledError) as exc:
-            async with self.locks.setdefault(run_id, asyncio.Lock()):
-                latest = self.db.get_run(run_id)
-                record = next((d for d in latest.diagnoses if d.id == diagnosis_id), None) if latest else None
-                if record and record.status == "running":
-                    record.status, record.error = "failed", str(exc) or "诊断被中断。"
-                    record.cost_usd = round(getattr(exc, "accounted_cost_usd", 0.0), 6)
-                    record.finished_at = datetime.now(timezone.utc)
-                if latest:
-                    if record and record.reply_to and latest.waiting_diagnosis_id == record.reply_to:
-                        latest.waiting_diagnosis_id = None
-                    for node in latest.plan.nodes:
-                        if record and node.id == record.node_id and node.status == NodeStatus.RUNNING and latest.status != RunStatus.RUNNING:
-                            node.status = NodeStatus.CANCELLED if latest.status == RunStatus.CANCELLED else NodeStatus.PENDING
-                    self._save(latest)
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-        finally:
-            if self.diagnosing.get(run_id) is asyncio.current_task():
-                self.diagnosing.pop(run_id, None)
 
-    async def _run_diagnosis(self, run_id: str, diagnosis_id: str) -> None:
-        run = self.db.get_run(run_id)
-        diagnosis = next((item for item in run.diagnoses if item.id == diagnosis_id), None) if run else None
-        if not diagnosis or not diagnosis.model_id:
-            return
-        node = next((item for item in run.plan.nodes if item.id == diagnosis.node_id), None)
-        if node and run.status in {RunStatus.PAUSED, RunStatus.FAILED, RunStatus.INCOMPLETE} and node.status in {
-                NodeStatus.FAILED, NodeStatus.PENDING, NodeStatus.UNABLE}:
-            # A requested diagnosis of a stopped step uses the same repair/switching path
-            # as automatic recovery, then continues within the previously approved budget.
-            last = node.attempts[-1] if node.attempts else None
-            verdict = quality.Verdict(False, (last.reason if last else None) or node.review or run.error or "步骤未完成")
-            outcome = "error" if not last or last.outcome in {"error", "quota", "unavailable"} else last.outcome
-            node.status, node.failed_attempts, node.environment_fixes = NodeStatus.RUNNING, 0, 0
-            self._save(run)
-            await self._repair(run_id, node.id, verdict, outcome, diagnosis_id=diagnosis_id)
-            async with self.locks.setdefault(run_id, asyncio.Lock()):
-                latest = self.db.get_run(run_id)
-                current = next((item for item in latest.plan.nodes if item.id == node.id), None) if latest else None
-                if not current or latest.status == RunStatus.CANCELLED or current.status != NodeStatus.PENDING:
-                    return
-                # A failed/budget-blocked diagnosis does not authorize another blind attempt.
-                record = next(d for d in latest.diagnoses if d.id == diagnosis_id)
-                if record.status != "done" or record.verdict in {"needs_input", "platform_pending"}:
-                    return
-                try:
-                    self.refresh_model(latest, current)
-                except NoEligibleModelError:
-                    return
-                required = latest.actual_cost_usd + sum(n.estimated_cost_usd for n in latest.plan.nodes if n.status != NodeStatus.SUCCEEDED)
-                if required > latest.budget_usd:
-                    self._pause_for_budget(latest)
-                    return
-                active = self.tasks.get(run_id)
-                latest.status = RunStatus.RUNNING if active and not active.done() else RunStatus.QUEUED
-                latest.error = None
-                self._save(latest)
-                self.emit(run_id, "run.recovered", diagnosis_id=diagnosis_id)
-                self.start(run_id)
-            return
-        workspace = Path(run.project_dir) if run.project_dir else settings.workspace_root / run.folder_id
-        workspace.mkdir(parents=True, exist_ok=True)
-        events = [f"{event.created_at:%H:%M:%S} {event.kind} {event.data}" for event in self.db.events(run_id)]
-        report = advice = error = None
-        cost = 0.0
-        try:
-            result, _model_id, cost = await self._diagnose_with(
-                run, diagnosis, None, diagnosis_prompt(run, diagnosis.node_id, str(workspace), events,
-                                                      self.platform.context()), workspace, repair=False,
-            )
-            text = result.text
-            if parse_diagnosis(text)[2] == "platform_repair":
-                async with self.repair_lock:
-                    try:
-                        text, extra = await self._fix_platform(run, diagnosis, node, text)
-                    except BaseException as exc:
-                        exc.accounted_cost_usd = getattr(exc, "accounted_cost_usd", 0.0) + cost
-                        raise
-                    cost += extra
-            report, advice, status = parse_diagnosis(text)
-        except asyncio.CancelledError as exc:
-            async with self.locks.setdefault(run_id, asyncio.Lock()):
-                latest = self.db.get_run(run_id)
-                target = next((d for d in latest.diagnoses if d.id == diagnosis_id), None) if latest else None
-                if target:
-                    target.status, target.error = "failed", "诊断被中断（任务取消或服务重启）。"
-                    target.cost_usd = round(getattr(exc, "accounted_cost_usd", 0.0), 6)
-                    target.finished_at = datetime.now(timezone.utc)
-                    self._save(latest)
-            raise
-        except Exception as exc:
-            error = str(exc)[:500]
-            cost = getattr(exc, "accounted_cost_usd", 0.0)
-        finally:
-            self.diagnosing.pop(run_id, None)
-        async with self.locks.setdefault(run_id, asyncio.Lock()):
-            latest = self.db.get_run(run_id)
-            target = next((item for item in latest.diagnoses if item.id == diagnosis_id), None) if latest else None
-            if not target:
-                return
-            target.status = "failed" if error else "done"
-            target.report, target.advice, target.error, target.cost_usd = report, advice, error, round(cost, 6)
-            target.verdict = status if not error else None
-            answered_waiting = bool(target.reply_to and latest.waiting_diagnosis_id == target.reply_to)
-            if answered_waiting:
-                latest.waiting_diagnosis_id = None
-            if not error:
-                target.question, target.choices = interaction(text)
-                if status == "needs_input":
-                    target.question = target.question or "请补充你希望采用的方案或约束。"
-                    latest.waiting_diagnosis_id = target.id
-                    if latest.status in {RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.PAUSED}:
-                        latest.status, latest.error = RunStatus.PAUSED, target.question
-                        latest.maintenance_id = None
-                    self.emit(run_id, "run.diagnosis_question", diagnosis_id=target.id,
-                              question=target.question, choices=target.choices)
-                elif status == "platform_pending":
-                    latest.waiting_diagnosis_id = None
-                    self._hold_for_platform(latest, force=answered_waiting)
-                elif answered_waiting and status in {"retry", "fixed"}:
-                    if latest.status == RunStatus.PAUSED:
-                        required = latest.actual_cost_usd + sum(n.estimated_cost_usd for n in latest.plan.nodes
-                                                               if n.status != NodeStatus.SUCCEEDED)
-                        if required <= latest.budget_usd:
-                            active = self.tasks.get(run_id)
-                            latest.status = RunStatus.RUNNING if active and not active.done() else RunStatus.QUEUED
-                            latest.error = None
-                        else:
-                            self._pause_for_budget(latest)
-            target.finished_at = datetime.now(timezone.utc)
-            self._save(latest)
-        self.emit(run_id, "run.diagnosed", diagnosis_id=diagnosis_id, status=target.status, model_id=target.model_id)
-        if latest.status in {RunStatus.QUEUED, RunStatus.RUNNING}:
-            self.start(run_id)
 
-    def _hold_for_platform(self, run, force: bool = False) -> None:
-        if not self.platform_pending or (not force and run.status not in {RunStatus.QUEUED, RunStatus.RUNNING}):
-            return
-        run.maintenance_id = self.platform_pending["id"]
-        run.status = RunStatus.PAUSED
-        run.error = "Super Partner 修复已通过验证，正在等待在途步骤结束并自动生效，之后继续任务。"
-        self._save(run)
-        self.emit(run.id, "run.platform_waiting", repair_id=run.maintenance_id)
 
-    async def _fix_platform(self, run, diagnosis, node, problem: str) -> tuple[str, float]:
-        """Prepare source changes separately; only independent successful checks can apply them."""
-        latest = self.db.get_run(run.id)
-        record = next(d for d in latest.diagnoses if d.id == diagnosis.id)
-        record.scope = "super_partner"
-        self._save(latest)
-        if self.platform_pending:
-            record.repair_id = self.platform_pending["id"]
-            self._save(latest)
-            return "已有公共平台修复通过验证，等待自动生效。\nSTATUS: PLATFORM_PENDING", 0.0
-        if node and node.environment_fixes >= MAX_ENVIRONMENT_FIXES:
-            raise RepairError("同一步骤的公共修复已达到本轮上限，请结合已有验证结果重新定位，避免重复修改平台。")
-        job = await self.platform.prepare(run.id, diagnosis.id, allow_network=latest.allow_network)
-        latest = self.db.get_run(run.id)
-        record = next(d for d in latest.diagnoses if d.id == diagnosis.id)
-        record.repair_id = job["id"]
-        self._save(latest)
-        self.emit(run.id, "run.platform_repair", diagnosis_id=diagnosis.id, repair_id=job["id"], phase="editing")
-        replied = sorted((d for d in latest.diagnoses if d.messages), key=lambda d: d.messages[-1].created_at)
-        replies = [{"question": d.question, "answers": [m.model_dump(mode="json") for m in d.messages[-5:]]}
-                   for d in replied[-5:]]
-        base = (
-            "[[super-partner:platform-repair]]\n"
-            "Fix an evidenced defect in Super Partner itself in this isolated source copy. "
-            "The user authorizes this repair. Preserve unrelated existing changes. Modify "
-            "application code and add a regression test reproducing the defect; do not weaken "
-            "or delete existing tests. Do not change task data, credentials, Git history, live "
-            "source, or restart any services. The controller independently runs backend tests, "
-            "frontend tests and a build, then applies and activates a passing patch for all projects. "
-            "Use file tools to implement the fix, not merely report advice. If a real user choice "
-            "is required, use QUESTION, OPTIONS (JSON array), and STATUS: NEEDS_INPUT; otherwise "
-            "describe your fix in Chinese and end with STATUS: FIXED.\n"
-            "Follow the repair skill below. Start from the diagnosis's LOCATION lines; read only "
-            "the code around them.\n\n"
-            f"{repair_guide(Path(job['folder']) / 'source')}\n\n"
-            f"Original task: {run.prompt}\nDiagnosis: {problem}\n"
-            f"User replies: {json.dumps(replies, ensure_ascii=False)}\n"
-        )
-        feedback, cost = "", 0.0
-        try:
-            for attempt in range(settings.platform_repair_attempts):
-                result, _model_id, extra = await self._diagnose_with(
-                    run, diagnosis, node, base + feedback, Path(job["folder"]) / "source", repair=False, edit=True,
-                )
-                cost += extra
-                if parse_diagnosis(result.text)[2] in {"needs_input", "blocked"}:
-                    job.update(status="awaiting_input", report=result.text)
-                    self.platform.save(job)
-                    return result.text, cost
-                self.emit(run.id, "run.platform_repair", repair_id=job["id"], phase="validating", attempt=attempt + 1)
-                try:
-                    # The user can change network permission while the candidate is
-                    # being edited. Validation follows the current task setting too.
-                    current = self.db.get_run(run.id)
-                    job["allow_network"] = bool(current and current.allow_network)
-                    checks = await self.platform.check(job)
-                    break
-                except RepairError as exc:
-                    if attempt + 1 == settings.platform_repair_attempts:
-                        raise
-                    feedback = f"\nThe independent check failed. Fix it and recheck:\n{str(exc)[-6000:]}"
-            report = parse_diagnosis(result.text)[0]
-            report += "\n\n## 自动验证\n" + "\n".join(f"- {check['name']}: 通过" for check in checks)
-            report += "\n\n## 影响范围\nSuper Partner 公共代码；生效后供所有项目使用。\n修改：" + "、".join(job["files"])
-            job.update(report=report, model_id=_model_id)
-            self.platform.schedule(job)
-            self.platform_pending = job
-            self.maintenance_task = asyncio.create_task(self._activate_platform(job))
-            return report + "\nSTATUS: PLATFORM_PENDING", cost
-        except BaseException as exc:
-            job.update(status="failed", error=str(exc) or "平台修复被取消。")
-            self.platform.save(job)
-            exc.accounted_cost_usd = getattr(exc, "accounted_cost_usd", 0.0) + cost
-            raise
 
-    async def _activate_platform(self, job: dict) -> None:
-        try:
-            # No active model call is interrupted by our restart; usage and results drain first.
-            while self.active_requests or any(not task.done() for task in set(self.tasks.values()) | set(self.diagnosing.values())):
-                await asyncio.sleep(0.2)
-            initiating = self.db.get_run(job["run_id"])
-            if not initiating or initiating.status == RunStatus.CANCELLED:
-                job.update(status="cancelled", error="发起诊断的任务已取消或删除，未应用平台改动。")
-                self.platform.save(job)
-                self._finish_platform(job)
-                return
-            await self.platform.launch(job)
-            await self._watch_platform()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            job.update(status="failed", error=str(exc))
-            self.platform.save(job)
-            self._finish_platform(job)
 
-    def restore_platform(self) -> None:
-        """Called on API startup; ordinary interrupted tasks still require confirmation."""
-        pending = self.platform.pending()
-        if pending:
-            self.platform_pending = pending
-            if pending["status"] == "validated":
-                pending["old_pid"] = os.getpid()
-                self.maintenance_task = asyncio.create_task(self._activate_platform(pending))
-            else:
-                self.maintenance_task = asyncio.create_task(self._watch_platform())
 
-    async def _watch_platform(self) -> None:
-        deadline = time.monotonic() + 420
-        while time.monotonic() < deadline:
-            job = self.platform.pending()
-            if not job:
-                return
-            if job["status"] in {"activated", "failed", "rolled_back", "cancelled"}:
-                self._finish_platform(job)
-                return
-            await asyncio.sleep(0.5)
-        job.update(status="failed", error="平台修复生效超时；任务状态已保留，未宣称修复成功。")
-        self.platform.save(job)
-        self._finish_platform(job)
 
-    def _finish_platform(self, job: dict) -> None:
-        success = job["status"] == "activated"
-        ready = []
-        for run in self.db.list_runs():
-            records = [d for d in run.diagnoses if d.repair_id == job["id"]]
-            held = run.maintenance_id == job["id"]
-            if not records and not held:
-                continue
-            for record in records:
-                record.status = "done" if success else "failed"
-                record.verdict = "platform_fixed" if success else "platform_failed"
-                record.error = None if success else job.get("error", "平台修复未生效。")
-                record.report = (record.report or "") + ("\n\n平台修复已生效，服务健康检查通过。" if success
-                                                      else f"\n\n平台修复未生效：{record.error}")
-            if held:
-                run.maintenance_id = None
-                if run.status == RunStatus.PAUSED:
-                    if (success or (job["status"] == "cancelled" and run.id != job["run_id"])) and not run.waiting_diagnosis_id:
-                        required = run.actual_cost_usd + sum(n.estimated_cost_usd for n in run.plan.nodes
-                                                           if n.status != NodeStatus.SUCCEEDED)
-                        if required <= run.budget_usd:
-                            run.status, run.error = RunStatus.QUEUED, None
-                            ready.append(run.id)
-                        else:
-                            self._pause_for_budget(run)
-                    else:
-                        run.error = job.get("error", "平台修复未生效，任务现场已保留。")
-            self._save(run)
-            self.emit(run.id, "run.platform_activated" if success else "run.platform_failed",
-                      repair_id=job["id"], files=job["files"], error=job.get("error"))
-        self.db.save_shared_repair({
-            "id": job["id"], "scope": "super_partner", "status": job["status"],
-            "run_id": job["run_id"], "model_id": job.get("model_id"), "files": job["files"],
-            "checks": job.get("checks", []), "report": job.get("report", ""), "error": job.get("error"),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-        self.platform.clear_pending(job)
-        self.platform_pending = None
-        for run_id in ready:
-            self.start(run_id)
 
     async def _complete(self, run, node, model_id, prompt, workspace, **kwargs):
         """Persist each received usage report, even if a later round fails or is cancelled."""
@@ -1259,8 +600,6 @@ class Executor:
             configured = {item for item in configured if not item.startswith("mock:")}
         return configured if run.use_cli else {item for item in configured if not item.startswith("cli:")}
 
-    def _reviewer(self, run: ExecutionRun, node, tokens: int):
-        return pick_reviewer(list(self.model_lookup.values()), self._configured(run), node.model_id, tokens)
 
     def _actual_cost(self, result, node, model_id: Optional[str] = None) -> float:
         """Charge by token usage; if the model or its price has since left the catalog, the

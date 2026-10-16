@@ -132,10 +132,40 @@ class ToolCall(BaseModel):
     ok: bool = True
 
 
+class Outcome:
+    """How an attempt of a step ended (``NodeAttempt.outcome``)."""
+    PASSED = "passed"
+    REJECTED = "rejected"            # the reviewer did not accept the result
+    VERIFY_FAILED = "verify_failed"  # a verification step found problems
+    UNVERIFIED = "unverified"        # no reviewer could give a verdict
+    UNABLE = "unable"                # the step cannot be done in this environment
+    ERROR = "error"                  # the model call failed
+    BUDGET = "budget"                # not enough budget left for the next request
+    SUPERSEDED = "superseded"        # upstream rework made the attempt stale
+    CANCELLED = "cancelled"
+    QUOTA = "quota"                  # the model ran out of usage; another takes over
+    UNAVAILABLE = "unavailable"      # the model's service is down; another takes over
+
+
+class DiagnosisStatus:
+    """A diagnosis's conclusion (``Diagnosis.verdict``), from its STATUS line or the platform repair."""
+    FIXED = "fixed"
+    RETRY = "retry"
+    UNABLE = "unable"
+    BLOCKED = "blocked"
+    NEEDS_INPUT = "needs_input"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+    MODEL_UNAVAILABLE = "model_unavailable"
+    PLATFORM_REPAIR = "platform_repair"
+    PLATFORM_PENDING = "platform_pending"
+    PLATFORM_FIXED = "platform_fixed"
+    PLATFORM_FAILED = "platform_failed"
+
+
 class NodeAttempt(BaseModel):
     """One run of a node: what model did it, and whether its result was accepted."""
     model_id: Optional[str] = None
-    # passed | rejected (review failed) | error (model call failed) | verify_failed
+    # One of Outcome.
     outcome: str
     reason: Optional[str] = None
     reviewer_model_id: Optional[str] = None
@@ -257,7 +287,7 @@ class Diagnosis(BaseModel):
     # Automatic diagnoses after a failed attempt: fixed (environment repaired, run again),
     # retry (nothing outside the task is wrong), quota_exhausted (switch execution model),
     # or blocked (the user must act).
-    verdict: Optional[str] = None
+    verdict: Optional[str] = None  # one of DiagnosisStatus
     # A concrete human-only dependency is required before a BLOCKED diagnosis pauses a task.
     user_action: Optional[str] = None
     scope: str = "environment"  # task | environment | super_partner

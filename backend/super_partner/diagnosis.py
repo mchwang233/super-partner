@@ -12,7 +12,7 @@ import json
 import re
 from typing import Optional
 
-from .models import ExecutionRun, TaskNode
+from .models import ExecutionRun, Outcome, TaskNode
 from .recovery import SWITCH_AFTER, recent_failures
 
 MAX_RESULT_CHARS = 2_000
@@ -169,7 +169,7 @@ def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str,
             "(NEEDS_INPUT). If the claim is wrong and the step can be done as is, say RETRY and how. "
             "Otherwise answer BLOCKED with the USER_ACTION that would make it possible: the step is "
             "then reported as not doable here, with your report, instead of pausing the task.")]
-          if last and last.outcome == "unable" else []),
+          if last and last.outcome == Outcome.UNABLE else []),
         f"Working directory of the task: {workspace}",
         "",
         "# What you may do",

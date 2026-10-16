@@ -6,14 +6,14 @@ from __future__ import annotations
 from typing import Optional
 
 from .config import settings
-from .models import ModelProfile, TaskNode
+from .models import DiagnosisStatus, ModelProfile, Outcome, TaskNode
 from .routing import stronger_than, strongest_for
 
 # Turns of tool calls an API model gets for a node, as a multiple of api_agent_max_turns.
 TURNS_BY_DIFFICULTY = {"easy": 1.0, "normal": 1.5, "hard": 2.0}
 # Outcomes that say a model's attempt was not good enough. Provider limits (quota, unavailable),
 # budget pauses, cancelled or superseded work, unverified reviews and unable steps do not.
-MODEL_FAILURES = {"rejected", "verify_failed", "error"}
+MODEL_FAILURES = {Outcome.REJECTED, Outcome.VERIFY_FAILED, Outcome.ERROR}
 # Failures in a row of one model on a step, after which the step goes to another model.
 SWITCH_AFTER = 2
 # Environment repairs per node that do not count as failed attempts.
@@ -28,7 +28,7 @@ def recent_failures(node: TaskNode) -> list:
     """The step's model failures since its last accepted attempt, oldest first."""
     failures = []
     for attempt in node.attempts:
-        if attempt.outcome == "passed":
+        if attempt.outcome == Outcome.PASSED:
             failures = []
         elif attempt.outcome in MODEL_FAILURES:
             failures.append(attempt)
@@ -65,18 +65,19 @@ def after_diagnosis(outcome: str, status: Optional[str], *, has_model: bool, env
     environment was repaired; the failure does not count), ``unable``, ``pause``,
     ``pause_rework`` (a verification out of rework rounds), ``retry``.
     """
-    if status == "platform_pending":
+    if status == DiagnosisStatus.PLATFORM_PENDING:
         return "hold_for_platform"
-    if status == "needs_input":
+    if status == DiagnosisStatus.NEEDS_INPUT:
         return "ask_user"
-    if status in {"quota_exhausted", "model_unavailable"} and outcome == "error" and has_model:
+    if (status in {DiagnosisStatus.QUOTA_EXHAUSTED, DiagnosisStatus.MODEL_UNAVAILABLE}
+            and outcome == Outcome.ERROR and has_model):
         return "switch_model"
-    if status == "fixed" and environment_fixes < MAX_ENVIRONMENT_FIXES:
+    if status == DiagnosisStatus.FIXED and environment_fixes < MAX_ENVIRONMENT_FIXES:
         return "retry_fixed"
-    if status == "unable" or (outcome == "unable" and status != "retry"):
+    if status == DiagnosisStatus.UNABLE or (outcome == Outcome.UNABLE and status != DiagnosisStatus.RETRY):
         return "unable"
-    if status == "blocked":
+    if status == DiagnosisStatus.BLOCKED:
         return "pause"
-    if outcome == "verify_failed":
+    if outcome == Outcome.VERIFY_FAILED:
         return "pause_rework"
     return "retry"
