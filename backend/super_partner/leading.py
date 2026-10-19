@@ -260,6 +260,14 @@ class Leading:
             elif action == "unable":
                 self._mark_unable(run, node, reason or verdict.unable or verdict.reason,
                                   user_action=decision.get("user_action"))
+            elif action == "request_component":
+                job = self._engineer_for_lead(run, node, instructions or reason, made.id)
+                if job:
+                    made.engineer_job_id = job.id
+                    self.emit(run_id, "run.engineer_requested", node_id=node_id, job_id=job.id)
+                else:
+                    self._mark_unable(run, node, f"这一步需要 Super Partner 新增能力，但平台工程师当前不可用：{instructions or reason}",
+                                      user_action="启用平台自修复后，可以在“平台工程师”页面提出这个需求。")
             elif action == "ask_user":
                 question = Diagnosis(
                     id=uuid4().hex[:8], trigger="lead", node_id=node_id,
@@ -382,7 +390,8 @@ class Leading:
         """A task paused for the lead's question goes on once nothing else holds it."""
         async with self.locks.setdefault(run_id, asyncio.Lock()):
             run = self.db.get_run(run_id)
-            if run.status != RunStatus.PAUSED or run.waiting_diagnosis_id or run.maintenance_id:
+            if (run.status != RunStatus.PAUSED or run.waiting_diagnosis_id or run.maintenance_id
+                    or run.engineer_job_id):
                 return
             required = run.actual_cost_usd + sum(node.estimated_cost_usd for node in run.plan.nodes
                                                  if node.status != NodeStatus.SUCCEEDED)

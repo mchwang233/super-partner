@@ -15,7 +15,8 @@ api.confirm_task ── Executor.execute ── _dispatch                       
   _finish  (record the NodeAttempt, then: passed / send back / diagnose / retry / unable)
   _decide ── ask_lead ── _apply_decision                                (the task's lead decides, leading.py)
      ├─ retry / switch_model / accept / unable / ask_user / rework / replan (replan.py)
-     └─ repair_environment / repair_platform ── _repair (diagnosis with the lead's brief)
+     ├─ repair_environment / repair_platform ── _repair (diagnosis with the lead's brief)
+     └─ request_component ── _engineer_for_lead (task waits; the platform engineer's job, engineer.py)
   _repair ── _diagnose_with ── _repair_done                             (fallback: no lead decides)
      └─ STATUS: PLATFORM_REPAIR ── _fix_platform ── platform_repair     (fix Super Partner itself)
   all steps done ── _final_review (the lead: done / rework / replan) ── succeeded
@@ -36,7 +37,8 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Reviewing a result | `review.py` (mixed into `Executor`) | `_check`, `_reviewer`, `MAX_BACKUPS` |
 | The lead's decisions after a failed attempt, and its questions to the user; while it decides, `ExecutionRun.lead_thinking` (`_thinking`); a repair it asks for (`Diagnosis.trigger == "lead_repair"`, `decision_id`) comes back to it (`_after_repair`) before the step runs again | `leading.py` (mixed into `Executor`) | `_decide`, `_ask_for_decision`, `_apply_decision`, `_after_repair`, `_decisions_left`, `start_lead_answer`, `start_lead_chat`; prompts in `supervisor.failure_message`, `repair_message`, `parse_decision` |
 | Diagnosing failures and acting on them (when no lead decides; repairs the lead asks for) | `diagnosing.py` (mixed into `Executor`) | `_repair`, `_diagnose_with`, `_repair_done`, `begin_diagnosis`, `_run_diagnosis` |
-| Repairing Super Partner itself (flow) | `self_repair.py` (mixed into `Executor`) | `_fix_platform`, `_activate_platform`, `_hold_for_platform`, `restore_platform` |
+| Repairing Super Partner itself (flow) | `self_repair.py` (mixed into `Executor`) | `_fix_platform`, `_activate_platform`, `_hold_for_platform`, `restore_platform`, `_finish_platform` (a repair the lead asked for goes back to it: `_platform_to_lead`) |
+| The platform engineer: repairs and components the user (or a lead) asks for, as jobs; plan → approve → build in a copy → check → approve → apply → git commit (docs/design/platform-engineer.md) | `engineer.py` (mixed into `Executor`) | `EngineerJob`, `engineer_request`, `engineer_reply`, `engineer_approve`, `engineer_reject`, `_engineer_run`, `_engineer_apply`, `_engineer_finished`, `_engineer_to_lead`, `commit`; API `/api/engineer`; prompts `plan_prompt`, `edit_prompt`; guide `skills/platform-engineer/SKILL.md` |
 | Changing a running task's plan at the lead's decision | `replan.py` | `change_plan`, `PlanError` |
 | What happens after a failure without a lead (fallback: retry model, meaning of a diagnosis) | `recovery.py` | `retry_model`, `failed_models`, `after_diagnosis`, `turns_for`, `MODEL_FAILURES` |
 | Prompts for steps and reviews, verdict parsing | `quality.py` | `node_prompt`, `continue_prompt`, `attempt_notes`, `review_prompt`, `parse_review`, `UNABLE_RULE`, `unable_claim`, `retry_feedback` |
@@ -51,15 +53,15 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Per-request budget reservations | `budget.py` | `RequestBudget.reserve` |
 | Quota / outage detection and cooldown | `quota.py` | `QuotaTracker.classify`, `mark`, `exhausted` |
 | Shared machine fixes (tools dir, env) | `environment.py` | `tools_dir`, `command_env` |
-| Self-repair: isolated copy, checks, activation | `platform_repair.py` | `PlatformRepairs.prepare`, `check`, `activate`, `SOURCE_DIRS` |
+| Self-repair: isolated copy, checks, activation | `platform_repair.py` | `PlatformRepairs.prepare`, `check`, `load`, `stale`, `diff`, `activate`, `SOURCE_DIRS` |
 | Model catalog and benchmark scores | `catalog_sync.py`, `benchmarks.py`, `scoring.py` | `public_models`, `match_results`, `rescore` |
 | Results listing, ZIP, GitHub publish | `publish.py` | `SKIP`, `result_markdown` |
 | Settings (env `SUPER_PARTNER_*`) | `config.py` | `settings` |
 
 ## Executor
 
-`Executor` (`executor.py`) mixes in `Reviewing` (`review.py`), `Diagnosing` (`diagnosing.py`) and
-`SelfRepair` (`self_repair.py`); they share its state (`db`, `locks`, `_complete`, `_save`, `emit`).
+`Executor` (`executor.py`) mixes in `Reviewing` (`review.py`), `Leading` (`leading.py`), `Diagnosing`
+(`diagnosing.py`), `SelfRepair` (`self_repair.py`) and `Engineering` (`engineer.py`); they share its state (`db`, `locks`, `_complete`, `_save`, `emit`).
 
 - `execute` / `_dispatch`: the run loop; starts ready nodes up to `max_parallel_nodes`.
 - `_execute_node`: one attempt; exceptions map to outcomes (`budget`, `error`, quota → `_switch_model`).
@@ -92,6 +94,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | The lead's decisions | `test_leading.py`, `test_replan.py` (plan changes, final review) |
 | Review prompts and evidence | `test_quality.py`, `test_review_evidence.py` |
 | Platform self-repair | `test_platform_repair.py` |
+| The platform engineer | `test_engineer.py` |
 | Catalog and benchmarks | `test_catalog_sync.py`, `test_benchmarks.py`, `test_scoring.py` |
 | API-level flows | `test_core.py`, `test_followup.py`, `test_task_deletion.py`, `test_publish.py` |
 | Web UI | `frontend/tests/mission-actions.test.mjs` |
@@ -102,5 +105,5 @@ about 35 s), `cd frontend && npm test` and `npm run build` (only when the fronte
 ## Frontend (`frontend/`)
 
 `src.tsx` (app shell, task creation, actions), `lead.tsx` (the lead's decisions, questions and messages), `result-page.tsx` (results, requirement change),
-`plan-graph.tsx` (steps and attempts), `diagnosis.tsx` (diagnosis chat), `mission-history.tsx`
+`plan-graph.tsx` (steps and attempts), `engineer.tsx` (the platform engineer's page), `diagnosis.tsx` (diagnosis chat), `mission-history.tsx`
 (task list), `model-profiles.tsx` (models), `style.css` (tokens and styles).

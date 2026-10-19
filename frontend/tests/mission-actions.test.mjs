@@ -222,6 +222,23 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
     }
     if (path === "/api/models") return json(state.models);
     if (path === "/api/providers") return json([]);
+    if (path === "/api/engineer") return json(state.engineer ?? { available: true, jobs: [] });
+    if (path.startsWith("/api/engineer/") && options.method === "POST") {
+      const body = JSON.parse(options.body || "{}");
+      state.engineerActions = [...(state.engineerActions ?? []), { path, body }];
+      const engineer = state.engineer ?? (state.engineer = { available: true, jobs: [] });
+      if (path === "/api/engineer/jobs") {
+        const job = { id: `job${engineer.jobs.length + 1}`, kind: body.kind, origin: "user", title: body.request.slice(0, 40),
+          request: body.request, status: "queued", messages: [], budget_usd: 2, cost_usd: 0,
+          created_at: "2026-10-19T08:00:00Z", updated_at: "2026-10-19T08:00:00Z" };
+        engineer.jobs = [job, ...engineer.jobs];
+        return json(job, 201);
+      }
+      const [, , , , id, action] = path.split("/");
+      const next = { approve: "queued", reject: "rejected", reply: "queued" }[action];
+      engineer.jobs = engineer.jobs.map(job => job.id === id ? { ...job, status: next } : job);
+      return json(engineer.jobs.find(job => job.id === id));
+    }
     throw new Error(`Unexpected request: ${path}`);
   };
   window.eval(browserCode);
@@ -1253,4 +1270,57 @@ test("the lead panel shows the lead deciding, and the repair it asked for under 
   assert.match(repair.textContent, /修复Codex CLI未发现环境问题.*修复报告.*结果已交回负责人/s);
   // Its repair is not shown again in the separate diagnosis panel.
   assert.equal(document.querySelectorAll(".diagnosis-card").length, 1);
+});
+
+function engineerJob(fields) {
+  return { id: "job1", kind: "component", origin: "user", title: "导出按钮", request: "给结果页加一个导出按钮",
+    status: "plan_ready", plan: "- 目标: 结果页可以导出 CSV", messages: [], files: [], checks: [], budget_usd: 2, cost_usd: 0,
+    created_at: "2026-10-19T08:00:00Z", updated_at: "2026-10-19T08:00:00Z", ...fields };
+}
+
+test("the platform engineer page takes requests, shows finished work, and the user approves its plan", async t => {
+  const { state, document, click, act, window } = await setup(t, [mission("finished-task", "succeeded")], [], { openComposer: false });
+  state.engineer = { available: true, jobs: [engineerJob({}), engineerJob({ id: "job0", title: "修复状态", status: "applied", kind: "repair",
+    report: "改好了", files: ["backend/super_partner/executor.py"], checks: ["Backend tests"], diff: "+fixed", commit: "abcdef1234" })] };
+  await act(async () => state.poll());
+  const nav = [...document.querySelectorAll(".app-nav button")].find(node => node.textContent.startsWith("平台工程师"));
+  // One job waits for the user.
+  assert.equal(nav.querySelector(".nav-badge").textContent, "1");
+  await click(nav);
+  const page = document.querySelector(".engineer-page");
+  assert.match(page.querySelector(".engineer-job").textContent, /方案待批准.*结果页可以导出 CSV/s);
+  await click([...page.querySelectorAll("button")].find(node => node.textContent === "批准方案，开始实施"));
+  assert.deepEqual(state.engineerActions.map(item => item.path), ["/api/engineer/jobs/job1/approve"]);
+  // A finished repair shows its files, checks, diff and commit.
+  await click([...page.querySelectorAll(".engineer-list button")].find(node => node.textContent.includes("修复状态")));
+  const detail = document.querySelector(".engineer-job");
+  assert.match(detail.textContent, /已生效.*executor\.py.*检查通过：Backend tests.*abcdef12/s);
+  // A new request goes to the engineer with its kind.
+  await click([...page.querySelectorAll(".engineer-kind label")].find(node => node.textContent === "修复缺陷"));
+  const box = page.querySelector(".engineer-request textarea");
+  await act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+    setter.call(box, "暂停后继续一直显示排队中");
+    box.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await click([...page.querySelectorAll("button")].find(node => node.textContent === "交给平台工程师"));
+  const posted = state.engineerActions.at(-1);
+  assert.equal(posted.path, "/api/engineer/jobs");
+  assert.deepEqual(posted.body, { request: "暂停后继续一直显示排队中", kind: "repair" });
+});
+
+test("the lead panel shows a component the lead asked for, and opens it on the engineer page", async t => {
+  const run = mission("waiting-task", "paused");
+  run.plan.nodes = [{ id: "a", title: "读资料", dependencies: [], status: "pending", estimated_cost_usd: 0, attempts: [] }];
+  run.supervisor = { model_id: "cli:claude", calls: 2 };
+  run.engineer_job_id = "job1";
+  run.decisions = [{ id: "d1", node_id: "a", event: "attempt_failed", action: "request_component", engineer_job_id: "job1",
+    reason: "缺一个读 PDF 的工具。", instructions: "给执行模型加一个读 PDF 的工具", created_at: "2026-10-19T07:00:00Z" }];
+  const { state, document, click } = await setup(t, [run], [], { openComposer: false });
+  state.engineer = { available: true, jobs: [engineerJob({ origin: "lead", run_id: "waiting-task", node_id: "a", title: "PDF 工具" })] };
+  const panel = document.querySelector(".lead-panel");
+  assert.match(panel.textContent, /请平台工程师添加组件.*任务在等这个组件/s);
+  await click([...panel.querySelectorAll("button")].find(node => node.textContent === "查看方案和进度"));
+  const detail = document.querySelector(".engineer-job");
+  assert.match(detail.textContent, /PDF 工具.*负责人请求.*来自任务.*结束后结果会交回负责人/s);
 });

@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     platform_self_repair: bool = True
     platform_root: Optional[Path] = None
     platform_repair_attempts: int = Field(default=2, ge=1, le=3)
+    # Spending cap of a platform engineer job the user starts (engineer.py); membership CLIs cost
+    # nothing extra. Repairs started from a task are charged to that task instead.
+    engineer_budget_usd: float = Field(default=2.0, ge=0)
+    # Commit an applied platform change to the source checkout's current branch (never pushed).
+    engineer_commit: bool = True
     # Have another model check each node's result against its acceptance criteria.
     review_nodes: bool = True
     # Without a lead deciding (the fallback): runs per node (first try plus retries) before it

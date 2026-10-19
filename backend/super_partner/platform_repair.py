@@ -32,6 +32,9 @@ PRIVATE = {"credentials.json", "secrets.json", ".env"}
 CHECK_TIMEOUT = 600
 # How to diagnose and repair the platform, and where its code is; given to every model that does.
 REPAIR_GUIDES = ("skills/platform-repair/SKILL.md", "docs/ARCHITECTURE.md")
+# How the platform engineer adds a component (engineer.py).
+COMPONENT_GUIDES = ("skills/platform-engineer/SKILL.md", "docs/ARCHITECTURE.md")
+MAX_DIFF_CHARS = 60_000
 
 
 class RepairError(RuntimeError):
@@ -79,11 +82,11 @@ def source_files(root: Path) -> dict[str, dict]:
     return result
 
 
-def repair_guide(root: Optional[Path]) -> str:
-    """The repair skill and the architecture map from ``root``, without the skill's front matter,
-    so that a model of any kind follows the same procedure."""
+def repair_guide(root: Optional[Path], names: tuple = REPAIR_GUIDES) -> str:
+    """The repair skill (or another of ``names``) and the architecture map from ``root``, without
+    the skill's front matter, so that a model of any kind follows the same procedure."""
     parts = []
-    for name in REPAIR_GUIDES:
+    for name in names:
         path = root / name if root else None
         if path and path.is_file():
             text = path.read_text(encoding="utf-8")
@@ -137,7 +140,9 @@ class PlatformRepairs:
                 f"and diagnose as {self.root}/{REPAIR_GUIDES[0]} says. Both are about Super Partner's "
                 "own code, not the task: never tell the task's steps to read or follow them.")
 
-    async def prepare(self, run_id: str, diagnosis_id: str, *, allow_network: bool = False) -> dict:
+    async def prepare(self, run_id: Optional[str], diagnosis_id: Optional[str], *,
+                      allow_network: bool = False) -> dict:
+        """A fresh copy of the source to edit. ``run_id``: the task it is for, if any."""
         if not self.enabled or not self.root:
             raise RepairError("平台自修复未启用，或当前安装没有可编辑的 Super Partner 源码。")
         unit = unit_name(self.root)
@@ -172,6 +177,34 @@ class PlatformRepairs:
 
     def save(self, job: dict) -> None:
         atomic_json(Path(job["folder"]) / "job.json", job)
+
+    def load(self, identifier: Optional[str]) -> Optional[dict]:
+        """A copy prepared earlier, by its id; None if it is gone."""
+        if not identifier or len(identifier) != 32 or any(c not in "0123456789abcdef" for c in identifier):
+            return None
+        path = self.directory / identifier / "job.json"
+        return json.loads(path.read_text()) if path.is_file() else None
+
+    def stale(self, job: dict) -> bool:
+        """The live source has changed since the copy was made: applying it would overwrite that."""
+        return not self.root or source_files(self.root) != job["before"]
+
+    def diff(self, job: dict) -> str:
+        """A unified diff of what the copy changed, for the user to read before applying it."""
+        import difflib
+
+        folder = Path(job["folder"])
+        parts = []
+        for name in job.get("files", []):
+            def lines(path: Path) -> list[str]:
+                try:
+                    return path.read_text(encoding="utf-8").splitlines(keepends=True) if path.is_file() else []
+                except UnicodeDecodeError:
+                    return ["(binary file)\n"]
+            parts += difflib.unified_diff(lines(folder / "before" / name), lines(folder / "source" / name),
+                                          f"a/{name}", f"b/{name}")
+        text = "".join(parts)
+        return text if len(text) <= MAX_DIFF_CHARS else text[:MAX_DIFF_CHARS] + "\n… (diff truncated)\n"
 
     def pending(self):
         path = self.directory / "pending.json"

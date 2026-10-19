@@ -132,6 +132,7 @@ async def lifespan(_: FastAPI):
         if interrupted:
             db.save_run(run)
     executor.restore_platform()
+    executor.restore_engineer()
     try:
         yield
     finally:
@@ -206,6 +207,60 @@ def reset_model_quota(model_id: str):
     """The user knows the quota is back (or topped up the account): use the model again."""
     providers.quota.clear(model_id)
     return providers.quota.public()
+
+
+class EngineerRequest(BaseModel):
+    request: str = Field(min_length=1, max_length=20_000)
+    kind: str = Field(default="component", pattern="^(repair|component)$")
+    budget_usd: Optional[float] = Field(default=None, ge=0, le=100)
+
+
+class EngineerReply(BaseModel):
+    text: str = Field(default="", max_length=20_000)
+    choice: Optional[str] = Field(default=None, max_length=300)
+
+
+def _engineer(action):
+    from .engineer import EngineerError
+
+    try:
+        return action()
+    except EngineerError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/engineer")
+def engineer_overview():
+    """The platform engineer (engineer.py): its jobs, newest first, and what it is working on."""
+    return executor.engineer_overview()
+
+
+@app.post("/api/engineer/jobs", status_code=201)
+async def engineer_request(body: EngineerRequest):
+    """Ask the platform engineer for a repair (applied once checked) or a component (planned
+    first; applied once the user approves the checked change)."""
+    return _engineer(lambda: executor.engineer_request(body.request, body.kind, budget_usd=body.budget_usd))
+
+
+@app.post("/api/engineer/jobs/{job_id}/reply")
+async def engineer_reply(job_id: str, body: EngineerReply):
+    return _engineer(lambda: executor.engineer_reply(job_id, body.text, body.choice))
+
+
+@app.post("/api/engineer/jobs/{job_id}/approve")
+async def engineer_approve(job_id: str):
+    """Approve the plan (the engineer then makes the change) or the checked change (applied)."""
+    return _engineer(lambda: executor.engineer_approve(job_id))
+
+
+@app.post("/api/engineer/jobs/{job_id}/reject")
+async def engineer_reject(job_id: str):
+    from .engineer import EngineerError
+
+    try:
+        return await executor.engineer_reject(job_id)
+    except EngineerError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/channels/cli")
@@ -562,6 +617,8 @@ async def confirm_task(run_id: str, body: ConfirmTask):
     run = get_task(run_id)
     if run.waiting_diagnosis_id or run.maintenance_id:
         raise HTTPException(409, "请先回复诊断问题，或等待平台修复自动生效。")
+    if run.engineer_job_id:
+        raise HTTPException(409, "任务在等平台工程师添加组件：请到“平台工程师”页面批准或放弃这项工作。")
     diagnosis = executor.diagnosing.get(run_id)
     if diagnosis and not diagnosis.done():
         raise HTTPException(409, "诊断或修复仍在进行，完成后会自动继续；也可以取消任务。")
@@ -718,6 +775,8 @@ async def resume_task(run_id: str, body: ConfirmTask):
     run = get_task(run_id)
     if run.waiting_diagnosis_id or run.maintenance_id:
         raise HTTPException(409, "请先回复诊断问题，或等待平台修复自动生效。")
+    if run.engineer_job_id:
+        raise HTTPException(409, "任务在等平台工程师添加组件：请到“平台工程师”页面批准或放弃这项工作。")
     diagnosis = executor.diagnosing.get(run_id)
     if diagnosis and not diagnosis.done():
         raise HTTPException(409, "诊断或修复仍在进行，完成后会自动继续；也可以取消任务。")
@@ -775,6 +834,8 @@ async def cancel_task(run_id: str):
     run.status = RunStatus.CANCELLED
     run.waiting_diagnosis_id = None
     run.maintenance_id = None
+    # A component the lead asked for stays with the platform engineer; the user decides on it there.
+    run.engineer_job_id = None
     db.save_run(run)
     db.add_event(Event(run_id=run.id, kind="run.cancelled"))
     executor.cancel(run.id)

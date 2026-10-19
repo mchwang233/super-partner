@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional
 
-from .models import Event, ExecutionRun, ModelProfile, RunStatus
+from .models import EngineerJob, Event, ExecutionRun, ModelProfile, RunStatus
 
 
 class Database:
@@ -42,6 +42,9 @@ class Database:
                     id INTEGER PRIMARY KEY CHECK (id = 1), body TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS shared_repairs (
+                    id TEXT PRIMARY KEY, body TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS engineer_jobs (
                     id TEXT PRIMARY KEY, body TEXT NOT NULL, created_at TEXT NOT NULL
                 );
                 """
@@ -115,6 +118,26 @@ class Database:
                 "SELECT body FROM shared_repairs ORDER BY created_at DESC LIMIT ?", (limit,),
             ).fetchall()
         return [json.loads(row["body"]) for row in rows]
+
+    def save_engineer_job(self, job: EngineerJob) -> None:
+        with self.lock, self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO engineer_jobs(id, body, created_at) VALUES (?, ?, ?)",
+                (job.id, job.model_dump_json(), job.created_at.isoformat()),
+            )
+
+    def get_engineer_job(self, job_id: str) -> Optional[EngineerJob]:
+        with self.lock:
+            row = self.connection.execute("SELECT body FROM engineer_jobs WHERE id = ?", (job_id,)).fetchone()
+        return EngineerJob.model_validate_json(row["body"]) if row else None
+
+    def engineer_jobs(self, limit: int = 50) -> list[EngineerJob]:
+        """Newest first."""
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT body FROM engineer_jobs ORDER BY created_at DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [EngineerJob.model_validate_json(row["body"]) for row in rows]
 
     def save_run(self, run: ExecutionRun) -> None:
         with self.lock, self.connection:

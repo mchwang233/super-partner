@@ -317,9 +317,11 @@ class Decision(BaseModel):
     """What the task's lead decided, why, and about what (supervisor.py)."""
     id: str = Field(default_factory=lambda: uuid4().hex[:8])
     node_id: Optional[str] = None
-    # What it decided on: attempt_failed | verify_failed | user_answer | repair_done | all_done.
+    # What it decided on: attempt_failed | verify_failed | user_answer | repair_done | engineer_done |
+    # all_done.
     event: str
-    # retry | switch_model | accept | unable | ask_user | repair_environment | repair_platform,
+    # retry | switch_model | accept | unable | ask_user | repair_environment | repair_platform |
+    # request_component (engineer_job_id), rework, replan, done,
     # or fallback when no lead could decide and the usual diagnosis took over.
     action: str
     reason: str = ""
@@ -328,12 +330,13 @@ class Decision(BaseModel):
     # Steps a rework sent back.
     targets: list[str] = Field(default_factory=list)
     lead_model_id: Optional[str] = None
+    engineer_job_id: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
 
 
 class LeadThinking(BaseModel):
     """The lead is deciding something right now, shown until its decision arrives."""
-    # attempt_failed | verify_failed | user_answer | repair_done | overrun | all_done
+    # attempt_failed | verify_failed | user_answer | repair_done | engineer_done | overrun | all_done
     event: str
     node_id: Optional[str] = None
     started_at: datetime = Field(default_factory=utcnow)
@@ -364,6 +367,55 @@ class SupervisorSession(BaseModel):
     started_at: datetime = Field(default_factory=utcnow)
 
 
+class EngineerMessage(BaseModel):
+    """One line in a platform engineer job's conversation."""
+    role: str  # user | engineer | system
+    text: str
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class EngineerJob(BaseModel):
+    """A change to Super Partner itself by the platform engineer (engineer.py,
+    docs/design/platform-engineer.md): a repair, or a component to add."""
+    id: str = Field(default_factory=lambda: uuid4().hex[:10])
+    kind: str = "component"  # repair | component
+    origin: str = "user"  # user | lead | diagnosis
+    title: str = ""
+    request: str
+    # queued | planning | plan_ready | editing | validating | ready | needs_input | applying, or
+    # one of ENGINEER_DONE; ``phase`` is the work a queued job waits to do (plan | edit).
+    status: str = "queued"
+    phase: str = "plan"
+    plan: Optional[str] = None
+    report: Optional[str] = None
+    question: Optional[str] = None
+    choices: list[str] = Field(default_factory=list)
+    # The task a lead or diagnosis started it from.
+    run_id: Optional[str] = None
+    node_id: Optional[str] = None
+    decision_id: Optional[str] = None
+    diagnosis_id: Optional[str] = None
+    # The isolated source copy (platform_repair.PlatformRepairs job id), and what it changed.
+    repair_id: Optional[str] = None
+    files: list[str] = Field(default_factory=list)
+    checks: list[str] = Field(default_factory=list)
+    diff: Optional[str] = None
+    commit: Optional[str] = None
+    model_id: Optional[str] = None
+    messages: list[EngineerMessage] = Field(default_factory=list)
+    budget_usd: float = 2.0
+    cost_usd: float = 0.0
+    error: Optional[str] = None
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+    finished_at: Optional[datetime] = None
+
+
+# Engineer jobs in these states are over; those in WAITING wait for the user.
+ENGINEER_DONE = {"applied", "failed", "rejected", "cancelled"}
+ENGINEER_WAITING = {"plan_ready", "ready", "needs_input"}
+
+
 class ExecutionRun(BaseModel):
     id: str
     prompt: str
@@ -388,6 +440,8 @@ class ExecutionRun(BaseModel):
     decisions_since: Optional[datetime] = None
     # Only tasks deliberately held for an application repair may resume after its restart.
     maintenance_id: Optional[str] = None
+    # The platform engineer job (a component the lead asked for) this task waits for.
+    engineer_job_id: Optional[str] = None
     waiting_diagnosis_id: Optional[str] = None
     # A requirement change continues a finished task: the task it builds on, the scratch folder
     # they share (when there is no project), and what the planner and steps are told about it.

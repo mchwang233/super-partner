@@ -140,7 +140,7 @@ async def ask(providers, models: list[ModelProfile], configured: set[str], run: 
 # --- deciding what to do after a failed attempt -------------------------------------------------
 
 ACTIONS = ("retry", "switch_model", "accept", "unable", "ask_user", "repair_environment", "repair_platform",
-           "rework", "replan", "done")
+           "request_component", "rework", "replan", "done")
 # What the lead may answer when every step has finished.
 FINAL_ACTIONS = ("done", "rework", "replan")
 ACTION_RULES = {
@@ -162,6 +162,11 @@ ACTION_RULES = {
                           "fixes it, then the step runs again.\n",
     "repair_platform": "- repair_platform: Super Partner itself (its scheduler, tools or sandbox) is at fault; say "
                        "what and where. A source repair is made, checked and applied, then the task continues.\n",
+    "request_component": "- request_component: the task needs a capability Super Partner does not have (a tool for "
+                         "the steps, a model channel, a kind of step or check) and no repair of a defect would "
+                         "give it. Say in instructions what to add and why. Super Partner's platform engineer "
+                         "plans it, the user approves, and it is built, checked and applied; the task waits, "
+                         "then you decide again.\n",
     "replan": "- replan: change the plan in \"plan\": add steps, remove steps that have not finished, or rewrite "
               "the instructions of steps that have not finished (splitting a step that is too big, adding a "
               "missing prerequisite, dropping one the task does not need). Finished steps stay as they are.\n",
@@ -191,7 +196,7 @@ def decision_format(rework: bool = False, final: bool = False) -> str:
         f'{{"action": "{" | ".join(actions)}", '
         '"reason": "one or two sentences in Chinese, shown to the user", '
         '"instructions": "for retry / switch_model / rework: exactly what must be done differently; '
-        'for repair_*: what to repair", "model_id": "switch_model only: one of the models listed", '
+        'for repair_*: what to repair; for request_component: what to add and why", "model_id": "switch_model only: one of the models listed", '
         + ('"targets": ["rework only: ids of the steps to redo"], ' if rework or final else "")
         + (PLAN_FORMAT + ", " if "replan" in actions else "")
         + '"question": "ask_user only, in Chinese", "options": ["ask_user only: up to 4 answers"], '
@@ -341,6 +346,35 @@ def repair_message(run: ExecutionRun, node, diagnosis, choices: list[ModelProfil
     ])
 
 
+ENGINEER_OUTCOMES = {
+    "applied": "It was built, checked and applied: Super Partner now has it.",
+    "failed": "It could not be built or applied.",
+    "rejected": "The user gave it up: it will not be added.",
+    "cancelled": "It was cancelled.",
+}
+
+
+def engineer_message(run: ExecutionRun, node, job, choices: list[ModelProfile], left: tuple[int, int]) -> str:
+    """The component the lead asked the platform engineer for is done with: its outcome."""
+    talk = [f"- {item.role}: {item.text[:400]}" for item in job.messages[-6:] if item.role in {"user", "engineer"}]
+    return "\n".join([
+        f"EVENT: the component you asked for, for step [{node.id}] {node.title}, is done with. "
+        + ENGINEER_OUTCOMES.get(job.status, f"It ended as {job.status}."),
+        f"What you asked for: {job.request[:800]}",
+        *([f"The plan:\n{job.plan[:MAX_REPAIR_REPORT]}"] if job.plan else []),
+        *([f"Its report:\n{job.report[:MAX_REPAIR_REPORT]}"] if job.report else []),
+        *([f"Why it failed: {job.error[:800]}"] if job.error else []),
+        *([f"Changed files: {', '.join(job.files[:30])}"] if job.files else []),
+        *(["What the user and the engineer said:", *talk] if talk else []),
+        "Where the steps stand:", *_steps(run),
+        "Models that can take this step:", *_models(choices, node),
+        f"Decisions left: {left[0]} for this step, {left[1]} for the task; after that the task pauses for the user.",
+        "",
+        "Decide what to do with the step now. Without the component, do not send the step back to the same wall.",
+        DECISION_FORMAT,
+    ])
+
+
 def answer_message(node, question: str, answer: str, rework: bool = False) -> str:
     """Hand the user's answer to the lead's question back to it."""
     return "\n".join([
@@ -375,6 +409,8 @@ def parse_decision(text: str, model_ids: set[str], targets: Optional[set[str]] =
     if clean["action"] == "switch_model" and clean.get("model_id") not in model_ids:
         return None
     if clean["action"] == "ask_user" and not clean.get("question"):
+        return None
+    if clean["action"] == "request_component" and not (clean.get("instructions") or clean.get("reason")):
         return None
     if clean["action"] == "rework":
         chosen = payload.get("targets") or sorted(targets or ())

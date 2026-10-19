@@ -8,11 +8,12 @@ import { MarkdownView } from "./markdown";
 import { DiagnosisPanel, type Diagnosis } from "./diagnosis";
 import { LeadPanel, hasLead, leadRepairIds, type AskLead, type Decision, type LeadMessage, type LeadThinking } from "./lead";
 import { ProjectField, rememberProject } from "./project-picker";
+import { EngineerPage, waitingJobs, type EngineerJob } from "./engineer";
 import { canCancelMission, canDeleteMission, CancelMissionDialog, DeleteMissionButton, DeleteMissionDialog, formatUsd, MissionHistory, needsAttention, statusLabel } from "./mission-history";
 import "./style.css";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
-type Run = {id:string;status:string;prompt?:string;created_at?:string;updated_at?:string;diagnoses?:Diagnosis[];supervisor?:{model_id?:string|null;calls?:number}|null;decisions?:Decision[];lead_messages?:LeadMessage[];lead_thinking?:LeadThinking|null;maintenance_id?:string|null;waiting_diagnosis_id?:string|null;parent_run_id?:string|null;budget_usd:number;use_cli:boolean;allow_network?:boolean;project_dir?:string|null;attachments?:Attachment[];rework_rounds?:number;actual_cost_usd:number;final_result?:string;error?:string;plan:{summary:string;nodes:PlanNode[];planning_method:string;planner_model_id?:string;planning_note?:string;planning_cost_usd:number;estimate:{low_usd:number;high_usd:number}}};
+type Run = {id:string;status:string;prompt?:string;created_at?:string;updated_at?:string;diagnoses?:Diagnosis[];supervisor?:{model_id?:string|null;calls?:number}|null;decisions?:Decision[];lead_messages?:LeadMessage[];lead_thinking?:LeadThinking|null;maintenance_id?:string|null;engineer_job_id?:string|null;waiting_diagnosis_id?:string|null;parent_run_id?:string|null;budget_usd:number;use_cli:boolean;allow_network?:boolean;project_dir?:string|null;attachments?:Attachment[];rework_rounds?:number;actual_cost_usd:number;final_result?:string;error?:string;plan:{summary:string;nodes:PlanNode[];planning_method:string;planner_model_id?:string;planning_note?:string;planning_cost_usd:number;estimate:{low_usd:number;high_usd:number}}};
 type ReplyToDiagnosis = (run:Run, diagnosisId:string, body:{text:string;choice?:string})=>Promise<string|null>;
 type Provider = {id:string;name:string;configured:boolean};
 // The task list polls often; the model catalog is large and changes rarely.
@@ -147,9 +148,10 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "node.model_switched":(data,title)=>`${title(data.node_id)}：${data.model_id} ${data.reason==="model_configuration_changed"?"配置已变更":data.reason==="model_unavailable"?"服务暂时不可用":"额度用完"}，换用 ${data.next_model_id}`,
   "node.superseded":(data,title)=>`${title(data.node_id)}：上游已返工，旧结果失效，将重新执行`,
   "run.recovered":data=>data.reason==="lead"?"负责人已处理你的回答，任务继续":"诊断已处理阻碍，任务自动继续",
-  "run.decision":(data,title)=>`负责人决定${data.node_id?`（${title(data.node_id)}）`:""}：${({retry:"按要求重试",switch_model:`换成 ${data.model_id??"其它模型"}`,accept:"接受当前结果",unable:"判定无法完成",ask_user:"需要问你",repair_environment:"修复环境",repair_platform:"修复 Super Partner",rework:`返工 ${(data.targets??[]).map(title).join("、")}`,replan:"调整计划",done:"确认任务完成",fallback:"暂时无法决策，交给诊断"} as Record<string,string>)[data.action]??data.action}${data.reason?` · ${data.reason}`:""}`,
+  "run.decision":(data,title)=>`负责人决定${data.node_id?`（${title(data.node_id)}）`:""}：${({retry:"按要求重试",switch_model:`换成 ${data.model_id??"其它模型"}`,accept:"接受当前结果",unable:"判定无法完成",ask_user:"需要问你",repair_environment:"修复环境",repair_platform:"修复 Super Partner",request_component:"请平台工程师添加组件",rework:`返工 ${(data.targets??[]).map(title).join("、")}`,replan:"调整计划",done:"确认任务完成",fallback:"暂时无法决策，交给诊断"} as Record<string,string>)[data.action]??data.action}${data.reason?` · ${data.reason}`:""}`,
   "run.plan_changed":data=>`负责人调整了计划：${[data.added?.length?`新增 ${data.added.join("、")}`:"",data.removed?.length?`删除 ${data.removed.join("、")}`:"",data.updated?.length?`修改 ${data.updated.join("、")}`:""].filter(Boolean).join("；")}`,
-  "run.lead_thinking":(data,title)=>`负责人开始判断${data.node_id?`（${title(data.node_id)}）`:""}：${({attempt_failed:"尝试失败后怎么处理",verify_failed:"验证没通过是否返工",user_answer:"根据你的回答下一步做什么",all_done:"整体结果是否满足需求",repair_done:"修复是否真的生效",overrun:"超出预计轮数是否继续"} as Record<string,string>)[data.event]??data.event}`,
+  "run.lead_thinking":(data,title)=>`负责人开始判断${data.node_id?`（${title(data.node_id)}）`:""}：${({attempt_failed:"尝试失败后怎么处理",verify_failed:"验证没通过是否返工",user_answer:"根据你的回答下一步做什么",all_done:"整体结果是否满足需求",repair_done:"修复是否真的生效",engineer_done:"平台工程师的结果如何处理",overrun:"超出预计轮数是否继续"} as Record<string,string>)[data.event]??data.event}`,
+  "run.engineer_requested":(data,title)=>`负责人请平台工程师添加组件${data.node_id?`（${title(data.node_id)}）`:""}，等你在“平台工程师”页面批准方案`,
   "run.lead_changed":data=>`负责人换成 ${data.model_id}${data.previous_model_id?`（原为 ${data.previous_model_id}）`:""}`,
   "node.succeeded":(data,title)=>`${title(data.node_id)}：完成`,
   "node.overrun_check":(data,title)=>data.stop?`${title(data.node_id)}：已用 ${data.turns} 轮（预计 ${data.expected} 轮），负责人停止了这次尝试（${data.reason??""}）`:`${title(data.node_id)}：已用 ${data.turns} 轮（预计 ${data.expected} 轮），负责人判断仍在推进，继续执行`,
@@ -221,7 +223,7 @@ function QuotaBanner({quota,models,onReset}:{quota:Quota[];models:Model[];onRese
 
 type SetNetwork=(run:Run,allow:boolean)=>Promise<string|null>;
 
-function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,onCancel,onDelete,onOpenModel,onPause,onDiagnose,onReply,onAsk,onChange,onNetwork,parent,onOpenRun}:{onAsk:(run:Run,text:string)=>Promise<string|null>;onNetwork:SetNetwork;onChange:(run:Run,prompt:string,budget:number,options:ChangeOptions)=>Promise<string|null>;parent?:Run;onOpenRun:(run:Run)=>void;run:Run|null;models:Model[];onOpenModel:(model:Model)=>void;onPause:(run:Run)=>Promise<string|null>;onDiagnose:(run:Run)=>Promise<string|null>;onReply:ReplyToDiagnosis;deletingId:string|null;cancellingId:string|null;onConfirm:(run:Run,budget:number)=>Promise<string|null>;onResume:(run:Run,budget:number)=>Promise<string|null>;onCancel:(run:Run)=>void;onDelete:(run:Run)=>void}) {
+function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,onCancel,onDelete,onOpenModel,onPause,onDiagnose,onReply,onAsk,onOpenEngineer,onChange,onNetwork,parent,onOpenRun}:{onAsk:(run:Run,text:string)=>Promise<string|null>;onOpenEngineer:(jobId:string)=>void;onNetwork:SetNetwork;onChange:(run:Run,prompt:string,budget:number,options:ChangeOptions)=>Promise<string|null>;parent?:Run;onOpenRun:(run:Run)=>void;run:Run|null;models:Model[];onOpenModel:(model:Model)=>void;onPause:(run:Run)=>Promise<string|null>;onDiagnose:(run:Run)=>Promise<string|null>;onReply:ReplyToDiagnosis;deletingId:string|null;cancellingId:string|null;onConfirm:(run:Run,budget:number)=>Promise<string|null>;onResume:(run:Run,budget:number)=>Promise<string|null>;onCancel:(run:Run)=>void;onDelete:(run:Run)=>void}) {
   const [budget,setBudget]=useState(run?.budget_usd??2),[error,setError]=useState(""),[busy,setBusy]=useState(false);
   const [tab,setTab]=useState<Tab>(defaultTab(run?.status??"")),picked=useRef(false),[now,setNow]=useState(()=>Date.now());
   useEffect(()=>{setBudget(run?.budget_usd??2);setError("");picked.current=false;setTab(defaultTab(run?.status??""))},[run?.id]);
@@ -280,7 +282,7 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
     </div>}
     {error&&<div className="error" role="alert">{error}</div>}
     {run.error&&<div className="error">{run.error}</div>}
-    {hasLead(run)&&<LeadPanel run={run} models={models} onReply={(id,body)=>onReply(run,id,body)} onAsk={(text=>onAsk(run,text)) satisfies AskLead}/>}
+    {hasLead(run)&&<LeadPanel run={run} models={models} onReply={(id,body)=>onReply(run,id,body)} onAsk={(text=>onAsk(run,text)) satisfies AskLead} onOpenEngineer={onOpenEngineer}/>}
     {/* Diagnoses that run when no lead decides, or that the lead sends to repair something. */}
     <DiagnosisPanel run={{...run,diagnoses:(run.diagnoses??[]).filter(item=>item.trigger!=="lead"&&!leadRepairIds(run.diagnoses).has(item.id))}} models={models} onReply={(id,body)=>onReply(run,id,body)}/>
     <nav className="task-tabs" aria-label="任务内容">{([["progress","进度"],["result","结果"],["details","详情"]] as const).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}</button>)}</nav>
@@ -298,7 +300,7 @@ const NOTICE: Record<string,{text:string;tone:Toast["tone"]}> = {
 
 function App() {
   const [runs,setRuns]=useState<Run[]>([]),[models,setModels]=useState<Model[]>([]),[providerList,setProviderList]=useState<Provider[]>([]);
-  const [view,setView]=useState<"missions"|"models">("missions"),[selectedModelId,setSelectedModelId]=useState("");
+  const [view,setView]=useState<"missions"|"models"|"engineer">("missions"),[engineerFocus,setEngineerFocus]=useState<string|null>(null),[engineerWaiting,setEngineerWaiting]=useState(0),[selectedModelId,setSelectedModelId]=useState("");
   const [selected,setSelected]=useState<Run|null>(null),[selectedProvider,setSelectedProvider]=useState<Provider|null>(null),[prompt,setPrompt]=useState(""),[budget,setBudget]=useState(2),[useCli,setUseCli]=useState(true),[allowNetwork,setAllowNetwork]=useState(false),[busy,setBusy]=useState(false),[projectDir,setProjectDir]=useState(savedProjectDir);
   const [formError,setFormError]=useState(""),[offline,setOffline]=useState(false);
   const attachments=useAttachments(API),[dragging,setDragging]=useState(false);
@@ -314,9 +316,11 @@ function App() {
   const [quota,setQuota]=useState<Quota[]>([]);
   // Separate from the main load: an older API without this route must not look offline.
   const loadQuota=async(init?:RequestInit,path="")=>{try{const r=await fetch(`${API}/api/models/quota${path}`,init);if(r.ok)setQuota(await r.json())}catch{}};
+  // How many platform engineer jobs wait for the user, for the badge; an older API has no route.
+  const loadEngineer=async()=>{try{const r=await fetch(`${API}/api/engineer`);if(r.ok)setEngineerWaiting(waitingJobs(((await r.json()).jobs??[]) as EngineerJob[]))}catch{}};
   const load=async(withModels=true)=>{
     const revision=loadRevision.current;
-    void loadQuota();
+    void loadQuota();void loadEngineer();
     try{
       const urls=[`${API}/api/tasks`,...(withModels?[`${API}/api/models`,`${API}/api/providers`]:[])];
       const data=await Promise.all((await Promise.all(urls.map(url=>fetch(url)))).map(r=>r.json()));
@@ -434,9 +438,9 @@ function App() {
   function configureModel(model:Model){setSelectedProvider(providerList.find(provider=>provider.id===model.provider)||null)}
   return <main className={view==="models"?"profiles-view":undefined}>
     {quota.length>0&&<QuotaBanner quota={quota} models={models} onReset={id=>loadQuota({method:"DELETE"},`/${encodeURIComponent(id)}`)}/>}
-    <header><div><span className="logo">SP</span><h1>Super Partner</h1></div><div className="header-actions"><button type="button" className="primary new-task" aria-expanded={view==="missions"&&composerOpen} onClick={()=>{setView("missions");setComposerOpen(open=>view!=="missions"||!open);window.scrollTo({top:0})}}>＋ 新任务</button><nav className="app-nav" aria-label="页面导航"><button aria-pressed={view!=="models"} onClick={()=>setView("missions")}>任务工作台</button><button aria-pressed={view==="models"} onClick={()=>setView("models")}>模型画像<span>{models.length}</span></button></nav><ThemeSwitch/></div></header>
+    <header><div><span className="logo">SP</span><h1>Super Partner</h1></div><div className="header-actions"><button type="button" className="primary new-task" aria-expanded={view==="missions"&&composerOpen} onClick={()=>{setView("missions");setComposerOpen(open=>view!=="missions"||!open);window.scrollTo({top:0})}}>＋ 新任务</button><nav className="app-nav" aria-label="页面导航"><button aria-pressed={view==="missions"} onClick={()=>setView("missions")}>任务工作台</button><button aria-pressed={view==="engineer"} onClick={()=>{setEngineerFocus(null);setView("engineer")}} title="修复 Super Partner 自身，或给它添加组件">平台工程师{engineerWaiting>0&&<span className="nav-badge" title="等你处理">{engineerWaiting}</span>}</button><button aria-pressed={view==="models"} onClick={()=>setView("models")}>模型画像<span>{models.length}</span></button></nav><ThemeSwitch/></div></header>
     {offline&&<p className="offline" role="status">无法连接本地 API（{API}），正在重试…</p>}
-    {view==="models"?<ModelProfiles apiBase={API} models={models} selectedId={selectedModelId} onSelect={setSelectedModelId} onToggle={toggleModel} onConfigure={configureModel}/>:<>
+    {view==="engineer"?<EngineerPage apiBase={API} runs={runs} focusId={engineerFocus} onOpenRun={id=>{const run=runs.find(item=>item.id===id);if(run){autoSelected.current=true;setSelected(run);setView("missions")}}}/>:view==="models"?<ModelProfiles apiBase={API} models={models} selectedId={selectedModelId} onSelect={setSelectedModelId} onToggle={toggleModel} onConfigure={configureModel}/>:<>
     <div className={`workbench ${historyCollapsed?"history-collapsed":""}`}>
     <MissionHistory runs={runs} selectedId={selected?.id} deletingId={deletingRunId} error={deleteTarget?"":deleteError} onSelect={run=>{setSelected(run)}} onDelete={requestDeleteRun} collapsed={historyCollapsed} onToggle={()=>setHistoryCollapsed(value=>!value)}/>
     <div className="workbench-main">
@@ -449,7 +453,7 @@ function App() {
       <ProjectField apiBase={API} value={projectDir} onChange={setProjectDir} usedProjects={usedProjects}/>
       <div className="formbar"><div className="controls"><AttachButton onFiles={attachments.add}/><label className="budget-field" title="执行花费达到上限时任务会自动暂停">预算上限 <span>$</span><BudgetInput value={budget} onChange={setBudget} required/></label><label className="switch" title="关闭后本任务只使用按量计费的 API 模型"><input type="checkbox" checked={useCli} onChange={e=>setUseCli(e.target.checked)}/><span/>允许使用会员 CLI</label><label className="switch" title={NETWORK_HINT}><input type="checkbox" checked={allowNetwork} onChange={e=>setAllowNetwork(e.target.checked)}/><span/>允许联网</label><ModelFleet models={models} onOpenAll={()=>setView("models")} onOpen={openModelProfile} onToggle={toggleModel} onConfigure={configureModel}/></div><div className="submit-group"><small>Ctrl + Enter</small><button className="primary" disabled={busy||attachments.uploading||!(budget>0)}>{busy?"正在生成计划…":attachments.uploading?"附件上传中…":"生成执行计划 →"}</button></div></div>
     </form>{formError&&<p className="form-error" role="alert">{formError}</p>}</section>}
-      <MissionDetail run={selected} models={models} onOpenModel={openModelProfile} deletingId={deletingRunId} cancellingId={cancellingRunId} onConfirm={confirmRun} onResume={resumeRun} onPause={run=>postAction(run,"pause","暂停")} onDiagnose={run=>postAction(run,"diagnose","诊断")} onReply={replyToDiagnosis} onAsk={askLead} onChange={changeRequirement} onNetwork={setNetwork} parent={selected?.parent_run_id?runs.find(item=>item.id===selected.parent_run_id):undefined} onOpenRun={run=>{autoSelected.current=true;setSelected(run)}} onCancel={requestCancelRun} onDelete={requestDeleteRun}/>
+      <MissionDetail run={selected} models={models} onOpenModel={openModelProfile} deletingId={deletingRunId} cancellingId={cancellingRunId} onConfirm={confirmRun} onResume={resumeRun} onPause={run=>postAction(run,"pause","暂停")} onDiagnose={run=>postAction(run,"diagnose","诊断")} onReply={replyToDiagnosis} onAsk={askLead} onOpenEngineer={id=>{setEngineerFocus(id);setView("engineer");window.scrollTo({top:0})}} onChange={changeRequirement} onNetwork={setNetwork} parent={selected?.parent_run_id?runs.find(item=>item.id===selected.parent_run_id):undefined} onOpenRun={run=>{autoSelected.current=true;setSelected(run)}} onCancel={requestCancelRun} onDelete={requestDeleteRun}/>
     </div>
     </div>
     </>}

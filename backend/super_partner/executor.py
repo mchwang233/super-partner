@@ -12,6 +12,7 @@ from .cli_channels import CLI_SPECS
 from .config import settings
 from .db import Database
 from .diagnosing import Diagnosing
+from .engineer import Engineering
 from .leading import Leading
 from .models import Diagnosis, Event, ExecutionRun, NodeAttempt, NodeStatus, Outcome, RunStatus
 from .platform_repair import PlatformRepairs
@@ -35,10 +36,10 @@ CHARS_PER_TOKEN = 3
 DEFAULT_CONTEXT = 128_000
 
 
-class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
+class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering):
     """Runs a task's steps: scheduling, attempts, retries and step outcomes. Reviewing
-    (review.py), the lead's decisions (leading.py), diagnosing (diagnosing.py) and self-repair
-    (self_repair.py) are mixed in."""
+    (review.py), the lead's decisions (leading.py), diagnosing (diagnosing.py), self-repair
+    (self_repair.py) and the platform engineer (engineer.py) are mixed in."""
 
     def __init__(self, db: Database, providers: ProviderRegistry, model_lookup: dict):
         self.db = db
@@ -67,6 +68,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
                                         self.db.connection.execute("PRAGMA database_list").fetchone()[2])
         self.platform_pending = None
         self.maintenance_task: Optional[asyncio.Task] = None
+        # The platform engineer's job at work, if any (engineer.py).
+        self.engineer_task: Optional[asyncio.Task] = None
+        self.engineer_job_id: Optional[str] = None
         self.active_requests = 0
 
     def start(self, run_id: str) -> None:
@@ -86,8 +90,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair):
 
     async def shutdown(self) -> None:
         tasks = set(self.tasks.values()) | set(self.diagnosing.values())
-        if self.maintenance_task:
-            tasks.add(self.maintenance_task)
+        tasks |= {task for task in (self.maintenance_task, self.engineer_task) if task}
         for task in tasks:
             if not task.done():
                 task.cancel()
