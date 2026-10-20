@@ -47,7 +47,15 @@ from .projects import (
     resolve_project_dir,
 )
 from .providers import ProviderError, ProviderRegistry
-from .routing import NoEligibleModelError, brief_writer, eligible_for_node, estimate, route_node
+from .routing import (
+    NoEligibleModelError,
+    brief_writer,
+    eligible_for_node,
+    estimate,
+    fit_and_route,
+    part_estimate,
+    route_node,
+)
 from .scoring import AA_SOURCE, rescore
 from .secrets import (
     PROVIDER_ENV,
@@ -230,9 +238,20 @@ def _engineer(action):
 
 
 @app.get("/api/engineer")
-def engineer_overview():
-    """The platform engineer (engineer.py): its jobs, newest first, and what it is working on."""
-    return executor.engineer_overview()
+def engineer_overview(run_id: Optional[str] = None):
+    """The platform engineer (engineer.py): its jobs, newest first, and what it is working on;
+    with ``run_id``, only the jobs of that task."""
+    return executor.engineer_overview(run_id=run_id)
+
+
+@app.post("/api/tasks/{run_id}/engineer", status_code=201)
+async def engineer_join(run_id: str, body: EngineerRequest):
+    """The user brings the platform engineer into the task's conversation with its lead."""
+    get_task(run_id)
+    job, problem = executor.engineer_join(run_id, {"request": body.request, "kind": body.kind}, "user")
+    if not job:
+        raise HTTPException(409, problem)
+    return job
 
 
 @app.post("/api/engineer/jobs", status_code=201)
@@ -470,30 +489,22 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
         session=(session := SupervisorSession()), brief=brief,
     )
     plan.planning_cost_usd = round(plan.planning_cost_usd + brief_cost, 6)
+    catalog = list(models.values())
+    if parent:
+        plan.in_project = True
     try:
         for node in plan.nodes:
             if parent:
                 # Every step changes files the earlier task left, so it needs a model that can act.
                 node.needs_workspace = True
-            available = eligible_for_node(node, list(models.values()), configured, needs_vision)
-            if available:
-                best_score = max(
-                    model.scores.score_for(node.capability) for model in available
-                )
-                if node.quality_threshold > best_score:
-                    original = node.quality_threshold
-                    node.quality_threshold = best_score
-                    adjustment = (
-                        f"Adjusted {node.title} {node.capability} threshold "
-                        f"from {original:g} to {best_score:g} for available models"
-                    )
-                    plan.planning_note = (
-                        f"{plan.planning_note}; {adjustment}" if plan.planning_note else adjustment
-                    )
-            route_node(node, list(models.values()), configured, needs_vision)
+            if note := fit_and_route(node, catalog, configured, needs_vision):
+                plan.planning_note = f"{plan.planning_note}; {note}" if plan.planning_note else note
+        for part in plan.parts:
+            if part.status == "planned":
+                part.estimated_cost_usd = part_estimate(part, plan.in_project, catalog, configured, needs_vision)
     except NoEligibleModelError as exc:
         raise HTTPException(422, str(exc)) from exc
-    plan.estimate = estimate(plan.nodes, body.budget_usd, plan.planning_cost_usd)
+    plan.estimate = estimate(plan.nodes, body.budget_usd, plan.planning_cost_usd, plan.unsplit_cost())
     run = ExecutionRun(
         id=str(uuid4()), prompt=body.prompt, status=RunStatus.AWAITING_CONFIRMATION,
         plan=plan, budget_usd=body.budget_usd, use_cli=body.use_cli, allow_network=body.allow_network,
@@ -639,7 +650,7 @@ async def confirm_task(run_id: str, body: ConfirmTask):
                 route_node(node, list(models.values()), configured, any(a.kind == "image" for a in run.attachments))
     except NoEligibleModelError as exc:
         raise HTTPException(422, str(exc)) from exc
-    required = run.actual_cost_usd + sum(
+    required = run.actual_cost_usd + run.plan.unsplit_cost() + sum(
         node.estimated_cost_usd for node in run.plan.nodes if node.status != NodeStatus.SUCCEEDED
     )
     if required > budget:
@@ -807,7 +818,7 @@ async def resume_task(run_id: str, body: ConfirmTask):
     except NoEligibleModelError as exc:
         raise HTTPException(422, str(exc)) from exc
     budget = body.budget_usd if body.budget_usd is not None else run.budget_usd
-    required = run.actual_cost_usd + sum(
+    required = run.actual_cost_usd + run.plan.unsplit_cost() + sum(
         node.estimated_cost_usd for node in run.plan.nodes if node.status != NodeStatus.SUCCEEDED
     )
     if required > budget:

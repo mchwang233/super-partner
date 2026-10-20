@@ -282,7 +282,12 @@ class Leading:
                 run.error, run.waiting_diagnosis_id = question.question, question.id
                 self.emit(run_id, "run.diagnosis_question", diagnosis_id=question.id,
                           question=question.question, choices=question.choices)
-            else:
+            if (call := decision.get("engineer")) and action not in {"request_component", "repair_platform"}:
+                # Something in Super Partner itself the lead found on the way: the engineer takes it
+                # in the background, whatever this decision does with the step.
+                job, _ = self.engineer_join(run_id, call, "lead", node_id, made.id)
+                made.engineer_job_id = job.id if job else None
+            if action in {"repair_environment", "repair_platform"}:
                 # A repair session with access to this machine (or a platform source repair) does
                 # the work; its outcome comes back to the lead (_after_repair) before the step runs.
                 node.status = NodeStatus.RUNNING
@@ -337,8 +342,14 @@ class Leading:
         return True
 
     async def _lead_chat(self, run_id: str, text: str, reply_id: str) -> None:
+        job = None
         try:
             answer, status = await self.ask_lead(run_id, supervisor.chat_message(text)), "done"
+            # The lead may bring the platform engineer in at once.
+            answer, call = supervisor.split_engineer(answer)
+            if call:
+                job, problem = self.engineer_join(run_id, call, "lead")
+                answer += f"\n\n（已请平台工程师加入：{job.title}）" if job else f"\n\n（没能请平台工程师加入：{problem}）"
         except asyncio.CancelledError:
             answer, status = "这条回复被中断了，请重新提问。", "failed"
             raise
@@ -350,6 +361,7 @@ class Leading:
                 reply = next((item for item in run.lead_messages if item.id == reply_id), None) if run else None
                 if reply:
                     reply.text, reply.status = answer, status
+                    reply.engineer_job_id = job.id if job else None
                     self._save(run)
         self.emit(run_id, "run.lead_message", role="lead", status=status)
 

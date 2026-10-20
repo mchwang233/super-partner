@@ -1,21 +1,35 @@
-"""The lead plans top-down: major parts first, then each part split level by level until every
-piece is a task that is independent, clear, small and checkable on its own."""
+"""The lead plans top-down. Before the task runs, it splits the request into major parts by
+function, each with the contract it provides. Once the task runs, every part is split at the same
+time, level by level, until each piece is a task that is independent, clear, small and checkable on
+its own."""
+import asyncio
 import json
 
 from super_partner import outline, supervisor
-from super_partner.models import PlanPart, SupervisorSession, TaskNode, TaskPlan
+from super_partner.executor import Executor
+from super_partner.models import (
+    ExecutionRun,
+    PlanPart,
+    RunStatus,
+    SupervisorSession,
+    TaskNode,
+    TaskPlan,
+)
 from super_partner.planner import autonomous_plan
+from super_partner.providers import ProviderResult
 from super_partner.quality import node_prompt
 from super_partner.replan import change_plan
+from test_leading import MODELS as RUN_MODELS
+from test_leading import decision
 from test_replan import CONFIGURED, MODELS, plan, step
 from test_supervisor import CONFIGURED as LEADS_CONFIGURED
 from test_supervisor import MODELS as LEAD_MODELS
 from test_supervisor import Leads
 
 
-def part(key, title, deps=()):
+def part(key, title, deps=(), **fields):
     return {"key": key, "kind": "part", "title": title, "goal": f"{title}的目标", "acceptance": "可验收",
-            "dependencies": list(deps)}
+            "dependencies": list(deps), **fields}
 
 
 def task(key, title, deps=(), **fields):
@@ -31,49 +45,79 @@ def split(*children):
     return json.dumps({"children": list(children)})
 
 
-async def test_the_lead_splits_major_parts_level_by_level_into_tasks():
-    leads = Leads([
-        outline_reply(part("api", "后端"), part("ui", "前端", ["api"])),
-        split(part("store", "存储"), task("routes", "接口", ["store"])),
-        split(task("model", "数据模型"), task("db", "数据库读写", ["model"])),
-        split(task("page", "页面"), task("check", "检查", ["page"], verifies=["page"], files=[], reads=["page.py"])),
-    ])
-    result = await autonomous_plan("写一个待办应用", LEAD_MODELS, LEADS_CONFIGURED, leads, session=SupervisorSession())
-    titles = {item.id: item.title for item in [*result.nodes, *result.parts]}
-    assert [(item.title, titles.get(item.parent_id)) for item in result.parts] == [
-        ("后端", None), ("存储", "后端"), ("前端", None)]
-    # Only tasks run, in the order they were planned; each knows its innermost part.
-    assert [(node.title, titles[node.part_id]) for node in result.nodes] == [
-        ("数据模型", "存储"), ("数据库读写", "存储"), ("接口", "后端"), ("页面", "前端"), ("检查", "前端")]
-    # Waiting for a part means waiting for its last tasks.
-    assert {node.title: [titles[item] for item in node.dependencies] for node in result.nodes} == {
-        "数据模型": [], "数据库读写": ["数据模型"], "接口": ["数据库读写"], "页面": ["接口"], "检查": ["页面", "接口"]}
-    assert [titles[item] for item in result.nodes[-1].verifies] == ["页面"]
-    # Depth first: a part's own parts are split before the next major part.
-    messages = [message for _, _, message in leads.messages]
-    assert "major parts" in messages[0] and "independent" in messages[0]
-    assert messages[1].startswith('Split part "后端" (后端)') and '"kind": "part"' in messages[1]
-    assert messages[2].startswith('Split part "存储" (后端 › 存储)')
-    assert messages[3].startswith('Split part "前端"')
-    assert "逐级拆分" in result.planning_note
+BACKEND = part("api", "后端", provides="GET /todos -> [{id, title, done}]", size=3)
+FRONTEND = part("ui", "前端", ["api"], provides="index.html", size=2, capability="coding")
+
+
+async def outlined(*parts):
+    leads = Leads([outline_reply(*parts)])
+    planned = await autonomous_plan("写一个待办应用", LEAD_MODELS, LEADS_CONFIGURED, leads, session=SupervisorSession())
+    return planned, leads
+
+
+async def refine(planned, title, *replies):
+    """Split major part ``title`` with ``replies``; returns the messages its planner was sent."""
+    leads = Leads(list(replies))
+    session = SupervisorSession(model_id="cli:codex")
+
+    async def say(text):
+        return (await leads.converse(session, text)).text
+
+    target = next(item for item in planned.parts if item.title == title)
+    parts, nodes = await outline.refine(say, planned, target, outline.part_opening(planned, target))
+    planned.parts += parts
+    planned.nodes += nodes
+    target.status = "ready"
+    outline.link(planned)
+    return [message for _, _, message in leads.messages]
+
+
+async def test_before_it_runs_a_task_is_planned_as_major_parts_by_function():
+    planned, leads = await outlined(BACKEND, FRONTEND)
+    assert planned.nodes == [] and planned.request.startswith("写一个待办应用")
+    assert [(item.title, item.status, item.size, item.provides) for item in planned.parts] == [
+        ("后端", "planned", 3, "GET /todos -> [{id, title, done}]"), ("前端", "planned", 2, "index.html")]
+    assert planned.parts[1].dependencies == [planned.parts[0].id]
+    asked = leads.messages[0][2]
+    assert "By function, not by phase" in asked and "includes its own tests" in asked and '"provides"' in asked
+    assert "各大项同时细化" in planned.planning_note
+
+
+async def test_a_major_part_is_split_level_by_level_and_waits_become_task_waits():
+    planned, _ = await outlined(BACKEND, FRONTEND)
+    # The front end is split first: its tasks cannot wait for the back end's tasks yet.
+    front = await refine(planned, "前端", split(task("page", "页面"), task("check", "检查", ["page"], verifies=["page"],
+                                                                         files=[], reads=["page.py"])))
+    page = planned.nodes[0]
+    assert page.dependencies == [] and outline.waits_on_unsplit(planned, page)
+    back = await refine(planned, "后端", split(part("store", "存储"), task("routes", "接口", ["store"])),
+                        split(task("model", "数据模型"), task("db", "数据库读写", ["model"])))
+    titles = {item.id: item.title for item in [*planned.nodes, *planned.parts]}
+    assert [(node.title, titles[node.part_id]) for node in planned.nodes] == [
+        ("页面", "前端"), ("检查", "前端"), ("数据模型", "存储"), ("数据库读写", "存储"), ("接口", "后端")]
+    # Once both are split, the front end's tasks wait for the back end's last task.
+    assert {node.title: [titles[item] for item in node.dependencies] for node in planned.nodes} == {
+        "页面": ["接口"], "检查": ["页面", "接口"], "数据模型": [], "数据库读写": ["数据模型"], "接口": ["数据库读写"]}
+    assert not outline.waits_on_unsplit(planned, page)
+    # Each planner sees the outline with every part's contract, and its own part; depth first.
+    assert "Outline of the task" in front[0] and "provides: GET /todos" in front[0] and "Your part: 前端" in front[0]
+    assert 'Split part "后端" (后端)' in back[0] and back[1].startswith('Split part "存储" (后端 › 存储)')
 
 
 async def test_the_deepest_level_must_be_tasks(monkeypatch):
     monkeypatch.setattr(outline, "MAX_DEPTH", 1)
-    leads = Leads([outline_reply(part("p", "全部")), split(part("s", "还想再拆")), split(task("t", "做完"))])
-    result = await autonomous_plan("小事", LEAD_MODELS, LEADS_CONFIGURED, leads, session=SupervisorSession())
-    assert [node.title for node in result.nodes] == ["做完"]
-    asked, refused = leads.messages[1][2], leads.messages[2][2]
-    assert "every child must be a task" in asked and '"kind": "part"' not in asked
-    assert "not a valid plan" in refused and "deepest level" in refused
+    planned, _ = await outlined(part("p", "全部"))
+    messages = await refine(planned, "全部", split(part("s", "还想再拆")), split(task("t", "做完")))
+    assert [node.title for node in planned.nodes] == ["做完"]
+    assert "every child must be a task" in messages[0] and '"kind": "part"' not in messages[0]
+    assert "not a valid plan" in messages[1] and "deepest level" in messages[1]
 
 
-async def test_vague_tasks_go_back_to_the_lead():
-    vague = task("t", "随便做做", acceptance_criteria="")
-    leads = Leads([outline_reply(part("p", "全部")), split(vague), split(task("t", "做完"))])
-    result = await autonomous_plan("小事", LEAD_MODELS, LEADS_CONFIGURED, leads, session=SupervisorSession())
-    assert "随便做做: no acceptance_criteria" in leads.messages[2][2]
-    assert [node.title for node in result.nodes] == ["做完"]
+async def test_vague_tasks_go_back_to_the_planner():
+    planned, _ = await outlined(part("p", "全部"))
+    messages = await refine(planned, "全部", split(task("t", "随便做做", acceptance_criteria="")), split(task("t", "做完")))
+    assert "随便做做: no acceptance_criteria" in messages[1]
+    assert [node.title for node in planned.nodes] == ["做完"]
 
 
 def test_parallel_tasks_are_all_waited_for():
@@ -106,6 +150,69 @@ def test_a_split_names_only_earlier_siblings_and_stays_within_the_plan_size():
         raise AssertionError("room")
 
 
+class Splitters:
+    """Planners answer by the part they are asked about; steps succeed; the lead says done."""
+
+    def __init__(self, splits):
+        self.splits, self.work, self.lead = splits, [], []
+
+    def configured_models(self, ids):
+        return set(ids)
+
+    async def converse(self, session, prompt, spend_ok=None, timeout=600):
+        session.session_id = session.session_id or f"{session.model_id}-{len(self.lead)}"
+        self.lead.append(prompt)
+        if "EVENT: every step has finished" in prompt:
+            return ProviderResult(decision("done"), 0, 0, session.model_id)
+        title = next(name for name in self.splits if f'Split part "{name}"' in prompt)
+        await asyncio.sleep(0.01)
+        return ProviderResult(self.splits[title], 0, 0, session.model_id)
+
+    async def complete(self, model_id, prompt, workspace=None, **kwargs):
+        self.work.append(prompt.split("\n", 1)[0])
+        return ProviderResult("做完了", 0, 0, model_id)
+
+
+def outlined_run(database):
+    parts = [PlanPart(id="api", title="后端", goal="接口", status="planned", provides="GET /todos"),
+             PlanPart(id="ui", title="前端", goal="页面", status="planned", dependencies=["api"])]
+    database.save_run(ExecutionRun(
+        id="o", prompt="写一个待办应用", status=RunStatus.QUEUED, budget_usd=1,
+        supervisor=SupervisorSession(model_id="cli:claude", session_id="lead-1"),
+        plan=TaskPlan(summary="待办应用", nodes=[], parts=parts, request="写一个待办应用")))
+
+
+async def test_a_running_task_splits_its_parts_at_once_and_runs_their_tasks_in_order(database):
+    outlined_run(database)
+    team = Splitters({"后端": split(task("routes", "接口")), "前端": split(task("page", "页面"))})
+    executor = Executor(database, team, RUN_MODELS)
+    await executor.execute("o")
+    run = database.get_run("o")
+    assert run.status == RunStatus.SUCCEEDED and [item.status for item in run.plan.parts] == ["ready", "ready"]
+    # Both parts were asked about before either answered, and the page waited for the API.
+    assert ['Split part "后端"' in team.lead[0], 'Split part "前端"' in team.lead[1]] == [True, True]
+    assert team.work == ["Task: 做接口", "Task: 做页面"]
+    assert all(node.model_id for node in run.plan.nodes)
+    events = [event.kind for event in database.events("o")]
+    assert events.count("part.refined") == 2
+
+
+async def test_a_part_that_cannot_be_split_pauses_the_task_until_it_is_continued(database):
+    outlined_run(database)
+    team = Splitters({"后端": "我拆不了", "前端": split(task("page", "页面"))})
+    executor = Executor(database, team, RUN_MODELS)
+    await executor.execute("o")
+    run = database.get_run("o")
+    failed = run.plan.parts[0]
+    assert (run.status, failed.status) == (RunStatus.PAUSED, "failed")
+    assert "大项「后端」没能细化成任务" in run.error and team.work == []
+    team.splits["后端"] = split(task("routes", "接口"))
+    run.status = RunStatus.QUEUED
+    database.save_run(run)
+    await executor.execute("o")
+    assert database.get_run("o").status == RunStatus.SUCCEEDED and team.work == ["Task: 做接口", "Task: 做页面"]
+
+
 def parted():
     current = plan(step("a"), step("b"))
     current.plan.parts = [PlanPart(id="p", title="后端", goal="提供接口"), PlanPart(id="q", title="存储", parent_id="p"),
@@ -134,3 +241,17 @@ def test_a_step_added_while_running_joins_a_part():
 def test_a_plan_without_parts_is_unchanged():
     flat = TaskPlan(summary="s", nodes=[TaskNode(id="a", title="A", instructions="i", capability="coding")])
     assert flat.parts == [] and flat.part_path(None) == [] and flat.part_path("missing") == []
+    assert flat.unsplit_cost() == 0
+
+
+def test_a_part_not_yet_split_is_estimated_from_the_tasks_it_expects():
+    from super_partner.routing import part_estimate
+
+    def cost(size):
+        return part_estimate(PlanPart(id="p", title="后端", size=size, status="planned"), False,
+                             list(RUN_MODELS.values()), {"x:api"})
+
+    assert cost(1) > 0 and abs(cost(3) - 3 * cost(1)) < 1e-6
+    later = TaskPlan(summary="s", nodes=[], parts=[PlanPart(id="p", title="后端", status="planned", estimated_cost_usd=0.5),
+                                                   PlanPart(id="q", title="前端", estimated_cost_usd=0.2)])
+    assert later.unsplit_cost() == 0.5

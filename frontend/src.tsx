@@ -144,6 +144,9 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "run.confirmed":data=>`确认执行，预算 ${formatUsd(data.budget_usd??0)}`,
   "run.resumed":data=>`从中断处继续，预算 ${formatUsd(data.budget_usd??0)}`,
   "run.started":()=>"开始执行",
+  "part.refining":data=>`大项「${data.title}」开始细化成任务`,
+  "part.refined":data=>`大项「${data.title}」细化为 ${data.tasks} 个任务${data.parts?`、${data.parts} 个子项`:""}${data.model_id?`（${data.model_id}）`:""}`,
+  "part.refine_failed":data=>`大项「${data.title}」没能细化：${data.error??""}`,
   "workspace.snapshot":data=>data.git?`记录项目起点：分支 ${data.branch}，${data.uncommitted_files} 个未提交改动`:"项目不是 git 仓库",
   "node.started":(data,title)=>`${title(data.node_id)}：开始第 ${data.attempt??1} 次执行`,
   "node.model_switched":(data,title)=>`${title(data.node_id)}：${data.model_id} ${data.reason==="model_configuration_changed"?"配置已变更":data.reason==="model_unavailable"?"服务暂时不可用":"额度用完"}，换用 ${data.next_model_id}`,
@@ -283,7 +286,7 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
     </div>}
     {error&&<div className="error" role="alert">{error}</div>}
     {run.error&&<div className="error">{run.error}</div>}
-    {hasLead(run)&&<LeadPanel run={run} models={models} onReply={(id,body)=>onReply(run,id,body)} onAsk={(text=>onAsk(run,text)) satisfies AskLead} onOpenEngineer={onOpenEngineer}/>}
+    {hasLead(run)&&<LeadPanel apiBase={API} run={run} models={models} onReply={(id,body)=>onReply(run,id,body)} onAsk={(text=>onAsk(run,text)) satisfies AskLead} onOpenEngineer={onOpenEngineer}/>}
     {/* Diagnoses that run when no lead decides, or that the lead sends to repair something. */}
     <DiagnosisPanel run={{...run,diagnoses:(run.diagnoses??[]).filter(item=>item.trigger!=="lead"&&!leadRepairIds(run.diagnoses).has(item.id))}} models={models} onReply={(id,body)=>onReply(run,id,body)}/>
     <nav className="task-tabs" aria-label="任务内容">{([["progress","进度"],["result","结果"],["details","详情"]] as const).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}</button>)}</nav>

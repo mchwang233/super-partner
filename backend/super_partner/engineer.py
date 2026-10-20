@@ -135,12 +135,15 @@ class Engineering:
     def engineer_available(self) -> bool:
         return bool(self.platform.enabled and self.platform.root)
 
-    def engineer_overview(self, limit: int = 30) -> dict:
+    def engineer_overview(self, limit: int = 30, run_id: Optional[str] = None) -> dict:
+        jobs = self.db.engineer_jobs(200 if run_id else limit)
+        if run_id:
+            jobs = [job for job in jobs if job.run_id == run_id]
         return {
             "available": self.engineer_available(),
             "working_on": self.engineer_job_id if self.engineer_task and not self.engineer_task.done() else None,
             "pending": self.platform_pending.get("id") if self.platform_pending else None,
-            "jobs": [job.model_dump(mode="json") for job in self.db.engineer_jobs(limit)],
+            "jobs": [job.model_dump(mode="json") for job in jobs],
         }
 
     def _engineer_save(self, job: EngineerJob) -> None:
@@ -479,6 +482,23 @@ class Engineering:
         await self._apply_decision(run.id, node.id, decision, verdict, last.outcome if last else "error",
                                    "engineer_done")
         await self._continue_after_answer(run.id)
+
+    def engineer_join(self, run_id: str, call: dict, origin: str, node_id: Optional[str] = None,
+                      decision_id: Optional[str] = None) -> tuple[Optional[EngineerJob], str]:
+        """Bring the platform engineer into a task's conversation with the lead: a job tied to the
+        task, which does not hold it. Returns the job, or None and why it could not be taken."""
+        try:
+            job = self.engineer_request(call["request"], call.get("kind") or "repair", origin, run_id=run_id,
+                                        node_id=node_id, decision_id=decision_id)
+        except EngineerError as exc:
+            return None, str(exc)
+        self.emit(run_id, "run.engineer_joined", job_id=job.id, job_kind=job.kind, origin=origin, title=job.title)
+        return job, ""
+
+    def _engineer_news(self, run) -> list[EngineerJob]:
+        """The task's engineer jobs whose status changed since its lead last heard of them."""
+        return [job for job in self.db.engineer_jobs(200)
+                if job.run_id == run.id and run.engineer_seen.get(job.id) != job.status]
 
     def _engineer_for_lead(self, run, node, request: str, decision_id: str) -> Optional[EngineerJob]:
         """The lead asks for a component (called holding the run's lock): the task waits for it.

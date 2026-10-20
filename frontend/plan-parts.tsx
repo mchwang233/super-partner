@@ -4,7 +4,15 @@ import { formatUsd, statusLabel } from "./mission-history";
 import { ModelCapabilityDialog, NodeProgress, PlanGraph, nodeLine, planStages, useLinks, type PlanNode } from "./plan-graph";
 
 /** A part of a plan made top-down (backend outline.py): 大项 at the top, then smaller parts, then tasks. */
-export type PlanPart = { id: string; title: string; goal?: string; acceptance?: string; parent_id?: string | null; dependencies?: string[] };
+export type PlanPart = { id: string; title: string; goal?: string; acceptance?: string; parent_id?: string | null; dependencies?: string[];
+  provides?: string; size?: number; status?: string; error?: string | null };
+
+/** A major part's split into tasks happens once the task runs: these are the states before it is done. */
+const SPLIT_STATE: Record<string, { state: string; label: string; note: string }> = {
+  planned: { state: "planned", label: "待细化", note: "确认执行后，这一项会和其他大项同时细化成任务。" },
+  refining: { state: "running", label: "细化中…", note: "负责人正在把这一项细化成任务。" },
+  failed: { state: "failed", label: "细化失败", note: "这一项没能细化成任务；继续执行会再试一次。" },
+};
 
 type Props = { apiBase: string; runId: string; runStatus: string; nodes: PlanNode[]; parts?: PlanPart[]; inProject: boolean; models: Model[]; onOpenProfile: (model: Model) => void; reworkRounds?: number };
 
@@ -50,8 +58,10 @@ function PartBoard({ apiBase, runId, runStatus, parts, nodes, models, onOpenProf
   const board = useRef<HTMLDivElement>(null);
   const edges = top.flatMap(part => (part.dependencies ?? []).filter(id => shown.has(id)).map(from => ({ from, to: part.id, done: partState(tasksOf(from)).state === "succeeded" })));
   const shape = [...expanded].join(",") + "|" + top.map(part => `${part.id}:${(part.dependencies ?? []).join(",")}`).join("|") + "|" + edges.map(edge => edge.done).join("");
-  const { links, size } = useLinks(board, edges, "part", shape);
+  const { links, size } = useLinks(board, edges, "part", shape, ".part-card-line");
   const done = nodes.filter(node => node.status === "succeeded").length;
+  const unsplit = top.filter(part => SPLIT_STATE[part.status ?? "ready"]);
+  const expected = unsplit.reduce((sum, part) => sum + (part.size || 0), 0);
   const retries = nodes.reduce((sum, node) => sum + Math.max(0, (node.attempts?.length ?? 0) - 1), 0);
   const selected = nodes.find(node => node.id === selectedId);
 
@@ -90,7 +100,7 @@ function PartBoard({ apiBase, runId, runStatus, parts, nodes, models, onOpenProf
   return <div className="plan-graph part-board">
     <div className="plan-summary" aria-label="计划概览">
       <span><b>{top.length}</b> 个大项</span>
-      <span><b>{nodes.length}</b> 个任务</span>
+      <span><b>{nodes.length}</b> 个任务{unsplit.length ? <>（另有 {unsplit.length} 个大项待细化{expected ? `，预计约 ${expected} 个任务` : ""}）</> : null}</span>
       <span>已完成 <b>{done}</b></span>
       {retries > 0 && <span>重试 <b>{retries}</b> 次</span>}
       {reworkRounds > 0 && <span>返工 <b>{reworkRounds}</b> 轮</span>}
@@ -108,7 +118,8 @@ function PartBoard({ apiBase, runId, runStatus, parts, nodes, models, onOpenProf
           </div>
           <div className="plan-stage-nodes">{stage.map(part => {
             const tasks = tasksOf(part.id), finished = tasks.filter(task => task.status === "succeeded").length;
-            const running = tasks.filter(task => task.status === "running").length, state = partState(tasks), open = expanded.has(part.id);
+            const split = SPLIT_STATE[part.status ?? "ready"];
+            const running = tasks.filter(task => task.status === "running").length, state = split ?? partState(tasks), open = expanded.has(part.id);
             const sub = childrenOf(part.id).length;
             const cost = tasks.reduce((sum, task) => sum + (task.attempts ?? []).reduce((total, attempt) => total + attempt.cost_usd, 0), 0);
             return <article key={part.id} data-part={part.id} className={`part-card ${state.state} ${open ? "open" : ""}`}>
@@ -116,10 +127,14 @@ function PartBoard({ apiBase, runId, runStatus, parts, nodes, models, onOpenProf
                 <span className="part-card-line"><span className="num">{numberOf(part)}</span><b>{part.title}</b><span className={`state ${state.state}`}>{state.label}</span></span>
                 {part.goal && <span className="part-goal">{part.goal}</span>}
                 <span className="part-progress"><span className="part-bar" aria-hidden="true"><i style={{ width: `${tasks.length ? finished / tasks.length * 100 : 0}%` }} /></span>
-                  <small>{finished} / {tasks.length} 个任务完成{running ? ` · ${running} 个进行中` : ""}</small></span>
+                  <small>{split ? `预计 ${part.size || "若干"} 个任务` : `${finished} / ${tasks.length} 个任务完成${running ? ` · ${running} 个进行中` : ""}`}</small></span>
                 <span className="part-meta"><small>{sub ? `${sub} 个子项 · ` : ""}花费 {formatUsd(cost)}</small><span className="part-expand">{open ? "收起 ▴" : "展开 ▾"}</span></span>
               </button>
-              {open && body(part)}
+              {open && <div className="part-detail">
+                {part.provides && <details className="part-provides"><summary>对外提供（接口约定）</summary><p>{part.provides}</p></details>}
+                {split && <p className={`part-split ${split.state}`}>{part.status === "failed" && part.error ? `${split.note}原因：${part.error}` : split.note}</p>}
+              </div>}
+              {open && !split && body(part)}
             </article>;
           })}</div>
         </li>)}

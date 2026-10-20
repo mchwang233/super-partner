@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 from .config import settings
-from .models import CostEstimate, ModelProfile, TaskNode
+from .models import DIFFICULTY_THRESHOLDS, CostEstimate, ModelProfile, TaskNode
 
 # Context the project brief's writer needs for a batch of whole files (briefing.BATCH_CHARS).
 BRIEF_CONTEXT = 64_000
@@ -210,8 +210,37 @@ def pick_diagnoser(models: list[ModelProfile], configured: set[str]) -> Optional
     return candidates[0] if candidates else None
 
 
-def estimate(nodes: list[TaskNode], budget: float, planning_cost: float = 0.0) -> CostEstimate:
-    base = planning_cost + sum(node.estimated_cost_usd for node in nodes)
+def fit_and_route(node: TaskNode, models: list[ModelProfile], configured: set[str], needs_vision: bool = False) -> Optional[str]:
+    """Route ``node``, first lowering its quality threshold to the best available score when no
+    available model reaches it. Returns a note saying so, or None."""
+    note = None
+    available = eligible_for_node(node, models, configured, needs_vision)
+    if available:
+        best = max(model.scores.score_for(node.capability) for model in available)
+        if node.quality_threshold > best:
+            note = (f"Adjusted {node.title} {node.capability} threshold from {node.quality_threshold:g} "
+                    f"to {best:g} for available models")
+            node.quality_threshold = best
+    route_node(node, models, configured, needs_vision)
+    return note
+
+
+def part_estimate(part, in_project: bool, models: list[ModelProfile], configured: set[str],
+                  needs_vision: bool = False) -> float:
+    """What a major part not yet split may cost: its expected number of ordinary tasks of its main
+    capability, routed as such."""
+    cost = 0.0
+    for index in range(max(1, part.size or 3)):
+        probe = TaskNode(id=f"{part.id}-{index}", title=part.title, instructions=part.goal or part.title,
+                         capability=part.capability, needs_workspace=in_project, difficulty="normal",
+                         quality_threshold=DIFFICULTY_THRESHOLDS["normal"])
+        fit_and_route(probe, models, configured, needs_vision)
+        cost += probe.estimated_cost_usd
+    return round(cost, 6)
+
+
+def estimate(nodes: list[TaskNode], budget: float, planning_cost: float = 0.0, extra: float = 0.0) -> CostEstimate:
+    base = planning_cost + extra + sum(node.estimated_cost_usd for node in nodes)
     retry = base * .25
     tools = max(.01, base * .10)
     low = base + tools

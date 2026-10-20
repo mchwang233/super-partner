@@ -268,8 +268,9 @@ def scope_problems(plan: TaskPlan) -> list[str]:
 
 async def _plan_as_lead(request: str, models: list[ModelProfile], configured: set[str], providers,
                         session: SupervisorSession, in_project: bool) -> Optional[TaskPlan]:
-    """The best lead plans top-down in its own conversation (outline.py), which ``session`` then
-    holds; None if none can."""
+    """The best lead splits the request into major parts in its own conversation (outline.py),
+    which ``session`` then holds; the parts are split into tasks when the task runs. None if no
+    lead can plan."""
     from . import outline
 
     for model in supervisor.candidates(models, configured)[:supervisor.MAX_LEADS]:
@@ -282,20 +283,18 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
             return result.text
 
         try:
-            plan = await outline.plan_in_parts(say, supervisor.ROLE + request)
+            plan = await outline.plan_outline(say, supervisor.ROLE + request)
         except Exception as exc:
             # The next lead tries; with none left, the usual single-call planner does.
             logger.warning("lead %s could not plan: %s", model.id, exc)
             continue
         for name, value in fresh:
             setattr(session, name, value)
-        if not in_project:
-            for node in plan.nodes:
-                node.needs_workspace = False
+        plan.in_project = in_project
         plan.planning_method = "model"
         plan.planner_model_id = model.id
         plan.planning_cost_usd = round(spent[0], 6)
-        plan.planning_note = f"由负责人 {model.display_name} 逐级拆分规划，并全程跟进这个任务"
+        plan.planning_note = f"由负责人 {model.display_name} 划分大项；执行时各大项同时细化成任务，负责人全程跟进"
         return plan
     return None
 
@@ -328,6 +327,7 @@ async def autonomous_plan(
 
         plan = await _plan_as_lead(OUTLINE_PROMPT + body, models, configured, providers, session, in_project)
         if plan:
+            plan.request = body
             return plan
     planner = select_planner_model(models, configured)
     if planner is None or planner.provider == "mock":

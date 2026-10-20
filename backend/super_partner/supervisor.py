@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Optional
 from uuid import uuid4
 
@@ -161,11 +162,12 @@ ACTION_RULES = {
                           "or machine limits, configuration). A repair session with access to this machine "
                           "fixes it, then the step runs again.\n",
     "repair_platform": "- repair_platform: Super Partner itself (its scheduler, tools or sandbox) is at fault; say "
-                       "what and where. A source repair is made, checked and applied, then the task continues.\n",
+                       "what and where. Its platform engineer (平台工程师) makes a source repair, checked and "
+                       "applied, then the task continues.\n",
     "request_component": "- request_component: the task needs a capability Super Partner does not have (a tool for "
                          "the steps, a model channel, a kind of step or check) and no repair of a defect would "
                          "give it. Say in instructions what to add and why. Super Partner's platform engineer "
-                         "plans it, the user approves, and it is built, checked and applied; the task waits, "
+                         "(平台工程师) plans it, the user approves, and it is built, checked and applied; the task waits, "
                          "then you decide again.\n",
     "replan": "- replan: change the plan in \"plan\": add steps, remove steps that have not finished, or rewrite "
               "the instructions of steps that have not finished (splitting a step that is too big, adding a "
@@ -201,7 +203,10 @@ def decision_format(rework: bool = False, final: bool = False) -> str:
         + ('"targets": ["rework only: ids of the steps to redo"], ' if rework or final else "")
         + (PLAN_FORMAT + ", " if "replan" in actions else "")
         + '"question": "ask_user only, in Chinese", "options": ["ask_user only: up to 4 answers"], '
-        '"user_action": "unable only: what the user could do to make it possible"}\n'
+        '"user_action": "unable only: what the user could do to make it possible", '
+        '"engineer": {"kind": "repair | component", "request": "optional, with any action: a fault in Super '
+        'Partner itself, or a capability it lacks, that you found and this decision does not deal with; the '
+        'platform engineer (平台工程师) joins the task\'s conversation and works on it in the background"}}\n'
         + "".join(ACTION_RULES[action] for action in actions)
     )
 
@@ -327,8 +332,57 @@ def chat_message(text: str) -> str:
         f"{text}\n\n"
         "Answer in Chinese, in a few sentences, as yourself: the lead who has followed this task. "
         "No decision JSON is needed here. If they ask for a change (to a step, the plan, or how you "
-        "decide), say what you will do; you will act on it at your next decisions."
+        "decide), say what you will do; you will act on it at your next decisions.\n"
+        "The platform engineer (平台工程师) changes Super Partner itself: its sandbox, tools, scheduler or "
+        "model channels. If the user asks for it, or you find that Super Partner itself is at fault or lacks "
+        "a capability the task needs, bring it into this conversation now, not at a later decision: end your "
+        "answer with one line\n"
+        'ENGINEER: {"kind": "repair or component", "request": "what to repair or add, why, and the evidence"}\n'
+        "A repair is applied once it passes its checks; a component waits for the user's approval. Its plan, "
+        "questions and progress appear in this conversation."
     )
+
+
+ENGINEER_LINE = re.compile(r"^\s*ENGINEER:\s*(\{.*\})\s*$", re.MULTILINE)
+
+
+def read_engineer(value) -> Optional[dict]:
+    """A call for the platform engineer ({"kind", "request"}), or None if it is not one."""
+    if not isinstance(value, dict) or not str(value.get("request") or "").strip():
+        return None
+    kind = str(value.get("kind") or "repair").strip()
+    return {"kind": kind if kind in {"repair", "component"} else "repair", "request": str(value["request"]).strip()[:6000]}
+
+
+def split_engineer(text: str) -> tuple[str, Optional[dict]]:
+    """A chat answer without its ENGINEER line, and the call that line makes."""
+    found = ENGINEER_LINE.search(text or "")
+    if not found:
+        return text, None
+    try:
+        call = read_engineer(json.loads(found.group(1)))
+    except json.JSONDecodeError:
+        call = None
+    return (text[:found.start()] + text[found.end():]).strip(), call
+
+
+ENGINEER_STATES = {
+    "queued": "queued", "planning": "writing its plan", "plan_ready": "plan written, waiting for the user's approval",
+    "needs_input": "waiting for the user's answer", "editing": "making the change in a copy",
+    "validating": "checking the change", "ready": "change checked, waiting for the user to apply it",
+    "applying": "being applied (Super Partner restarts)", "applied": "applied", "failed": "failed",
+    "rejected": "given up by the user", "cancelled": "cancelled",
+}
+
+
+def engineer_updates(jobs) -> str:
+    """What changed in the platform engineer's work for this task since the lead last heard."""
+    lines = ["UPDATE from the platform engineer (平台工程师) on its work for this task:"]
+    for job in jobs:
+        lines.append(f"- [{job.id}] {job.kind} \"{job.title}\": {ENGINEER_STATES.get(job.status, job.status)}")
+        if job.status in {"applied", "failed"} and (job.report or job.error):
+            lines.append(f"  {(job.error or job.report)[:600]}")
+    return "\n".join(lines) + "\n\n"
 
 
 MAX_REPAIR_REPORT = 3000
@@ -419,6 +473,8 @@ def parse_decision(text: str, model_ids: set[str], targets: Optional[set[str]] =
         return None
     if clean["action"] == "request_component" and not (clean.get("instructions") or clean.get("reason")):
         return None
+    if call := read_engineer(payload.get("engineer")):
+        clean["engineer"] = call
     if clean["action"] == "rework":
         chosen = payload.get("targets") or sorted(targets or ())
         if not targets or not isinstance(chosen, list) or not set(map(str, chosen)) <= targets:

@@ -98,6 +98,27 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
   state.poll = () => [...polls.values()][0]();
   window.fetch = async (url, options = {}) => {
     const path = new URL(url).pathname;
+    if (/^\/api\/tasks\/[^/]+\/engineer$/.test(path) && options.method === "POST") {
+      const body = JSON.parse(options.body || "{}");
+      state.engineerActions = [...(state.engineerActions ?? []), { path, body }];
+      return json({ id: "joined", run_id: path.split("/")[3], ...body }, 201);
+    }
+    if (path.startsWith("/api/engineer/") && options.method === "POST") {
+      const body = JSON.parse(options.body || "{}");
+      state.engineerActions = [...(state.engineerActions ?? []), { path, body }];
+      const engineer = state.engineer ?? (state.engineer = { available: true, jobs: [] });
+      if (path === "/api/engineer/jobs") {
+        const job = { id: `job${engineer.jobs.length + 1}`, kind: body.kind, origin: "user", title: body.request.slice(0, 40),
+          request: body.request, status: "queued", messages: [], budget_usd: 2, cost_usd: 0,
+          created_at: "2026-10-19T08:00:00Z", updated_at: "2026-10-19T08:00:00Z" };
+        engineer.jobs = [job, ...engineer.jobs];
+        return json(job, 201);
+      }
+      const [, , , , id, action] = path.split("/");
+      const next = { approve: "queued", reject: "rejected", reply: "queued" }[action];
+      engineer.jobs = engineer.jobs.map(job => job.id === id ? { ...job, status: next } : job);
+      return json(engineer.jobs.find(job => job.id === id));
+    }
     if (path.startsWith("/api/models/quota")) {
       if (options.method === "DELETE") {
         const id = decodeURIComponent(path.slice("/api/models/quota/".length));
@@ -223,22 +244,6 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
     if (path === "/api/models") return json(state.models);
     if (path === "/api/providers") return json([]);
     if (path === "/api/engineer") return json(state.engineer ?? { available: true, jobs: [] });
-    if (path.startsWith("/api/engineer/") && options.method === "POST") {
-      const body = JSON.parse(options.body || "{}");
-      state.engineerActions = [...(state.engineerActions ?? []), { path, body }];
-      const engineer = state.engineer ?? (state.engineer = { available: true, jobs: [] });
-      if (path === "/api/engineer/jobs") {
-        const job = { id: `job${engineer.jobs.length + 1}`, kind: body.kind, origin: "user", title: body.request.slice(0, 40),
-          request: body.request, status: "queued", messages: [], budget_usd: 2, cost_usd: 0,
-          created_at: "2026-10-19T08:00:00Z", updated_at: "2026-10-19T08:00:00Z" };
-        engineer.jobs = [job, ...engineer.jobs];
-        return json(job, 201);
-      }
-      const [, , , , id, action] = path.split("/");
-      const next = { approve: "queued", reject: "rejected", reply: "queued" }[action];
-      engineer.jobs = engineer.jobs.map(job => job.id === id ? { ...job, status: next } : job);
-      return json(engineer.jobs.find(job => job.id === id));
-    }
     throw new Error(`Unexpected request: ${path}`);
   };
   window.eval(browserCode);
@@ -665,6 +670,24 @@ test("a plan made in parts shows its major parts as stages; each opens in place,
   assert.equal(document.querySelectorAll(".part-task").length, 4);
   await click(all);
   assert.equal(document.querySelectorAll(".part-task").length, 0);
+});
+
+test("a task planned as major parts says they are split once it runs, and what each provides", async t => {
+  const run = mission("outlined", "awaiting_confirmation");
+  run.plan.parts = [
+    { id: "api", title: "后端", goal: "提供待办接口", provides: "GET /todos -> [{id, title, done}]", size: 3, status: "planned", dependencies: [] },
+    { id: "ui", title: "前端", goal: "待办页面", size: 2, status: "failed", error: "回复不是计划", dependencies: ["api"] },
+  ];
+  const { document, click } = await setup(t, [run]);
+  assert.match(document.querySelector(".plan-summary").textContent, /2 个大项.*0 个任务（另有 2 个大项待细化，预计约 5 个任务）/);
+  const cards = [...document.querySelectorAll(".part-card")];
+  assert.match(cards[0].textContent, /后端待细化.*预计 3 个任务/);
+  assert.match(cards[1].textContent, /前端细化失败/);
+  await click(cards[0].querySelector(".part-card-head"));
+  assert.match(cards[0].querySelector(".part-provides").textContent, /对外提供（接口约定）GET \/todos/);
+  assert.match(cards[0].querySelector(".part-split").textContent, /确认执行后，这一项会和其他大项同时细化成任务/);
+  await click(cards[1].querySelector(".part-card-head"));
+  assert.match(cards[1].querySelector(".part-split.failed").textContent, /原因：回复不是计划/);
 });
 
 test("the budget accepts round amounts such as 2 and can be cleared while typing", async t => {
@@ -1371,4 +1394,63 @@ test("the lead panel shows a component the lead asked for, and opens it on the e
   await click([...panel.querySelectorAll("button")].find(node => node.textContent === "查看方案和进度"));
   const detail = document.querySelector(".engineer-job");
   assert.match(detail.textContent, /PDF 工具.*负责人请求.*来自任务.*结束后结果会交回负责人/s);
+});
+
+
+test("the lead's panel is a group chat the platform engineer joins, where its plan is approved and @ talks to it", async t => {
+  const run = mission("chat-task", "paused");
+  run.plan.nodes = [{ id: "a", title: "跑仿真", dependencies: [], status: "pending", estimated_cost_usd: 0, attempts: [] }];
+  run.supervisor = { model_id: "cli:claude", calls: 3 };
+  run.lead_messages = [
+    { id: "m1", role: "user", text: "应该是沙箱的问题", status: "done", created_at: "2026-10-20T06:16:00Z" },
+    { id: "m2", role: "lead", text: "是沙箱连不到宿主机的许可证端口。\n\n（已请平台工程师加入：放行许可证端口）", status: "done",
+      engineer_job_id: "job1", created_at: "2026-10-20T06:16:30Z" },
+  ];
+  const { state, document, click, act, window } = await setup(t, [run], [], { openComposer: false });
+  state.engineer = { available: true, jobs: [
+    engineerJob({ kind: "repair", origin: "lead", run_id: "chat-task", title: "放行许可证端口", plan: "- 只放行 26585 和 39097",
+      messages: [{ role: "lead", text: "让步骤沙箱能连宿主机的许可证端口", created_at: "2026-10-20T06:16:31Z" },
+                 { role: "engineer", text: "方案写好了，请看过后批准。", created_at: "2026-10-20T06:18:00Z" }] }),
+    engineerJob({ id: "other", run_id: "another-task", title: "别的任务的工作" }),
+  ] };
+  // The panel looks again whenever the task changes.
+  state.records[0] = { ...state.records[0], updated_at: "2026-10-20T06:18:01Z" };
+  await act(async () => state.poll());
+  const panel = () => document.querySelector(".lead-panel");
+  const button = text => [...panel().querySelectorAll("button")].find(node => node.textContent === text);
+  assert.match(panel().querySelector(".diagnosis-head").textContent, /负责人.*平台工程师/);
+  // The engineer's lines sit among the lead's, after the lead brought it in; other tasks' work does not.
+  assert.match(panel().textContent, /应该是沙箱的问题.*已请平台工程师加入.*负责人请平台工程师加入.*让步骤沙箱能连.*平台工程师.*方案写好了/s);
+  assert.doesNotMatch(panel().textContent, /别的任务的工作/);
+  const card = panel().querySelector(".engineer-card");
+  assert.match(card.textContent, /修复 · 放行许可证端口.*方案待批准.*只放行 26585 和 39097/s);
+
+  // @平台工程师 answers the job waiting for the user, instead of the lead.
+  const box = document.querySelector('[aria-label="给负责人的消息"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(box, "@平台工程师 39097 是动态端口，用 VENDOR 固定一下");
+    box.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await click(button("发送"));
+  assert.deepEqual(state.engineerActions.at(-1), { path: "/api/engineer/jobs/job1/reply", body: { text: "39097 是动态端口，用 VENDOR 固定一下" } });
+  assert.equal(state.leadMessages.length, 0);
+
+  // Its plan is approved right here.
+  state.engineer.jobs[0].status = "plan_ready";
+  state.records[0] = { ...state.records[0], updated_at: "2026-10-20T06:19:00Z" };
+  await act(async () => state.poll());
+  await click(panel().querySelector(".engineer-card .primary"));
+  assert.equal(state.engineerActions.at(-1).path, "/api/engineer/jobs/job1/approve");
+
+  // The user can bring it in too, for a repair or a component.
+  await click(button("拉平台工程师进来"));
+  await click([...panel().querySelectorAll('[role="radio"]')].find(node => node.textContent === "添加组件"));
+  const ask = panel().querySelector('[aria-label="要平台工程师做的事"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(ask, "加一个 EDA 许可证检查");
+    ask.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await click(button("拉它进来"));
+  assert.deepEqual(state.engineerActions.at(-1), { path: "/api/tasks/chat-task/engineer", body: { request: "加一个 EDA 许可证检查", kind: "component" } });
+  assert.equal(panel().querySelector(".engineer-join"), null);
 });

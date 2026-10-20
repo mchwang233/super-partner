@@ -586,6 +586,8 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .app-nav button span.nav-badge{display:inline-grid;place-items:center;min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:var(--warn);color:light-dark(#ffffff,#1b1300);font:600 10px 'DM Sans',sans-serif;opacity:1}
 /* A plan made in parts: major parts as stages, each opening in place on its sub-parts and tasks. */
 .part-toggle-all{margin-left:auto;padding:4px 12px;font-size:12px}
+/* Cards start at the top of their stage, so a part opening does not move the others or their lines. */
+.part-board .plan-stage-nodes{justify-content:flex-start}
 .part-card{display:flex;flex-direction:column;border:1px solid light-dark(#e1e7ee,#252e39);border-radius:10px;background:light-dark(#fbfcfd,#10161e);min-width:0;transition:border-color .15s,box-shadow .15s}
 .part-card.running{border-color:light-dark(#f0d39f,#5a4422)}
 .part-card.failed{border-color:light-dark(#f5c4cd,#522a32)}
@@ -620,4 +622,35 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .part-sub-head small{font-size:11px;color:var(--faint)}
 .part-caret{width:10px;color:var(--muted);font-size:10px}
 .state.partial{color:var(--partial)}
+.part-card.planned{border-style:dashed}
+.state.planned{color:var(--muted)}
+.part-detail{padding:0 12px 4px;display:flex;flex-direction:column;gap:6px}
+.part-detail:empty{display:none}
+.part-provides{font-size:12px}
+.part-provides summary{cursor:pointer;font-size:11px;font-weight:600;color:var(--muted)}
+.part-provides summary:hover{color:var(--accent)}
+.part-provides p{margin:6px 0 0;line-height:1.55;color:var(--text);word-break:break-word;max-height:320px;overflow-y:auto}
+.part-split{margin:0 0 6px;font-size:12px;line-height:1.5;color:var(--muted)}
+.part-split.failed{color:var(--danger)}
 .part-tasks h4{margin:4px 0 0;font-size:13px;color:var(--muted)}
+/* The platform engineer in a task's conversation with its lead. */
+.lead-member{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--accent-bg);color:var(--accent);white-space:nowrap}
+.lead-invite{margin-left:auto;padding:4px 10px;font-size:12px}
+.lead-invite+.diagnosis-fold{margin-left:6px}
+.engineer-avatar{background:light-dark(#eef2ff,#1d2236)}
+.engineer-msg{border-left:2px solid light-dark(#c7d2fe,#3a4570);padding-left:10px}
+.engineer-system{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;margin:2px 0;font-size:12px;color:var(--muted)}
+.engineer-system small{color:var(--faint);font-size:11px}
+.engineer-card{border-color:light-dark(#c7d2fe,#3a4570)}
+.engineer-card.plan_ready,.engineer-card.ready,.engineer-card.needs_input{box-shadow:0 0 0 2px light-dark(#fdf0dc,#33281a)}
+.engineer-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px}
+.engineer-actions button{padding:6px 12px;font-size:12px}
+.engineer-actions button.link{padding:0}
+.engineer-ready{margin:6px 0 0;font-size:13px}
+.engineer-join{display:flex;flex-direction:column;gap:8px;padding:12px;border:1px solid light-dark(#c7d2fe,#3a4570);border-radius:10px;background:var(--panel-2)}
+.engineer-join textarea{width:100%;box-sizing:border-box;font:inherit;font-size:13px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text);resize:vertical}
+.engineer-join-kind{display:flex;gap:4px}
+.engineer-join-kind button{padding:5px 12px;font-size:12px;background:var(--panel);color:var(--muted);border:1px solid var(--line)}
+.engineer-join-kind button.on{background:var(--accent-bg);color:var(--accent);border-color:var(--accent)}
+.engineer-join-bar{display:flex;justify-content:flex-end;gap:8px}
+.engineer-join-bar button{padding:6px 14px;font-size:12px}

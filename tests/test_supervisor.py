@@ -32,10 +32,9 @@ PLAN = json.dumps({"summary": "待办网页", "nodes": [
      "files": ["index.html"]},
     {"key": "b", "title": "检查", "instructions": "检查页面", "capability": "coding", "difficulty": "easy",
      "dependencies": ["a"], "files": ["test_index.py"], "reads": ["index.html"]}]})
-# The same plan as the lead makes it: one part, then its tasks.
-OUTLINE = json.dumps({"summary": "待办网页", "parts": [{"key": "p", "title": "网页", "goal": "能用的待办网页"}]})
-SPLIT = json.dumps({"children": [{**node, "kind": "task", "acceptance_criteria": "页面能打开"}
-                                 for node in json.loads(PLAN)["nodes"]]})
+# The same plan as the lead makes it: major parts only, split into tasks when the task runs.
+OUTLINE = json.dumps({"summary": "待办网页", "parts": [{"key": "p", "title": "网页", "goal": "能用的待办网页",
+                                                     "provides": "index.html", "size": 2}]})
 
 
 def model(model_id, planning, channel="api"):
@@ -81,17 +80,16 @@ class Leads:
 
 async def test_the_lead_plans_in_the_conversation_it_keeps():
     session = SupervisorSession()
-    leads = Leads(["我先想想……", OUTLINE, SPLIT])
+    leads = Leads(["我先想想……", OUTLINE])
     plan = await autonomous_plan("写一个待办网页", MODELS, CONFIGURED, leads, session=session)
-    assert [node.title for node in plan.nodes] == ["页面", "检查"] and plan.planner_model_id == "cli:codex"
-    assert [part.title for part in plan.parts] == ["网页"]
+    assert plan.nodes == [] and plan.planner_model_id == "cli:codex"
+    assert [(part.title, part.status, part.size) for part in plan.parts] == [("网页", "planned", 2)]
+    assert plan.request.startswith("写一个待办网页")
     assert (session.model_id, session.session_id) == ("cli:codex", "cli:codex-conversation")
-    # It was told it leads the task, asked again in the same conversation for a valid plan, then
-    # asked to split its part.
-    (_, first_id, first), (_, second_id, second), (_, _, third) = leads.messages
-    assert first.startswith(supervisor.ROLE) and "写一个待办网页" in first
+    # It was told it leads the task, and asked again in the same conversation for a valid plan.
+    (_, first_id, first), (_, second_id, second) = leads.messages
+    assert first.startswith(supervisor.ROLE) and "写一个待办网页" in first and "By function" in first
     assert first_id is None and second_id == "cli:codex-conversation" and "not a valid plan" in second
-    assert third.startswith('Split part "网页"')
 
 
 async def test_without_a_lead_the_usual_planner_plans():

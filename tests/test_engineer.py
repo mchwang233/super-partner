@@ -258,3 +258,75 @@ async def test_the_api_lists_jobs_and_refuses_what_the_engineer_cannot_take(task
     refused = await client.post("/api/engineer/jobs", json={"request": "加一个按钮"})
     assert refused.status_code == 409 and "不可用" in refused.json()["detail"]
     assert (await client.post("/api/engineer/jobs/nope/approve")).status_code == 409
+
+
+def test_a_call_for_the_engineer_is_read_from_a_chat_answer_and_a_decision():
+    text, call = supervisor.split_engineer('沙箱连不到宿主机的许可证端口，我请平台工程师来修。\n'
+                                           'ENGINEER: {"kind": "repair", "request": "放行许可证端口 26585"}')
+    assert text == "沙箱连不到宿主机的许可证端口，我请平台工程师来修。"
+    assert call == {"kind": "repair", "request": "放行许可证端口 26585"}
+    assert supervisor.split_engineer("没有要找平台工程师的事")[1] is None
+    made = supervisor.parse_decision('{"action": "accept", "reason": "代码写好了", '
+                                     '"engineer": {"kind": "component", "request": "加 EDA 许可证检查"}}', set())
+    assert made["engineer"] == {"kind": "component", "request": "加 EDA 许可证检查"}
+
+
+async def test_the_lead_brings_the_engineer_into_the_chat_and_hears_how_it_goes(database, setup):
+    build, _, _ = setup
+
+    class Lead(Team):
+        async def converse(self, session, prompt, spend_ok=None, timeout=600):
+            self.lead.append(prompt)
+            return ProviderResult('是沙箱的问题。\nENGINEER: {"kind": "repair", "request": "让步骤沙箱能连宿主机许可证端口"}',
+                                  0, 0, session.model_id)
+
+    team = Lead([])
+    executor = build(team, database)
+    monkey_kick = executor._engineer_kick
+    executor._engineer_kick = lambda: None  # keep the job queued for the test
+    assert executor.start_lead_chat("r", "应该是你沙箱的问题，请平台工程师修")
+    await executor.lead_tasks["r"]
+    run = database.get_run("r")
+    reply = run.lead_messages[-1]
+    assert reply.text.startswith("是沙箱的问题。") and "ENGINEER:" not in reply.text and "已请平台工程师加入" in reply.text
+    job = database.get_engineer_job(reply.engineer_job_id)
+    assert (job.origin, job.kind, job.run_id, job.status) == ("lead", "repair", "r", "queued")
+    assert "ENGINEER: {" in team.lead[0]  # it was told how to bring the engineer in
+    # Its next message to the lead starts with what the engineer did, once.
+    job.status = "applied"
+    database.save_engineer_job(job)
+    await executor.ask_lead("r", "还好吗")
+    await executor.ask_lead("r", "现在呢")
+    assert team.lead[1].startswith("UPDATE from the platform engineer") and '"让步骤沙箱能连宿主机许可证端口": applied' in team.lead[1]
+    assert not team.lead[2].startswith("UPDATE")
+    executor._engineer_kick = monkey_kick
+
+
+async def test_a_decision_can_bring_the_engineer_in_without_holding_the_step(database, setup):
+    build, _, _ = setup
+    team = Team([decision("accept", engineer={"kind": "repair", "request": "步骤沙箱连不到许可证服务"})])
+    executor = build(team, database)
+    executor._engineer_kick = lambda: None
+    await executor.execute("r")
+    run = database.get_run("r")
+    assert run.status == RunStatus.SUCCEEDED and run.engineer_job_id is None
+    job = database.get_engineer_job(run.decisions[0].engineer_job_id)
+    assert (job.origin, job.node_id, job.request) == ("lead", "a", "步骤沙箱连不到许可证服务")
+
+
+async def test_the_user_brings_the_engineer_into_a_task(task_api):
+    from super_partner.models import ExecutionRun, TaskPlan
+
+    api, client = task_api
+    assert (await client.post("/api/tasks/nope/engineer", json={"request": "修沙箱"})).status_code == 404
+    api.db.save_run(ExecutionRun(id="t", prompt="p", status=RunStatus.PAUSED, budget_usd=1,
+                                 plan=TaskPlan(summary="s", nodes=[])))
+    refused = await client.post("/api/tasks/t/engineer", json={"request": "修沙箱", "kind": "repair"})
+    assert refused.status_code == 409 and "不可用" in refused.json()["detail"]
+    api.executor.engineer_available = lambda: True
+    api.executor._engineer_kick = lambda: None
+    joined = await client.post("/api/tasks/t/engineer", json={"request": "让步骤沙箱能连许可证端口", "kind": "repair"})
+    assert joined.status_code == 201 and joined.json()["run_id"] == "t" and joined.json()["origin"] == "user"
+    listed = (await client.get("/api/engineer", params={"run_id": "t"})).json()["jobs"]
+    assert [job["id"] for job in listed] == [joined.json()["id"]]
+    assert (await client.get("/api/engineer", params={"run_id": "other"})).json()["jobs"] == []

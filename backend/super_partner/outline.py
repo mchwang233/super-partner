@@ -1,10 +1,11 @@
-"""Planning a task top-down (docs/design/plan-parts.md). In its own conversation, the lead first splits
-the request into major parts (大项). It then splits each part, level by level, into smaller parts or
-tasks, until every piece is a task one model can do alone. The tasks are the plan's steps, and only
-they run. The parts group the tasks: the lead sees them, a step's prompt names them, and the
-progress view shows them.
+"""Planning a task top-down (docs/design/plan-parts.md). Before the task runs, the lead splits the
+request into major parts (大项), split by function so they can go on side by side, each saying what
+it provides to the others (``plan_outline``). Once the task runs, every major part is split at the
+same time, each in a conversation of its own (refining.py, ``refine``): level by level into smaller
+parts or tasks, until every piece is a task one model can do alone.
 
-A dependency between parts becomes a dependency on the waited-for part's last tasks, so the
+Only tasks run. The parts group them: the lead sees them, a step's prompt names them, and the
+progress view shows them. A wait on a part becomes a wait on its last tasks (``link``), so the
 executor sees an ordinary DAG of tasks."""
 
 from __future__ import annotations
@@ -32,19 +33,40 @@ TASK_RULES = """A task is what one model does in one go. Every task must be:
 - checkable on its own: acceptance criteria a reviewer can check against its result and files alone.
 """
 
+CAPABILITY_CHOICES = "coding | planning | research | chinese | tool_use | structured_output"
+
 OUTLINE_PROMPT = (
-    "You are planning a task for an autonomous multi-model executor. Plan it top-down, level by "
-    "level, in this conversation:\n"
-    "1. Now: split the whole request into its major parts (1-" + str(MAX_CHILDREN) + "). A part is one "
-    "area of the result with its own goal, for example the data layer, an API, a page, the tests, "
-    "a chapter of a report. Parts that do not wait for each other run at the same time.\n"
-    "2. Then you will be asked about each part in turn, to split it into smaller parts or tasks, "
-    "until every piece is a task.\n\n"
-    + TASK_RULES + "\n" + WORK_RULES
-    + "\nReply now with only a JSON object, no markdown fences:\n"
+    "You are planning a task for an autonomous multi-model executor, top-down. Now split the whole "
+    "request into its major parts (1-" + str(MAX_CHILDREN) + "); nothing else yet. When the task runs, "
+    "every part is split into tasks at the same time, each by a planner that sees the request, this "
+    "outline and its own part, not the other parts' tasks.\n"
+    "How to split:\n"
+    "- By function, not by phase: each part is one module, feature or component of the result (a "
+    "storage module, an API, a screen, a chapter), and it includes its own tests and checks. Do not "
+    "make parts like \"design\", \"implementation\", \"tests\" or \"documentation\" that each touch "
+    "everything; only integrating the parts and a final report may be parts of their own.\n"
+    "- Parts that do not wait for each other run at the same time, so let a part wait only for what "
+    "it truly needs; most parts should be able to start at once.\n"
+    "- \"provides\" is the contract other parts build on, because they never see this part's tasks: "
+    "the files it owns, and exact names, function signatures, endpoints and their fields, data and "
+    "file formats, commands. A part that waits for another uses only what that one provides.\n"
+    "- \"size\" is how many tasks you expect the part to take, each about 10-15 tool turns for a "
+    "capable model; \"capability\" is the main kind of work in it.\n\n"
+    "Reply with only a JSON object, no markdown fences:\n"
     '{"summary": "short objective", "parts": [{"key": "p1", "title": "short title", '
     '"goal": "what this part delivers", "acceptance": "how to tell it is done", '
+    '"provides": "the contract other parts may rely on", "size": 3, '
+    '"capability": "' + CAPABILITY_CHOICES + '", '
     '"dependencies": ["keys of earlier parts it needs finished first"]}]}\n\nUser request:\n'
+)
+
+PART_ROLE = (
+    "You are planning one part of a multi-model task in Super Partner. The task's lead split the "
+    "request into major parts; other planners split the other parts at the same time, so rely only on "
+    "what the outline below says each part provides, and deliver exactly what yours provides. Split "
+    "your part level by level, as you are asked, until every piece is a task. You may read files and "
+    "run read-only commands to look things up; do not edit anything.\n\n"
+    + TASK_RULES + "\n" + WORK_RULES
 )
 
 PART_SHAPE = ('{"key": "s1", "kind": "part", "title": "...", "goal": "what it delivers", '
@@ -223,43 +245,117 @@ async def _ask(say: Say, message: str, read):
         return read(_extract_json(reply))
 
 
-async def plan_in_parts(say: Say, opening: str) -> TaskPlan:
-    """Plan top-down through ``say`` (one message to the lead, its reply back): the major parts
-    first, then each part in turn, depth first. Raises ValueError if the lead's replies cannot be
-    turned into a plan."""
-    tree = Tree()
-
-    def outline(payload: dict):
+async def plan_outline(say: Say, opening: str) -> TaskPlan:
+    """The major parts of a plan, from the lead through ``say``; their tasks come later
+    (``refine``). Raises ValueError if the lead's replies cannot be turned into an outline."""
+    def read(payload: dict):
         return str(payload.get("summary") or "").strip(), siblings(payload.get("parts"), False, parts_only=True)
 
-    summary, parts = await _ask(say, opening, outline)
-    waiting = tree.add(parts, None)
+    summary, raw = await _ask(say, opening, read)
+    tree = Tree()
+    parts = tree.add(raw, None)
+    for part, item in zip(parts, raw):
+        part.provides = str(item.get("provides") or "").strip()[:3000]
+        part.capability = str(item.get("capability") or "coding").split("|")[0].strip()
+        if part.capability not in CAPABILITY_CHOICES.split(" | "):
+            part.capability = "coding"
+        try:
+            part.size = max(1, min(int(item.get("size") or 3), MAX_TASKS))
+        except (TypeError, ValueError):
+            part.size = 3
+        part.status = "planned"
+    return TaskPlan(summary=(summary or "Autonomous task plan")[:240], nodes=[], parts=parts)
+
+
+def outline_text(plan: TaskPlan) -> str:
+    """The major parts as a planner of one of them sees them."""
+    titles = {part.id: part.title for part in plan.parts}
+    lines = []
+    for part in plan.parts:
+        if part.parent_id:
+            continue
+        waits = ", ".join(titles.get(item, item) for item in part.dependencies)
+        lines.append(f"- {part.title}: {part.goal}" + (f" (waits for: {waits})" if waits else ""))
+        if part.provides:
+            lines.append(f"  provides: {part.provides}")
+    return "\n".join(lines)
+
+
+def part_opening(plan: TaskPlan, part: PlanPart) -> str:
+    """The first message to the planner of ``part``, before it is asked to split it."""
+    return (PART_ROLE + f"\nOutline of the task ({plan.summary}):\n{outline_text(plan)}\n\n"
+            f"Your part: {part.title}\n\nRequest and context:\n{plan.request}\n\n")
+
+
+async def refine(say: Say, plan: TaskPlan, part: PlanPart, opening: str = "") -> tuple[list[PlanPart], list[TaskNode]]:
+    """Split ``part`` of ``plan`` through ``say``, depth first, until every piece is a task.
+    ``opening`` comes before the first question. Returns its new parts and its tasks, whose
+    dependencies are among themselves; ``link`` adds those on other major parts."""
+    tree = Tree()
+    tree.parts[part.id], tree.parent[part.id], tree.waits[part.id] = part, None, []
+    tree.children[None] = [part.id]
+    above = len(plan.part_path(part.parent_id))
+    waiting = [part]
     while waiting:
-        part = waiting.pop(0)
-        depth = tree.depth(part.id)
-        room = MAX_TASKS - len(tree.tasks)
-        path = [item.title for item in _path(tree, part.id)]
+        current = waiting.pop(0)
+        depth = above + tree.depth(current.id)
+        room = MAX_TASKS - len(plan.nodes) - len(tree.tasks)
+        path = [item.title for item in plan.part_path(part.parent_id)] + [item.title for item in _path(tree, current.id)]
 
         def read(payload: dict, depth=depth, room=room):
             return siblings(payload.get("children"), depth >= MAX_DEPTH, room=room)
 
-        children = await _ask(say, refine_message(part, path, depth, room), read)
+        message = refine_message(current, path, depth, room)
+        children = await _ask(say, opening + message if current is part else message, read)
         for _ in range(ROUNDS):
             if not (problems := task_problems(children)):
                 break
-            # Too broad or vague a task makes its model explore or guess; the lead cuts it up.
+            # Too broad or vague a task makes its model explore or guess; the planner cuts it up.
             try:
                 children = await _ask(say, (
-                    f"Some tasks of \"{part.title}\" are not yet small and clear:\n- " + "\n- ".join(problems)
+                    f"Some tasks of \"{current.title}\" are not yet small and clear:\n- " + "\n- ".join(problems)
                     + "\nReply with the whole corrected split of this part as the JSON object described, "
                     "and nothing else."), read)
             except (ValueError, TypeError, KeyError):
                 break  # keep the split it gave before
-        # Depth first: this part's own parts are split before the next part at its level.
-        waiting[0:0] = tree.add(children, part.id)
+        # Depth first: this part's own parts are split before the next one at its level.
+        waiting[0:0] = tree.add(children, current.id)
     if not tree.tasks:
-        raise ValueError("the plan has no tasks")
-    return tree.plan(summary or "Autonomous task plan")
+        raise ValueError(f"part {part.title} has no tasks")
+    split = tree.plan("")
+    return [item for item in split.parts if item.id != part.id], split.nodes
+
+
+def _top(plan: TaskPlan, part_id: Optional[str]) -> Optional[PlanPart]:
+    path = plan.part_path(part_id)
+    return path[0] if path else None
+
+
+def last_tasks(plan: TaskPlan, top: PlanPart) -> list[str]:
+    """The tasks of major part ``top`` that none of its other tasks waits for."""
+    own = [node for node in plan.nodes if (found := _top(plan, node.part_id)) and found.id == top.id]
+    ids = {node.id for node in own}
+    waited = {item for node in own for item in node.dependencies if item in ids}
+    return [node.id for node in own if node.id not in waited]
+
+
+def link(plan: TaskPlan) -> None:
+    """Make every task wait for the last tasks of the major parts its own major part waits for,
+    once those are split. Only adds waits, so the lead's own changes stay."""
+    by_id = {part.id: part for part in plan.parts}
+    last = {part.id: last_tasks(plan, part) for part in plan.parts if not part.parent_id and part.status == "ready"}
+    for node in plan.nodes:
+        top = _top(plan, node.part_id)
+        for waited in top.dependencies if top else []:
+            if waited in last and by_id[waited].parent_id is None:
+                node.dependencies += [item for item in last[waited] if item not in node.dependencies]
+
+
+def waits_on_unsplit(plan: TaskPlan, node: TaskNode) -> bool:
+    """Whether ``node``'s major part waits for one not split into tasks yet, whose tasks it will wait for."""
+    by_id = {part.id: part for part in plan.parts}
+    top = _top(plan, node.part_id)
+    return bool(top) and any(by_id[item].status != "ready" for item in top.dependencies if item in by_id)
 
 
 def _path(tree: Tree, part_id: str) -> list[PlanPart]:

@@ -3,7 +3,7 @@ import json
 
 import httpx
 import pytest
-from super_partner import progress
+from super_partner import outline, progress
 from super_partner.budget import ProviderError
 from super_partner.models import SupervisorSession, TaskNode, TaskPlan
 from super_partner.planner import autonomous_plan, scope_problems
@@ -27,6 +27,20 @@ def plan(*nodes):
 OUTLINE = json.dumps({"summary": "s", "parts": [{"key": "p", "title": "全部", "goal": "完成请求"}]})
 
 
+async def split(prompt, replies, brief=None):
+    """Plan ``prompt`` as one major part, then split it with ``replies``, as a running task does."""
+    leads = Leads([OUTLINE, *replies])
+    planned = await autonomous_plan(prompt, MODELS, CONFIGURED, leads, session=SupervisorSession(), brief=brief)
+    session = SupervisorSession(model_id="cli:codex")
+
+    async def say(text):
+        return (await leads.converse(session, text)).text
+
+    part = planned.parts[0]
+    _, nodes = await outline.refine(say, planned, part, outline.part_opening(planned, part))
+    return TaskPlan(summary="s", nodes=nodes), [message for _, _, message in leads.messages]
+
+
 AREA = plan(("界面", [], {"files": ["easylife/static/"]}), ("检查", ["界面"], {"verifies": ["界面"]}))
 PACKAGES = plan(
     ("按钮", [], {"files": ["style.css"], "provides": ".btn-primary 44px", "check": "node --check app.js"}),
@@ -35,11 +49,9 @@ PACKAGES = plan(
 
 
 async def test_the_lead_plans_from_the_brief_and_cuts_broad_steps_into_packages():
-    session = SupervisorSession()
-    leads = Leads([OUTLINE, AREA, PACKAGES])
-    result = await autonomous_plan("把界面打磨好", MODELS, CONFIGURED, leads, session=session, brief=BRIEF)
+    result, messages = await split("把界面打磨好", [AREA, PACKAGES], BRIEF)
     assert [node.title for node in result.nodes] == ["按钮", "设置页", "检查"]
-    first, _, second = (message for _, _, message in leads.messages)
+    _, first, second = messages
     assert BRIEF in first and "small work packages" in first
     assert "界面: names folders or patterns (easylife/static/)" in second
     button = result.nodes[0]
@@ -47,9 +59,8 @@ async def test_the_lead_plans_from_the_brief_and_cuts_broad_steps_into_packages(
 
 
 async def test_a_lead_that_keeps_planning_broadly_still_gets_its_plan_run():
-    leads = Leads([OUTLINE, AREA, AREA, AREA])
-    result = await autonomous_plan("把界面打磨好", MODELS, CONFIGURED, leads, session=SupervisorSession(), brief=BRIEF)
-    assert [node.title for node in result.nodes] == ["界面", "检查"] and len(leads.messages) == 4
+    result, messages = await split("把界面打磨好", [AREA, AREA, AREA], BRIEF)
+    assert [node.title for node in result.nodes] == ["界面", "检查"] and len(messages) == 4
 
 
 def test_what_makes_a_package_too_broad():
@@ -103,12 +114,11 @@ def test_the_lead_is_asked_only_about_scoped_packages(database):
 
 async def test_a_new_task_is_cut_into_packages_too():
     broad = plan(("全部", [], {}), ("说明", ["全部"], {"capability": "chinese"})).replace('"needs_workspace": true, ', '')
-    leads = Leads([OUTLINE, broad, json.dumps(
+    result, messages = await split("写一个异步 FIFO", [broad, json.dumps(
         {"children": [
             {"key": "rtl", "title": "RTL", "instructions": "写 FIFO", "capability": "coding", "files": ["async_fifo.v"],
              "provides": "module async_fifo #(DATA_WIDTH, DEPTH)", "acceptance_criteria": "仿真通过"},
             {"key": "tb", "title": "测试", "instructions": "写测试", "capability": "coding",
              "files": ["tb_async_fifo.v", "Makefile"], "acceptance_criteria": "make 能跑"}]})])
-    result = await autonomous_plan("写一个异步 FIFO", MODELS, CONFIGURED, leads, session=SupervisorSession())
-    assert "全部: lists no files" in leads.messages[2][2]
+    assert "全部: lists no files" in messages[2]
     assert [node.files for node in result.nodes] == [["async_fifo.v"], ["tb_async_fifo.v", "Makefile"]]

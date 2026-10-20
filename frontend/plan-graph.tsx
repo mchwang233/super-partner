@@ -86,9 +86,29 @@ export function planStages<T extends { id: string; dependencies?: string[] }>(no
 
 export type Edge = { from: string; to: string; done: boolean };
 
+/** Only the edges no other path already implies: a -> c goes when a -> b -> c is there, so no line
+ * crosses behind the cards between them. */
+export function directEdges(edges: Edge[]): Edge[] {
+  const next = new Map<string, string[]>();
+  for (const edge of edges) next.set(edge.from, [...(next.get(edge.from) ?? []), edge.to]);
+  const reaches = (from: string, to: string, skip: string): boolean => {
+    const seen = new Set<string>(), stack = (next.get(from) ?? []).filter(item => item !== skip);
+    while (stack.length) {
+      const item = stack.pop()!;
+      if (item === to) return true;
+      if (seen.has(item)) continue;
+      seen.add(item);
+      stack.push(...(next.get(item) ?? []));
+    }
+    return false;
+  };
+  return edges.filter(edge => !reaches(edge.from, edge.to, edge.to));
+}
+
 /** Lines from card to card inside ``board``, for cards marked ``data-{attr}``; measured after layout
- * and redrawn when ``shape`` changes or the board resizes. */
-export function useLinks(board: React.RefObject<HTMLDivElement | null>, edges: Edge[], attr: string, shape: string) {
+ * and redrawn when ``shape`` changes or the board resizes. A line meets a card at the middle of its
+ * ``anchor`` element when it has one (a card's head, so it stays put when the card opens). */
+export function useLinks(board: React.RefObject<HTMLDivElement | null>, edges: Edge[], attr: string, shape: string, anchor?: string) {
   const [links, setLinks] = useState<(Edge & { id: string; d: string })[]>([]);
   const [size, setSize] = useState({ width: 0, height: 0 });
   useLayoutEffect(() => {
@@ -96,13 +116,16 @@ export function useLinks(board: React.RefObject<HTMLDivElement | null>, edges: E
     if (!element) return;
     const draw = () => {
       const box = element.getBoundingClientRect();
-      const cards = new Map([...element.querySelectorAll<HTMLElement>(`[data-${attr}]`)].map(card => [card.dataset[attr]!, card.getBoundingClientRect()]));
+      const cards = new Map([...element.querySelectorAll<HTMLElement>(`[data-${attr}]`)].map(card => {
+        const rect = card.getBoundingClientRect(), head = anchor ? card.querySelector(anchor)?.getBoundingClientRect() : undefined;
+        return [card.dataset[attr]!, { left: rect.left, right: rect.right, width: rect.width, middle: head ? head.top + head.height / 2 : rect.top + rect.height / 2 }];
+      }));
       const next = [];
-      for (const edge of edges) {
+      for (const edge of directEdges(edges)) {
         const from = cards.get(edge.from), to = cards.get(edge.to);
         if (!from || !to || !from.width) continue;
-        const x1 = from.right - box.left + element.scrollLeft, y1 = from.top + from.height / 2 - box.top;
-        const x2 = to.left - box.left + element.scrollLeft, y2 = to.top + to.height / 2 - box.top;
+        const x1 = from.right - box.left + element.scrollLeft, y1 = from.middle - box.top;
+        const x2 = to.left - box.left + element.scrollLeft, y2 = to.middle - box.top;
         const middle = (x1 + x2) / 2;
         next.push({ ...edge, id: `${edge.from}>${edge.to}`, d: `M${x1},${y1} C${middle},${y1} ${middle},${y2} ${x2},${y2}` });
       }

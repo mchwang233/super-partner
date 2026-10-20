@@ -261,7 +261,8 @@ class CostEstimate(BaseModel):
 
 class PlanPart(BaseModel):
     """A part of a plan (大项 at the top level), split level by level into smaller parts and
-    finally tasks (outline.py). Only tasks run; parts group them."""
+    finally tasks (outline.py). Only tasks run; parts group them. A task is planned as major
+    parts only; once it runs, every major part is split at the same time (refining.py)."""
     id: str
     title: str
     goal: str = ""
@@ -269,17 +270,35 @@ class PlanPart(BaseModel):
     parent_id: Optional[str] = None
     # Earlier parts or tasks under the same parent that this part waits for.
     dependencies: list[str] = Field(default_factory=list)
+    # What other parts may rely on (names, signatures, endpoints, file formats): parts are split
+    # apart, so this is all they know of each other.
+    provides: str = ""
+    # The lead's guess of its tasks and their main capability, for the estimate before it is split.
+    size: int = 0
+    capability: str = "coding"
+    estimated_cost_usd: float = 0.0
+    # A major part: planned (not split yet), refining, ready (split into tasks) or failed.
+    status: str = "ready"
+    error: Optional[str] = None
 
 
 class TaskPlan(BaseModel):
     summary: str
     nodes: list[TaskNode]
     parts: list[PlanPart] = Field(default_factory=list)
+    # What the plan was made from (request, project context and brief), for splitting its parts
+    # later; and whether its steps work in a project folder.
+    request: str = ""
+    in_project: bool = False
     estimate: Optional[CostEstimate] = None
     planning_method: str = "heuristic"
     planner_model_id: Optional[str] = None
     planning_cost_usd: float = 0.0
     planning_note: Optional[str] = None
+
+    def unsplit_cost(self) -> float:
+        """The estimate of major parts not yet split into tasks."""
+        return sum(part.estimated_cost_usd for part in self.parts if not part.parent_id and part.status != "ready")
 
     def part_path(self, part_id: Optional[str]) -> list[PlanPart]:
         """The parts from the top level down to ``part_id``."""
@@ -372,6 +391,8 @@ class LeadMessage(BaseModel):
     role: str  # user | lead
     text: str = ""
     status: str = "done"  # pending (the lead is answering) | done | failed
+    # The platform engineer's job the lead brought into the conversation with this answer.
+    engineer_job_id: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -466,6 +487,8 @@ class ExecutionRun(BaseModel):
     maintenance_id: Optional[str] = None
     # The platform engineer job (a component the lead asked for) this task waits for.
     engineer_job_id: Optional[str] = None
+    # The status of each platform engineer job for this task when its lead last heard of it.
+    engineer_seen: dict[str, str] = Field(default_factory=dict)
     waiting_diagnosis_id: Optional[str] = None
     # A requirement change continues a finished task: the task it builds on, the scratch folder
     # they share (when there is no project), and what the planner and steps are told about it.

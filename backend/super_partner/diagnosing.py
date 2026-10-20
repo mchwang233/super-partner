@@ -59,7 +59,8 @@ class Diagnosing:
                     diagnosis = next(item for item in run.diagnoses if item.id == diagnosis_id)
                     break
                 busy = self.diagnosing.get(run_id)
-                if not busy or busy.done():
+                # The slot may be this very task: the lead's answer to the user, which led here.
+                if not busy or busy.done() or busy is asyncio.current_task():
                     node = next(item for item in run.plan.nodes if item.id == node_id)
                     diagnosis_id = self.begin_diagnosis(run, "lead_repair" if decision_id else "auto", node_id)
                     diagnosis = run.diagnoses[-1]
@@ -310,7 +311,7 @@ class Diagnosing:
     def begin_diagnosis(self, run: ExecutionRun, trigger: str, node_id: Optional[str] = None) -> Optional[str]:
         """Record a new diagnosis on ``run`` (the caller saves it); None if one is running."""
         task = self.diagnosing.get(run.id)
-        if task and not task.done():
+        if task and not task.done() and task is not asyncio.current_task():
             return None
         model = pick_diagnoser(list(self.model_lookup.values()), self._configured(run))
         diagnosis = Diagnosis(id=uuid4().hex[:8], trigger=trigger, node_id=node_id, model_id=model.id if model else None)

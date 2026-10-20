@@ -107,6 +107,28 @@ async def test_the_lead_asks_the_user_and_acts_on_the_answer(database):
     assert [item.event for item in final.decisions] == ["attempt_failed", "user_answer"]
 
 
+async def test_a_repair_the_lead_decides_on_after_the_users_answer_runs(database):
+    """The answer is handled in the task's diagnosis slot; the repair it leads to must not wait for
+    that slot to free up, which would be waiting for itself."""
+    import asyncio
+
+    team = Team([decision("ask_user", question="许可证服务没起来，怎么办？", options=["修环境"]),
+                 decision("repair_environment", instructions="让步骤能连上许可证服务")])
+    executor, result = await run(database, team)
+    question = result.diagnoses[-1]
+    question.messages.append(DiagnosisMessage(text="交给平台修", choice=None))
+    result.waiting_diagnosis_id = None
+    database.save_run(result)
+    executor.start_lead_answer("r", question.id)
+    await asyncio.wait_for(executor.diagnosing["r"], 5)
+    final = database.get_run("r")
+    assert len(team.diagnoses) == 1 and "让步骤能连上许可证服务" in team.diagnoses[0]
+    assert [item.trigger for item in final.diagnoses] == ["lead", "lead_repair"]
+    if "r" in executor.tasks:
+        await executor.tasks["r"]
+    assert database.get_run("r").status == RunStatus.SUCCEEDED
+
+
 async def test_the_lead_sends_a_repair_session_to_fix_the_environment(database):
     team = Team([decision("repair_environment", instructions="装上 iverilog")])
     _, result = await run(database, team)

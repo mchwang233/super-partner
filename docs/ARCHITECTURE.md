@@ -6,8 +6,10 @@ Keep it current: a change that moves a responsibility updates this file in the s
 ## Life of a task
 
 ```
-api.create_task ── planner.autonomous_plan ── routing.route_node        (plan, pick a model per step)
-api.confirm_task ── Executor.execute ── _dispatch                       (run ready steps in parallel)
+api.create_task ── planner.autonomous_plan ── routing.route_node        (plan, pick a model per step;
+                                                                         with a lead: major parts only, outline.py)
+api.confirm_task ── Executor.execute ── _dispatch                       (run ready steps in parallel;
+                                          └─ _split_parts               split every major part at once, refining.py)
   _execute_node ── _work ── _complete ── providers.complete             (one attempt of one step)
                                           ├─ cli_channels  (membership CLIs: claude, codex, ...)
                                           └─ agent.Workspace (API models' tools, bwrap sandbox)
@@ -31,7 +33,8 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Records and statuses | `models.py` | `RunStatus`, `NodeStatus`, `Outcome` (attempt outcomes), `DiagnosisStatus`, `FINISHED`, `TaskNode`, `NodeAttempt`, `Diagnosis`, `ExecutionRun` |
 | Storage (SQLite, JSON bodies) | `db.py` | `Database.save_run`, `get_run`, events |
 | Planning | `planner.py` | `autonomous_plan` (by the lead when one is available: `_plan_as_lead`), `_validate_plan` (flat plan, when no lead plans), `task_node`, `WORK_RULES`; project work as small packages (`TaskNode.files/reads/provides/check`, `package`, `scope_problems` sends broad steps back to the lead) |
-| The lead plans top-down: major parts (大项), split level by level into parts or tasks until each is an independent task (docs/design/plan-parts.md) | `outline.py` | `plan_in_parts`, `OUTLINE_PROMPT`, `refine_message`, `siblings`, `task_problems`, `Tree` (a wait on a part becomes a wait on its last tasks), `MAX_DEPTH`, `MAX_TASKS`; `TaskPlan.parts`, `PlanPart`, `TaskNode.part_id`, `TaskPlan.part_path` |
+| The lead plans top-down (docs/design/plan-parts.md): before the run, major parts (大项) by function with their contracts (`provides`); each part later split level by level until every piece is an independent task | `outline.py` | `plan_outline`, `OUTLINE_PROMPT`, `refine`, `part_opening`, `refine_message`, `siblings`, `task_problems`, `Tree`, `link` (a wait on a part becomes a wait on its last tasks), `waits_on_unsplit`, `MAX_DEPTH`, `MAX_TASKS`; `TaskPlan.parts/request/in_project/unsplit_cost`, `PlanPart.status/size/provides`, `TaskNode.part_id`, `TaskPlan.part_path`; estimate `routing.part_estimate`, `fit_and_route` |
+| Splitting a running task's major parts into tasks, all at once, each in its own lead conversation; a part that cannot be split pauses the task | `refining.py` (mixed into `Executor`) | `_split_parts` (from `_dispatch`), `_split_part`, `PREFIX`; events `part.refining`, `part.refined`, `part.refine_failed` |
 | The task's lead: one conversation from planning to the end (docs/design/supervisor.md) | `supervisor.py` | `candidates`, `ask`, `handover`, `trim`; `Executor.ask_lead`, `ProviderRegistry.converse`, `CliChannelRegistry.converse`, `ExecutionRun.supervisor` |
 | Model choice | `routing.py` | `route_node` (first pick), `strongest_for` (retry), `stronger_than` (escalation), `pick_reviewer`, `diagnosers` |
 | Scheduling, attempts, step outcomes | `executor.py` | `Executor`; see "Executor" below |
@@ -39,7 +42,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | The lead's decisions after a failed attempt, and its questions to the user; while it decides, `ExecutionRun.lead_thinking` (`_thinking`); a repair it asks for (`Diagnosis.trigger == "lead_repair"`, `decision_id`) comes back to it (`_after_repair`) before the step runs again | `leading.py` (mixed into `Executor`) | `_decide`, `_ask_for_decision`, `_apply_decision`, `_after_repair`, `_decisions_left`, `start_lead_answer`, `start_lead_chat`; prompts in `supervisor.failure_message`, `repair_message`, `parse_decision` |
 | Diagnosing failures and acting on them (when no lead decides; repairs the lead asks for) | `diagnosing.py` (mixed into `Executor`) | `_repair`, `_diagnose_with`, `_repair_done`, `begin_diagnosis`, `_run_diagnosis` |
 | Repairing Super Partner itself (flow) | `self_repair.py` (mixed into `Executor`) | `_fix_platform`, `_activate_platform`, `_hold_for_platform`, `restore_platform`, `_finish_platform` (a repair the lead asked for goes back to it: `_platform_to_lead`) |
-| The platform engineer: repairs and components the user (or a lead) asks for, as jobs; plan → approve → build in a copy → check → approve → apply → git commit (docs/design/platform-engineer.md) | `engineer.py` (mixed into `Executor`) | `EngineerJob`, `engineer_request`, `engineer_reply`, `engineer_approve`, `engineer_reject`, `_engineer_run`, `_engineer_apply`, `_engineer_finished`, `_engineer_to_lead`, `commit`; API `/api/engineer`; prompts `plan_prompt`, `edit_prompt`; guide `skills/platform-engineer/SKILL.md` |
+| The platform engineer: repairs and components the user (or a lead) asks for, as jobs; plan → approve → build in a copy → check → approve → apply → git commit (docs/design/platform-engineer.md) | `engineer.py` (mixed into `Executor`) | `EngineerJob`, `engineer_request`, `engineer_join` (into a task's conversation with its lead: by the user, the lead's chat `supervisor.split_engineer`, or any decision's `engineer` field; the lead hears progress, `_engineer_news`/`engineer_updates`), `engineer_reply`, `engineer_approve`, `engineer_reject`, `_engineer_run`, `_engineer_apply`, `_engineer_finished`, `_engineer_to_lead`, `commit`; API `/api/engineer`; prompts `plan_prompt`, `edit_prompt`; guide `skills/platform-engineer/SKILL.md` |
 | Changing a running task's plan at the lead's decision | `replan.py` | `change_plan`, `PlanError` |
 | What happens after a failure without a lead (fallback: retry model, meaning of a diagnosis) | `recovery.py` | `retry_model`, `failed_models`, `after_diagnosis`, `turns_for`, `MODEL_FAILURES` |
 | Prompts for steps and reviews, verdict parsing | `quality.py` | `node_prompt`, `continue_prompt`, `attempt_notes`, `review_prompt`, `parse_review`, `UNABLE_RULE`, `unable_claim`, `retry_feedback` |
@@ -62,7 +65,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 ## Executor
 
 `Executor` (`executor.py`) mixes in `Reviewing` (`review.py`), `Leading` (`leading.py`), `Diagnosing`
-(`diagnosing.py`), `SelfRepair` (`self_repair.py`) and `Engineering` (`engineer.py`); they share its state (`db`, `locks`, `_complete`, `_save`, `emit`).
+(`diagnosing.py`), `SelfRepair` (`self_repair.py`), `Engineering` (`engineer.py`) and `Refining` (`refining.py`); they share its state (`db`, `locks`, `_complete`, `_save`, `emit`).
 
 - `execute` / `_dispatch`: the run loop; starts ready nodes up to `max_parallel_nodes`.
 - `_execute_node`: one attempt; exceptions map to outcomes (`budget`, `error`, quota → `_switch_model`).
@@ -106,6 +109,6 @@ about 35 s), `cd frontend && npm test` and `npm run build` (only when the fronte
 
 ## Frontend (`frontend/`)
 
-`src.tsx` (app shell, task creation, actions), `lead.tsx` (the lead's decisions, questions and messages), `result-page.tsx` (results, requirement change),
+`src.tsx` (app shell, task creation, actions), `lead.tsx` (the task's conversation: the lead's decisions, questions and messages), `lead-engineer.tsx` (the platform engineer in that conversation: its jobs' lines and cards, @平台工程师, bringing it in), `result-page.tsx` (results, requirement change),
 `plan-parts.tsx` (the progress view: major parts as stages that open in place, `PlanView`), `plan-graph.tsx` (steps and attempts), `engineer.tsx` (the platform engineer's page), `diagnosis.tsx` (diagnosis chat), `mission-history.tsx`
 (task list), `model-profiles.tsx` (models), `style.css` (tokens and styles).

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import briefing, progress, quality, scopes, supervisor
+from . import briefing, outline, progress, quality, scopes, supervisor
 from .budget import BudgetExceeded, RequestBudget
 from .cli_channels import CLI_SPECS
 from .config import settings
@@ -20,6 +20,7 @@ from .projects import git_snapshot
 from .providers import Conversation, ProviderRegistry
 from .quota import ModelUnavailable, failure_kind
 from .recovery import retry_model, turns_for
+from .refining import PREFIX, Refining
 from .review import Reviewing
 from .routing import NoEligibleModelError, can_act, eligible_for_node, node_cost, route_node
 from .self_repair import SelfRepair
@@ -36,10 +37,11 @@ CHARS_PER_TOKEN = 3
 DEFAULT_CONTEXT = 128_000
 
 
-class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering):
+class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining):
     """Runs a task's steps: scheduling, attempts, retries and step outcomes. Reviewing
     (review.py), the lead's decisions (leading.py), diagnosing (diagnosing.py), self-repair
-    (self_repair.py) and the platform engineer (engineer.py) are mixed in."""
+    (self_repair.py), the platform engineer (engineer.py) and splitting major parts into tasks
+    (refining.py) are mixed in."""
 
     def __init__(self, db: Database, providers: ProviderRegistry, model_lookup: dict):
         self.db = db
@@ -108,6 +110,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering):
         for node in run.plan.nodes:
             if node.status == NodeStatus.RUNNING:
                 node.status = NodeStatus.PENDING
+        for part in run.plan.parts:
+            if part.status == "refining":
+                part.status = "planned"
         self._save(run)
         self.emit(run.id, "run.started")
         if run.project_dir:
@@ -157,6 +162,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering):
                 if unable:
                     self._end_incomplete(run, unable)
                     return
+                if unsplit := [part.title for part in run.plan.parts if not part.parent_id and part.status != "ready"]:
+                    raise RuntimeError("这些大项还没细化成任务：" + "、".join(unsplit))
                 if any(node.status != NodeStatus.SUCCEEDED for node in run.plan.nodes):
                     raise RuntimeError("Task graph is blocked by failed or cyclic dependencies")
                 # The lead checks the whole result first; steps it reworks or adds run before the end.
@@ -214,20 +221,23 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering):
                   unable=[node.id for node in unable], blocked=blocked)
 
     def _dispatch(self, run: ExecutionRun, running: dict[asyncio.Task, str]) -> bool:
-        """Start ready nodes up to the parallel limit; return True if budget held any back."""
+        """Start splitting major parts not split yet, and ready nodes up to the parallel limit;
+        return True if budget held any back."""
+        self._split_parts(run, running)
         in_flight = set(running.values())
         completed = {node.id for node in run.plan.nodes if node.status == NodeStatus.SUCCEEDED}
         ready = [
             node for node in run.plan.nodes
             if node.status == NodeStatus.PENDING and node.id not in in_flight
-            and set(node.dependencies) <= completed
+            and set(node.dependencies) <= completed and not outline.waits_on_unsplit(run.plan, node)
         ]
         reserved = run.actual_cost_usd + sum(
             node.estimated_cost_usd for node in run.plan.nodes if node.id in in_flight
         )
         held_back = False
         for node in ready:
-            if len(running) >= settings.max_parallel_nodes:
+            # Splits at work do not count: they are the lead's conversations, not steps.
+            if sum(not item.startswith(PREFIX) for item in running.values()) >= settings.max_parallel_nodes:
                 break
             if node.estimated_cost_usd and reserved + node.estimated_cost_usd > run.budget_usd:
                 held_back = True
@@ -646,6 +656,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering):
         async with self.lead_locks.setdefault(run_id, asyncio.Lock()):
             run = self.db.get_run(run_id)
             previous = run.supervisor.model_id if run.supervisor else None
+            # What the platform engineer did for this task since the lead last heard.
+            if news := self._engineer_news(run):
+                prompt = supervisor.engineer_updates(news) + prompt
 
             async def charged(model_id, call):
                 return await self._charged(run, None, model_id, call)
@@ -655,6 +668,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering):
             async with self.locks.setdefault(run_id, asyncio.Lock()):
                 latest = self.db.get_run(run_id)
                 latest.supervisor = session
+                latest.engineer_seen.update({job.id: job.status for job in news})
                 self._save(latest)
             if session.model_id != previous:
                 self.emit(run_id, "run.lead_changed", model_id=session.model_id, previous_model_id=previous)
