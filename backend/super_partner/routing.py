@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import Optional
 
+from .budget import token_cost
 from .config import settings
 from .models import DIFFICULTY_THRESHOLDS, CostEstimate, ModelProfile, TaskNode
+from .progress import EXPECTED_TURNS, expected_turns
 
 # Context the project brief's writer needs for a batch of whole files (briefing.BATCH_CHARS).
 BRIEF_CONTEXT = 64_000
@@ -13,13 +15,34 @@ class NoEligibleModelError(ValueError):
     pass
 
 
+# How an API model's tool loop costs grow, turn by turn: its prompt, instructions and tool
+# definitions; what each turn adds to the conversation (tool output and the model's own message);
+# and what it writes each turn, by reasoning effort. Each turn resends the conversation, all but
+# the newest part of it read from the provider's prompt cache.
+LOOP_BASE_TOKENS = 3_000
+LOOP_TURN_GROWTH = 1_000
+LOOP_TURN_OUTPUT = {"none": 200, "minimal": 200, "low": 300, "medium": 600, "high": 900, "max": 1_200}
+
+
+def loop_turns(node: TaskNode) -> int:
+    """The tool turns a step is expected to take."""
+    return expected_turns(node) or EXPECTED_TURNS.get(node.difficulty, EXPECTED_TURNS["normal"])
+
+
 def node_cost(node: TaskNode, model: ModelProfile) -> float:
+    """What one attempt of ``node`` on ``model`` should cost: one call, or for an API model that
+    works through tools, every turn of its loop."""
     if model.input_per_million is None or model.output_per_million is None:
         raise NoEligibleModelError(f"Pricing is not available for {model.id}")
-    return (
-        node.estimated_input_tokens * model.input_per_million
-        + node.estimated_output_tokens * model.output_per_million
-    ) / 1_000_000
+    if model.channel == "cli" or not can_act(model):
+        return token_cost(model, node.estimated_input_tokens, node.estimated_output_tokens)
+    output = LOOP_TURN_OUTPUT.get(settings.reasoning_by_difficulty.get(node.difficulty) or "", 800)
+    context, cost = LOOP_BASE_TOKENS + node.estimated_input_tokens, 0.0
+    for turn in range(loop_turns(node)):
+        cost += token_cost(model, context, output, context - LOOP_TURN_GROWTH if turn else 0)
+        context += LOOP_TURN_GROWTH
+    # The final answer, a summary of the work.
+    return cost + token_cost(model, context, node.estimated_output_tokens, context - LOOP_TURN_GROWTH)
 
 
 def eligible_for_node(
@@ -237,6 +260,13 @@ def part_estimate(part, in_project: bool, models: list[ModelProfile], configured
         fit_and_route(probe, models, configured, needs_vision)
         cost += probe.estimated_cost_usd
     return round(cost, 6)
+
+
+def reestimate(run) -> None:
+    """The task's estimate again, after its plan changed: steps added by splitting a major part
+    or by the lead, and parts still to split."""
+    plan = run.plan
+    plan.estimate = estimate(plan.nodes, run.budget_usd, plan.planning_cost_usd, plan.unsplit_cost())
 
 
 def estimate(nodes: list[TaskNode], budget: float, planning_cost: float = 0.0, extra: float = 0.0) -> CostEstimate:

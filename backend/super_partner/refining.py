@@ -11,7 +11,7 @@ import logging
 
 from . import outline, supervisor
 from .models import RunStatus
-from .routing import NoEligibleModelError, fit_and_route
+from .routing import NoEligibleModelError, fit_and_route, reestimate
 
 logger = logging.getLogger(__name__)
 # What the executor's run loop calls a split at work, beside its nodes.
@@ -76,6 +76,7 @@ class Refining:
                 run.plan.nodes += nodes
                 part.status = "ready"
                 outline.link(run.plan)
+                reestimate(run)
                 self._save(run)
                 self.emit(run_id, "part.refined", part_id=part_id, title=part.title, tasks=len(nodes),
                           parts=len(parts), model_id=used)

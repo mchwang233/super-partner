@@ -9,7 +9,7 @@ from uuid import uuid4
 from .models import ExecutionRun, ModelProfile, NodeStatus, TaskNode
 from .outline import MAX_TASKS
 from .planner import _difficulty, package
-from .routing import NoEligibleModelError, route_node
+from .routing import NoEligibleModelError, reestimate, route_node
 
 
 class PlanError(Exception):
@@ -109,6 +109,7 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
         except NoEligibleModelError as exc:
             raise PlanError(f"no model can take step {node.title}: {exc}") from exc
     run.plan.nodes = remaining
+    reestimate(run)
     return {"added": [node.title for node in added], "removed": [node.title for node in removed],
             "updated": [node.title for node in updated]}
 

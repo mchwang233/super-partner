@@ -170,3 +170,29 @@ def test_a_long_tool_loop_history_is_shortened_once_past_the_limit():
     before = json.dumps(history)
     providers.compact(history)
     assert json.dumps(history) == before or len(json.dumps(history)) <= len(before)
+
+
+def test_an_api_step_is_estimated_turn_by_turn_with_its_cache():
+    from super_partner import routing
+    from super_partner.budget import token_cost
+    from super_partner.models import ModelProfile, TaskNode
+
+    api = ModelProfile(id="deepseek:flash", provider="deepseek", display_name="flash", context_window=1_000_000,
+                       input_per_million=0.15, output_per_million=0.6, cached_input_per_million=0.003)
+    cli = ModelProfile(id="cli:claude", provider="anthropic", display_name="cli", channel="cli",
+                       context_window=1_000_000, input_per_million=0, output_per_million=0)
+    step = TaskNode(id="a", title="A", instructions="i", capability="coding", difficulty="normal",
+                    estimated_input_tokens=4000, estimated_output_tokens=800)
+    one_call = token_cost(api, 4000, 800)
+    looped = routing.node_cost(step, api)
+    # Fifteen turns of a growing, mostly cached conversation: far more than one call.
+    assert looped > 5 * one_call
+    context, expected = routing.LOOP_BASE_TOKENS + 4000, 0.0
+    for turn in range(15):
+        expected += token_cost(api, context, 600, context - routing.LOOP_TURN_GROWTH if turn else 0)
+        context += routing.LOOP_TURN_GROWTH
+    expected += token_cost(api, context, 800, context - routing.LOOP_TURN_GROWTH)
+    assert looped == expected
+    assert routing.node_cost(step, cli) == 0
+    # A hard step takes more turns and thinks harder.
+    assert routing.node_cost(step.model_copy(update={"difficulty": "hard"}), api) > looped

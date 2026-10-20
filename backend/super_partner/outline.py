@@ -23,6 +23,8 @@ MAX_CHILDREN = 8
 MAX_TASKS = 60
 # How many times a refinement with tasks that are not small and clear goes back to the lead.
 ROUNDS = 2
+# This many tasks of one part in a single chain are sent back to be made parallel.
+CHAIN_LIMIT = 4
 
 TASK_RULES = """A task is what one model does in one go. Every task must be:
 - independent: its model sees only the task's instructions, the files it names and what the tasks
@@ -46,7 +48,9 @@ OUTLINE_PROMPT = (
     "make parts like \"design\", \"implementation\", \"tests\" or \"documentation\" that each touch "
     "everything; only integrating the parts and a final report may be parts of their own.\n"
     "- Parts that do not wait for each other run at the same time, so let a part wait only for what "
-    "it truly needs; most parts should be able to start at once.\n"
+    "it truly needs; most parts should be able to start at once. Even a part that waits for another "
+    "builds against what that one provides and starts at once: only its tasks that must run or test "
+    "the other part's finished work wait for it.\n"
     "- \"provides\" is the contract other parts build on, because they never see this part's tasks: "
     "the files it owns, and exact names, function signatures, endpoints and their fields, data and "
     "file formats, commands. A part that waits for another uses only what that one provides.\n"
@@ -78,15 +82,23 @@ TASK_SHAPE = (
     '"files": ["files it creates or changes"], "reads": ["files it reads for reference"], '
     '"provides": "what later tasks can rely on", "check": "a command that shows it works", '
     '"dependencies": ["keys of earlier children"], "verifies": ["keys of the tasks it checks"], '
+    '"after_parts": ["titles of the parts listed above whose finished work it runs or tests; usually none"], '
     '"estimated_input_tokens": 1500, "estimated_output_tokens": 800}'
 )
 
 Say = Callable[[str], Awaitable[str]]
 
 
-def refine_message(part: PlanPart, path: list[str], depth: int, room: int) -> str:
-    """Ask the lead to split ``part``, which sits ``depth`` levels down."""
+def refine_message(part: PlanPart, path: list[str], depth: int, room: int, waited: list[PlanPart] = ()) -> str:
+    """Ask the lead to split ``part``, which sits ``depth`` levels down; ``waited`` are the
+    major parts its major part waits for."""
     deepest = depth >= MAX_DEPTH
+    waits = ""
+    if waited:
+        waits = ("This part's work waits for these parts: " + "; ".join(
+            f"\"{item.title}\" (provides: {item.provides or item.goal or 'see the outline'})" for item in waited)
+            + ". Its tasks build against what they provide and start at once; only a task that must run or "
+            "test their finished work names them in after_parts, and then waits until they are done.\n")
     kinds = ("This is the deepest level: every child must be a task." if deepest else
              "Each child is a task or a smaller part. Make a child a task as soon as it is independent, "
              "clear, small and checkable on its own; make it a part only if it still needs splitting.")
@@ -94,9 +106,11 @@ def refine_message(part: PlanPart, path: list[str], depth: int, room: int) -> st
         f"Split part \"{part.title}\" ({' › '.join(path)}).\n"
         f"Goal: {part.goal or part.title}\n"
         + (f"Done when: {part.acceptance}\n" if part.acceptance else "")
-        + f"{kinds}\n"
-        f"Use 1-{MAX_CHILDREN} children; the whole plan may have {room} more tasks. Dependencies name "
-        "earlier children of this part only, because whatever this part waits for is already arranged. "
+        + f"{kinds}\n" + waits
+        + f"Use 1-{MAX_CHILDREN} children; the whole plan may have {room} more tasks. Dependencies name "
+        "earlier children of this part only. A task depends on another only when it needs that one's files "
+        "or results: tasks that need only a contract run at the same time, so do not chain them one after "
+        "another. "
         "A verification task lists in verifies the keys of the tasks it checks, and they must also be "
         "among its dependencies.\n"
         "Reply with only a JSON object, no markdown fences:\n"
@@ -216,6 +230,9 @@ def siblings(items, deepest: bool, parts_only: bool = False, room: int = MAX_TAS
         if kind == "task":
             # Keys for now, so a verification is seen as one; Tree.plan resolves them to tasks.
             entry["node"] = task_node(raw, key, [], verifies)
+            # Titles for now; refine resolves them to the waited-for parts.
+            entry["node"].after_parts = [str(item) for item in raw.get("after_parts") or []
+                                         if isinstance(item, (str, int))] if isinstance(raw.get("after_parts"), list) else []
             if not entry["node"].instructions:
                 raise ValueError(f"task {key} needs instructions")
         seen.add(key)
@@ -231,6 +248,10 @@ def task_problems(children: list[dict]) -> list[str]:
     problems = scope_problems(TaskPlan(summary="", nodes=nodes))
     problems += [f"{node.title}: no acceptance_criteria; say how a reviewer can tell it is done"
                  for node in nodes if not node.acceptance_criteria]
+    tasks = [item for item in children if item["kind"] == "task"]
+    if len(tasks) >= CHAIN_LIMIT and all(before["key"] in after["dependencies"] for before, after in zip(tasks, tasks[1:])):
+        problems.append(f"the {len(tasks)} tasks form one chain, each waiting for the one before; a task should "
+                        "wait only for tasks whose files or results it needs, so that the others run at the same time")
     return problems
 
 
@@ -295,6 +316,9 @@ async def refine(say: Say, plan: TaskPlan, part: PlanPart, opening: str = "") ->
     tree.parts[part.id], tree.parent[part.id], tree.waits[part.id] = part, None, []
     tree.children[None] = [part.id]
     above = len(plan.part_path(part.parent_id))
+    # The major parts this one waits for: its tasks build against them, or name them to wait.
+    top = (plan.part_path(part.parent_id) or [part])[0]
+    waited = [item for item in plan.parts if item.id in top.dependencies]
     waiting = [part]
     while waiting:
         current = waiting.pop(0)
@@ -305,7 +329,7 @@ async def refine(say: Say, plan: TaskPlan, part: PlanPart, opening: str = "") ->
         def read(payload: dict, depth=depth, room=room):
             return siblings(payload.get("children"), depth >= MAX_DEPTH, room=room)
 
-        message = refine_message(current, path, depth, room)
+        message = refine_message(current, path, depth, room, waited)
         children = await _ask(say, opening + message if current is part else message, read)
         for _ in range(ROUNDS):
             if not (problems := task_problems(children)):
@@ -323,6 +347,9 @@ async def refine(say: Say, plan: TaskPlan, part: PlanPart, opening: str = "") ->
     if not tree.tasks:
         raise ValueError(f"part {part.title} has no tasks")
     split = tree.plan("")
+    names = {name: item.id for item in waited for name in (item.title, item.id)}
+    for node in split.nodes:
+        node.after_parts = list(dict.fromkeys(names[name] for name in node.after_parts if name in names))
     return [item for item in split.parts if item.id != part.id], split.nodes
 
 
@@ -340,14 +367,15 @@ def last_tasks(plan: TaskPlan, top: PlanPart) -> list[str]:
 
 
 def link(plan: TaskPlan) -> None:
-    """Make every task wait for the last tasks of the major parts its own major part waits for,
-    once those are split. Only adds waits, so the lead's own changes stay."""
+    """Make each task that runs or tests another major part's finished work (``after_parts``)
+    wait for that part's last tasks, once it is split; every other task builds against what the
+    part provides and starts at once. Only adds waits, so the lead's own changes stay."""
     by_id = {part.id: part for part in plan.parts}
     last = {part.id: last_tasks(plan, part) for part in plan.parts if not part.parent_id and part.status == "ready"}
     for node in plan.nodes:
         top = _top(plan, node.part_id)
         for waited in top.dependencies if top else []:
-            if waited in last and by_id[waited].parent_id is None:
+            if waited in last and waited in node.after_parts and by_id[waited].parent_id is None:
                 node.dependencies += [item for item in last[waited] if item not in node.dependencies]
 
 
@@ -355,7 +383,8 @@ def waits_on_unsplit(plan: TaskPlan, node: TaskNode) -> bool:
     """Whether ``node``'s major part waits for one not split into tasks yet, whose tasks it will wait for."""
     by_id = {part.id: part for part in plan.parts}
     top = _top(plan, node.part_id)
-    return bool(top) and any(by_id[item].status != "ready" for item in top.dependencies if item in by_id)
+    return bool(top) and any(by_id[item].status != "ready" for item in top.dependencies
+                             if item in by_id and item in node.after_parts)
 
 
 def _path(tree: Tree, part_id: str) -> list[PlanPart]:

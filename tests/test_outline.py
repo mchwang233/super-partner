@@ -85,20 +85,24 @@ async def test_before_it_runs_a_task_is_planned_as_major_parts_by_function():
 
 async def test_a_major_part_is_split_level_by_level_and_waits_become_task_waits():
     planned, _ = await outlined(BACKEND, FRONTEND)
-    # The front end is split first: its tasks cannot wait for the back end's tasks yet.
+    # The front end is split first. Its page builds against what the back end provides and can start
+    # at once; its check runs against the finished back end, so it says so and waits for it.
     front = await refine(planned, "前端", split(task("page", "页面"), task("check", "检查", ["page"], verifies=["page"],
-                                                                         files=[], reads=["page.py"])))
-    page = planned.nodes[0]
-    assert page.dependencies == [] and outline.waits_on_unsplit(planned, page)
+                                                                         files=[], reads=["page.py"], after_parts=["后端"])))
+    page, check = planned.nodes
+    assert page.after_parts == [] and check.after_parts == [planned.parts[0].id]
+    assert not outline.waits_on_unsplit(planned, page) and outline.waits_on_unsplit(planned, check)
     back = await refine(planned, "后端", split(part("store", "存储"), task("routes", "接口", ["store"])),
                         split(task("model", "数据模型"), task("db", "数据库读写", ["model"])))
     titles = {item.id: item.title for item in [*planned.nodes, *planned.parts]}
     assert [(node.title, titles[node.part_id]) for node in planned.nodes] == [
         ("页面", "前端"), ("检查", "前端"), ("数据模型", "存储"), ("数据库读写", "存储"), ("接口", "后端")]
-    # Once both are split, the front end's tasks wait for the back end's last task.
+    # Once both are split, only the check waits for the back end's last task.
     assert {node.title: [titles[item] for item in node.dependencies] for node in planned.nodes} == {
-        "页面": ["接口"], "检查": ["页面", "接口"], "数据模型": [], "数据库读写": ["数据模型"], "接口": ["数据库读写"]}
-    assert not outline.waits_on_unsplit(planned, page)
+        "页面": [], "检查": ["页面", "接口"], "数据模型": [], "数据库读写": ["数据模型"], "接口": ["数据库读写"]}
+    assert not outline.waits_on_unsplit(planned, check)
+    # The front end's planner heard what it waits for and how to wait.
+    assert '"后端" (provides: GET /todos' in front[0] and "after_parts" in front[0]
     # Each planner sees the outline with every part's contract, and its own part; depth first.
     assert "Outline of the task" in front[0] and "provides: GET /todos" in front[0] and "Your part: 前端" in front[0]
     assert 'Split part "后端" (后端)' in back[0] and back[1].startswith('Split part "存储" (后端 › 存储)')
@@ -184,11 +188,13 @@ def outlined_run(database):
 
 async def test_a_running_task_splits_its_parts_at_once_and_runs_their_tasks_in_order(database):
     outlined_run(database)
-    team = Splitters({"后端": split(task("routes", "接口")), "前端": split(task("page", "页面"))})
+    team = Splitters({"后端": split(task("routes", "接口")), "前端": split(task("page", "页面", after_parts=["后端"]))})
     executor = Executor(database, team, RUN_MODELS)
     await executor.execute("o")
     run = database.get_run("o")
     assert run.status == RunStatus.SUCCEEDED and [item.status for item in run.plan.parts] == ["ready", "ready"]
+    # The estimate counts the steps the parts were split into.
+    assert run.plan.estimate and run.plan.estimate.base_usd >= sum(node.estimated_cost_usd for node in run.plan.nodes)
     # Both parts were asked about before either answered, and the page waited for the API.
     assert ['Split part "后端"' in team.lead[0], 'Split part "前端"' in team.lead[1]] == [True, True]
     assert team.work == ["Task: 做接口", "Task: 做页面"]
@@ -199,7 +205,7 @@ async def test_a_running_task_splits_its_parts_at_once_and_runs_their_tasks_in_o
 
 async def test_a_part_that_cannot_be_split_pauses_the_task_until_it_is_continued(database):
     outlined_run(database)
-    team = Splitters({"后端": "我拆不了", "前端": split(task("page", "页面"))})
+    team = Splitters({"后端": "我拆不了", "前端": split(task("page", "页面", after_parts=["后端"]))})
     executor = Executor(database, team, RUN_MODELS)
     await executor.execute("o")
     run = database.get_run("o")
@@ -255,3 +261,31 @@ def test_a_part_not_yet_split_is_estimated_from_the_tasks_it_expects():
     later = TaskPlan(summary="s", nodes=[], parts=[PlanPart(id="p", title="后端", status="planned", estimated_cost_usd=0.5),
                                                    PlanPart(id="q", title="前端", estimated_cost_usd=0.2)])
     assert later.unsplit_cost() == 0.5
+
+
+
+async def test_a_task_that_only_needs_a_contract_starts_before_the_part_it_builds_on(database):
+    outlined_run(database)
+    order = []
+
+    class Slow(Splitters):
+        async def converse(self, session, prompt, spend_ok=None, timeout=600):
+            if 'Split part "后端"' in prompt:
+                await asyncio.sleep(0.2)  # the back end takes long to split
+            return await super().converse(session, prompt, spend_ok, timeout)
+
+        async def complete(self, model_id, prompt, workspace=None, **kwargs):
+            order.append(prompt.split("\n", 1)[0])
+            return await super().complete(model_id, prompt, workspace, **kwargs)
+
+    team = Slow({"后端": split(task("routes", "接口")), "前端": split(task("page", "页面"))})
+    await Executor(database, team, RUN_MODELS).execute("o")
+    # The page started while the back end was still being split.
+    assert order[0] == "Task: 做页面" and database.get_run("o").status == RunStatus.SUCCEEDED
+
+
+def test_a_part_split_into_one_long_chain_goes_back():
+    chain = outline.siblings([task("a", "A"), task("b", "B", ["a"]), task("c", "C", ["b"]), task("d", "D", ["c"])], False)
+    assert any("form one chain" in problem for problem in outline.task_problems(chain))
+    fanned = outline.siblings([task("a", "A"), task("b", "B", ["a"]), task("c", "C", ["a"]), task("d", "D", ["b", "c"])], False)
+    assert not any("form one chain" in problem for problem in outline.task_problems(fanned))

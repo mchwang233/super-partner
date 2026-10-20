@@ -212,6 +212,9 @@ class TaskNode(BaseModel):
     check: str = ""
     # The innermost plan part (PlanPart) this task belongs to; None in a plan without parts.
     part_id: Optional[str] = None
+    # Major parts whose finished work this task runs or tests, so it waits for them (outline.link).
+    # Other tasks build against what those parts provide and start at once.
+    after_parts: list[str] = Field(default_factory=list)
     model_id: Optional[str] = None
     # Why the router chose model_id, for the plan view.
     routing_note: Optional[str] = None
