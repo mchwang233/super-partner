@@ -57,6 +57,16 @@ export async function tellEngineer(text: string, runId: string, jobs: EngineerJo
   return act(`/api/tasks/${encodeURIComponent(runId)}/engineer`, { request: said, kind: "repair" });
 }
 
+/** A long report shows its first paragraph; the rest opens on demand, so the chat stays readable. */
+function Folded({ text }: { text: string }) {
+  const cut = text.indexOf("\n\n");
+  if (text.length <= 400 || cut < 0) return <div className="dx-report"><MarkdownView text={text} /></div>;
+  return <div className="dx-report">
+    <MarkdownView text={text.slice(0, cut)} />
+    <details className="lead-instructions"><summary>完整报告</summary><MarkdownView text={text.slice(cut + 2)} /></details>
+  </div>;
+}
+
 function EngineerMeta({ note, at }: { note: string; at: string }) {
   return <div className="dx-meta">
     <span className="dx-avatar engineer-avatar" aria-hidden="true">🛠</span>
@@ -70,8 +80,13 @@ export function EngineerEntry({ job, message, first, last, act, onOpenEngineer }
   job: EngineerJob; message: EngineerMessage; first: boolean; last: boolean; act: Act; onOpenEngineer?: (jobId: string) => void;
 }) {
   const kind = KIND[job.kind] ?? job.kind;
+  const said = first ? `@平台工程师 ${message.text}` : message.text;
   const line = message.role === "user"
-    ? <UserMessage message={{ text: first ? `@平台工程师 ${message.text}` : message.text, created_at: message.created_at }} />
+    ? said.length > 240
+      ? <div className="dx-msg dx-user engineer-said"><p>{said.slice(0, 160)}…</p>
+          <details><summary>完整内容</summary><p>{said}</p></details>
+          <small>{when(message.created_at)}</small></div>
+      : <UserMessage message={{ text: said, created_at: message.created_at }} />
     : message.role === "lead"
       ? <article className="dx-msg dx-ai">
           <div className="dx-meta"><span className="dx-avatar" aria-hidden="true">🧭</span><b>负责人</b><small>请平台工程师加入 · {when(message.created_at)}</small></div>
@@ -79,8 +94,8 @@ export function EngineerEntry({ job, message, first, last, act, onOpenEngineer }
         </article>
       : message.role === "engineer"
         ? <article className="dx-msg dx-ai engineer-msg"><EngineerMeta note={`${kind} · ${job.title}`} at={message.created_at} />
-            <div className="dx-report"><MarkdownView text={message.text} /></div></article>
-        : <p className="engineer-system"><span aria-hidden="true">🛠</span> 平台工程师 · {message.text}<small>{when(message.created_at)}</small></p>;
+            <Folded text={message.text} /></article>
+        : <p className="engineer-system" role="note"><span>🛠 {job.title} · {message.text} · {when(message.created_at)}</span></p>;
   return <>{line}{last && <JobCard job={job} act={act} onOpenEngineer={onOpenEngineer} />}</>;
 }
 
@@ -102,7 +117,8 @@ function JobCard({ job, act, onOpenEngineer }: { job: EngineerJob; act: Act; onO
     {job.status === "plan_ready" && job.plan && <details className="lead-instructions" open><summary>方案</summary><div className="dx-report"><MarkdownView text={job.plan} /></div></details>}
     {job.status === "needs_input" && job.question && <p className="lead-question">{job.question}</p>}
     {job.status === "ready" && <p className="engineer-ready">改动已通过检查{job.files?.length ? `，涉及 ${job.files.join("、")}` : ""}。应用后服务会重启一次。</p>}
-    {job.report && (job.status === "ready" || ENGINEER_DONE.has(job.status)) && <details className="lead-instructions"><summary>改动说明</summary><div className="dx-report"><MarkdownView text={job.report} /></div></details>}
+    {job.report && (job.status === "ready" || ENGINEER_DONE.has(job.status))
+      && !(job.messages ?? []).some(item => item.role === "engineer" && item.text === job.report) && <details className="lead-instructions"><summary>改动说明</summary><div className="dx-report"><MarkdownView text={job.report} /></div></details>}
     {job.status === "applied" && job.commit && <p className="muted">已提交到 git：{job.commit.slice(0, 8)}（没有推送）</p>}
     {job.status === "failed" && job.error && <p className="error">{job.error}</p>}
     <div className="engineer-actions">
