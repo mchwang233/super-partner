@@ -12,10 +12,13 @@ export type PlanNode = {
   changed_files?: string[]; inputs?: { node_id: string; form: string; changed_files: number }[];
   files?: string[]; reads?: string[]; provides?: string; check?: string; part_id?: string | null;
 };
-type ToolCall = { turn: number; tool: string; detail?: string; ok?: boolean };
+type ToolCall = { turn: number; tool: string; detail?: string; ok?: boolean; output?: string };
 type NodeAttempt = { model_id?: string | null; outcome: string; reason?: string | null; reviewer_model_id?: string | null; cost_usd: number; finished_at?: string;
   turns?: number; turn_limit?: boolean; tool_calls?: ToolCall[] };
-const TOOL_LABELS: Record<string, string> = { list_dir: "列目录", read_file: "读文件", write_file: "写文件", edit_file: "改文件", run_command: "运行命令" };
+const TOOL_LABELS: Record<string, string> = { Bash: "运行命令", Read: "读文件", Write: "写文件", Edit: "改文件", MultiEdit: "批量改文件",
+  Glob: "找文件", Grep: "搜索", LS: "列目录",
+  // Attempts recorded before the tools followed Claude Code's.
+  list_dir: "列目录", read_file: "读文件", write_file: "写文件", edit_file: "改文件", run_command: "运行命令" };
 
 /** Where an API model's turns went: calls per tool, then every call, folded by default. */
 function ToolLog({ calls }: { calls: ToolCall[] }) {
@@ -28,6 +31,7 @@ function ToolLog({ calls }: { calls: ToolCall[] }) {
     <summary>工具调用 {calls.length} 次：{[...counts].map(([tool, [n, bad]]) => `${TOOL_LABELS[tool] ?? tool} ${n}${bad ? `（失败 ${bad}）` : ""}`).join(" · ")}</summary>
     <ol>{calls.map((call, index) => <li key={index} className={call.ok === false ? "bad" : undefined}>
       <span className="tool-turn">第 {call.turn} 轮</span><span className="tool-name">{TOOL_LABELS[call.tool] ?? call.tool}</span><code>{call.detail}</code>{call.ok === false && <em>失败</em>}
+      {call.output && <details className="tool-output"><summary>模型看到的输出</summary><pre>{call.output}</pre></details>}
     </li>)}</ol>
   </details>;
 }

@@ -186,10 +186,11 @@ def attempt_notes(node: TaskNode) -> str:
     def files(*tools):
         return list(dict.fromkeys(call.detail.split(" (", 1)[0] for call in attempt.tool_calls
                                   if call.tool in tools and call.ok))
-    changed = files("write_file", "edit_file")
-    read = [path for path in files("read_file") if path not in changed]
+    # Attempts recorded before the tools followed Claude Code's used the older names.
+    changed = files("Write", "Edit", "MultiEdit", "write_file", "edit_file")
+    read = [path for path in files("Read", "read_file") if path not in changed]
     commands = [f"{'ok' if call.ok else 'failed'}: {call.detail}" for call in attempt.tool_calls
-                if call.tool == "run_command"][-MAX_NOTED_COMMANDS:]
+                if call.tool in {"Bash", "run_command"}][-MAX_NOTED_COMMANDS:]
     lines = [(f"What the previous attempt did ({attempt.model_id}, {attempt.turns} turns), which ended: "
               f"{(attempt.reason or attempt.outcome)[:300]}")]
     if changed:
@@ -263,8 +264,8 @@ def review_prompt(node: TaskNode, result: str, changed: list[str], diff: str, su
             "files that exist). Files this attempt did not change may come from earlier attempts; judge "
             "them by these contents and the listing, not by the list of changed files. Excerpts may "
             "be clipped: omitted content is not evidence that an implementation or check is missing. "
-            "When read_file is available, inspect the relevant files before deciding; use tail=true "
-            f"to read the final verification output in a long log:\n{diff}\n"
+            "When Read is available, inspect the relevant files before deciding; Read with a negative "
+            f"offset (such as -50) reads the final verification output of a long log:\n{diff}\n"
             if diff else ""
         )
         + '\nReply with JSON only: {"passed": true or false, "reason": "one or two sentences", '
@@ -406,7 +407,7 @@ def _excerpt(text: str, limit: int) -> str:
     """Keep both ends: verification summaries are usually at the end of a file."""
     if len(text) <= limit:
         return text
-    note = "\n[... clipped; read_file can inspect omitted content ...]\n"
+    note = "\n[... clipped; Read can inspect omitted content ...]\n"
     if limit <= len(note):
         return note[:max(0, limit)]
     head = (limit - len(note) + 1) // 2

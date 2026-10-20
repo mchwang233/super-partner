@@ -1,0 +1,127 @@
+"""The tools API models act through are Claude Code's: Bash, Read, Write, Edit, MultiEdit, Glob,
+Grep and LS, with its parameters and output."""
+import asyncio
+import os
+import time
+
+import pytest
+from super_partner import agent
+from super_partner.agent import Workspace
+
+
+@pytest.fixture
+def ws(tmp_path):
+    root = tmp_path / "work"
+    (root / "rtl").mkdir(parents=True)
+    (root / "tb").mkdir()
+    (root / "node_modules").mkdir()
+    (root / "rtl" / "fifo.sv").write_text("module fifo;\n  logic full;\n  logic empty;\nendmodule\n")
+    (root / "rtl" / "sync.sv").write_text("module sync;\nendmodule\n")
+    (root / "tb" / "tb_fifo.sv").write_text("module tb_fifo;\n  fifo dut();\n  // FULL check\nendmodule\n")
+    (root / "node_modules" / "skip.sv").write_text("module fifo_in_deps;\n")
+    os.utime(root / "rtl" / "sync.sv", (time.time() + 10, time.time() + 10))
+    return Workspace(root)
+
+
+async def test_the_tools_offered_are_claude_codes():
+    names = [tool["name"] for tool in agent.tools_for(sandboxed=True)]
+    assert names == ["Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS"]
+    assert [tool["name"] for tool in agent.tools_for(sandboxed=True, read_only=True)] == ["Read", "Glob", "Grep", "LS"]
+    assert "Bash" not in [tool["name"] for tool in agent.tools_for(sandboxed=False)]
+    edit = next(tool for tool in agent.TOOLS if tool["name"] == "Edit")["parameters"]
+    assert edit["required"] == ["file_path", "old_string", "new_string"] and "replace_all" in edit["properties"]
+
+
+async def test_glob_finds_files_newest_first_without_build_folders(ws):
+    found = (await ws.call("Glob", {"pattern": "**/*.sv"})).splitlines()
+    assert found[0] == "rtl/sync.sv" and sorted(found) == ["rtl/fifo.sv", "rtl/sync.sv", "tb/tb_fifo.sv"]
+    assert "node_modules" not in await ws.call("Glob", {"pattern": "**/*.sv"})
+    assert await ws.call("Glob", {"pattern": "*.sv", "path": "tb"}) == "tb/tb_fifo.sv"
+    assert await ws.call("Glob", {"pattern": "**/*.{sv,v}"}) != "No files found"
+    assert await ws.call("Glob", {"pattern": "**/*.vhd"}) == "No files found"
+
+
+async def test_grep_lists_files_shows_lines_with_context_or_counts(ws):
+    assert sorted((await ws.call("Grep", {"pattern": r"module \w*fifo"})).splitlines()) == ["rtl/fifo.sv", "tb/tb_fifo.sv"]
+    content = await ws.call("Grep", {"pattern": "full", "-i": True, "output_mode": "content", "glob": "*.sv"})
+    assert content.splitlines() == ["rtl/fifo.sv:2:  logic full;", "tb/tb_fifo.sv:3:  // FULL check"]
+    around = await ws.call("Grep", {"pattern": "full", "output_mode": "content", "-A": 1, "path": "rtl"})
+    assert around.splitlines() == ["rtl/fifo.sv:2:  logic full;", "rtl/fifo.sv-3-  logic empty;"]
+    assert await ws.call("Grep", {"pattern": "module", "output_mode": "count", "path": "rtl/fifo.sv"}) == "rtl/fifo.sv:2"
+    assert await ws.call("Grep", {"pattern": "nothing-like-this"}) == "No matches found"
+    assert (await ws.call("Grep", {"pattern": "(unclosed"})).startswith("Error: invalid regular expression")
+    capped = await ws.call("Grep", {"pattern": "e", "output_mode": "content", "head_limit": 2})
+    assert len(capped.splitlines()) == 3 and "output cut at 2 lines" in capped
+
+
+async def test_read_numbers_lines_and_reads_from_the_end(ws):
+    assert await ws.call("Read", {"file_path": "rtl/fifo.sv", "offset": 2, "limit": 2}) == (
+        "     2\t  logic full;\n     3\t  logic empty;\n[lines 2-3 of 4; pass offset to read more]")
+    assert await ws.call("Read", {"file_path": "rtl/fifo.sv", "offset": -1}) == "     4\tendmodule\n[lines 4-4 of 4; pass offset to read more]"
+    assert "is a directory: use LS" in await ws.call("Read", {"file_path": "rtl"})
+    assert "past the end" in await ws.call("Read", {"file_path": "rtl/sync.sv", "offset": 9})
+
+
+async def test_edit_needs_a_unique_match_unless_replace_all(ws):
+    assert "occurs 2 times" in await ws.call("Edit", {"file_path": "rtl/fifo.sv", "old_string": "logic", "new_string": "bit"})
+    result = await ws.call("Edit", {"file_path": "rtl/fifo.sv", "old_string": "logic", "new_string": "bit", "replace_all": True})
+    assert result.startswith("Edited rtl/fifo.sv (2 replacements):") and "     2\t  bit full;" in result
+    assert "are the same" in await ws.call("Edit", {"file_path": "rtl/fifo.sv", "old_string": "bit", "new_string": "bit"})
+    assert "use Write" in await ws.call("Edit", {"file_path": "rtl/new.sv", "old_string": "a", "new_string": "b"})
+
+
+async def test_multi_edit_applies_all_edits_or_none(ws):
+    before = (ws.root / "rtl/fifo.sv").read_text()
+    failed = await ws.call("MultiEdit", {"file_path": "rtl/fifo.sv", "edits": [
+        {"old_string": "full", "new_string": "is_full"}, {"old_string": "missing", "new_string": "x"}]})
+    assert failed.startswith("Error: edit 2: old_string was not found")
+    assert (ws.root / "rtl/fifo.sv").read_text() == before
+    done = await ws.call("MultiEdit", {"file_path": "rtl/fifo.sv", "edits": [
+        {"old_string": "full", "new_string": "is_full"}, {"old_string": "empty", "new_string": "is_empty"}]})
+    assert done.startswith("Edited rtl/fifo.sv (2 edits):")
+    assert "is_full" in (ws.root / "rtl/fifo.sv").read_text() and "is_empty" in (ws.root / "rtl/fifo.sv").read_text()
+
+
+async def test_a_turns_reads_run_at_the_same_time_and_writes_in_order(ws, monkeypatch):
+    running, peak = 0, 0
+    original = ws.read
+
+    def slow_read(args):
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        time.sleep(0.05)
+        running -= 1
+        return original(args)
+
+    monkeypatch.setattr(ws, "read", slow_read)
+    results = await ws.run_all([("Read", {"file_path": "rtl/fifo.sv"}), ("Read", {"file_path": "rtl/sync.sv"}),
+                                ("Grep", {"pattern": "module"})])
+    assert peak == 2 and all(ok for _, ok in results)
+    assert [ok for _, ok in await ws.run_all([("Write", {"file_path": "a.txt", "content": "1"}),
+                                             ("Read", {"file_path": "a.txt"})])] == [True, True]
+
+
+def test_the_log_describes_each_call_briefly():
+    assert agent.describe_call("Bash", {"command": "make sim"}) == "make sim"
+    assert agent.describe_call("Grep", {"pattern": "full", "glob": "*.sv"}) == "full (*.sv)"
+    assert agent.describe_call("MultiEdit", {"file_path": "a.sv", "edits": [{}, {}]}) == "a.sv (2 edits)"
+    assert agent.describe_call("Read", {"file_path": "a.sv", "offset": 10}) == "a.sv (from line 10)"
+
+
+def test_long_command_output_keeps_its_start_and_end():
+    text = "start\n" + "x" * 100_000 + "\nend"
+    clipped = agent._clip(text)
+    assert clipped.startswith("start") and clipped.endswith("end") and "characters cut" in clipped
+
+
+async def test_a_review_searches_only_what_it_may_read(tmp_path):
+    root = tmp_path / "project"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "app.py").write_text("SECRET_KEY = 1\n")
+    (root / ".env").write_text("SECRET_KEY = 2\n")
+    review = Workspace(root, read_only=True)
+    found = await review.call("Grep", {"pattern": "SECRET_KEY"})
+    assert found == "src/app.py"
+    assert (await review.call("Bash", {"command": "ls"})).startswith("Error: review workspace is read-only")
+    assert asyncio.iscoroutinefunction(review.run_all)

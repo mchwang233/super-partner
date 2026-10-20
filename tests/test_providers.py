@@ -29,7 +29,7 @@ def deepseek(message: dict, finish_reason: str) -> dict:
 
 
 WRITE_CALL = {"id": "c1", "type": "function", "function": {
-    "name": "write_file", "arguments": json.dumps({"path": "mail.py", "content": "ok"})}}
+    "name": "Write", "arguments": json.dumps({"file_path": "mail.py", "content": "ok"})}}
 
 
 class Reserving:

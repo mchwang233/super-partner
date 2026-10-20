@@ -789,3 +789,7 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 /* In the window each job's card already has a header; its card shows only what to do. */
 .engineer-chat .engineer-card>.lead-repair-head{display:none}
 .engineer-chat .engineer-card>.engineer-actions{margin-top:0}
+.tool-output{flex-basis:100%;margin:2px 0 4px}
+.tool-output summary{cursor:pointer;font-size:11px;color:var(--faint)}
+.tool-output pre{margin:4px 0 0;padding:6px 8px;max-height:200px;overflow:auto;border-radius:6px;background:var(--panel-2);font:11px/1.5 ui-monospace,monospace;white-space:pre-wrap;word-break:break-word}
+.tool-log li{flex-wrap:wrap}

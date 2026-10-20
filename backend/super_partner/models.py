@@ -131,6 +131,8 @@ class ToolCall(BaseModel):
     tool: str
     detail: str = ""
     ok: bool = True
+    # The start of what the tool returned, as the model saw it.
+    output: str = ""
 
 
 class Outcome:

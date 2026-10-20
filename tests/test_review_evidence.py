@@ -86,10 +86,10 @@ async def test_review_reads_a_log_tail_and_line_ranges(tmp_path):
     )
     (tmp_path / "db.py").write_text("first\nmigration\nlast\n")
     ws = agent.Workspace(tmp_path, read_only=True, readable_files=[".tmp-verify/tests.log"])
-    output = await ws.call("read_file", {"path": ".tmp-verify/tests.log", "tail": True, "limit": 2})
-    assert "Ran 155 tests in 92.794s\nOK" in output
+    output = await ws.call("Read", {"file_path": ".tmp-verify/tests.log", "offset": -2})
+    assert "5001\tRan 155 tests in 92.794s\n  5002\tOK" in output
     assert "5001-5002 of 5002" in output
-    assert "migration" in await ws.call("read_file", {"path": "db.py", "offset": 2, "limit": 1})
+    assert "migration" in await ws.call("Read", {"file_path": "db.py", "offset": 2, "limit": 1})
 
 
 async def test_review_rejects_mutations_and_private_or_outside_reads(tmp_path):
@@ -110,15 +110,15 @@ async def test_review_rejects_mutations_and_private_or_outside_reads(tmp_path):
         ".env", ".tmp-verify/.env", ".tmp-verify/secrets.json", ".ssh/id_rsa", "../outside.txt",
     ])
     for name in [*blocked, "../outside.txt", str(tmp_path / "outside.txt"), "outside-link", "secret-link"]:
-        assert (await ws.call("read_file", {"path": name})).startswith("Error:"), name
-    listing = await ws.call("list_dir", {})
+        assert (await ws.call("Read", {"file_path": name})).startswith("Error:"), name
+    listing = await ws.call("LS", {})
     assert "db.py" in listing
     assert ".env" not in listing and "credentials.json" not in listing and "secret-link" not in listing
-    assert (await ws.call("list_dir", {"path": ".."})).startswith("Error:")
+    assert (await ws.call("LS", {"path": ".."})).startswith("Error:")
     for name, args in [
-        ("write_file", {"path": "created.txt", "content": "changed"}),
-        ("edit_file", {"path": "db.py", "old_text": "original", "new_text": "changed"}),
-        ("run_command", {"command": "touch created.txt"}),
+        ("Write", {"file_path": "created.txt", "content": "changed"}),
+        ("Edit", {"file_path": "db.py", "old_string": "original", "new_string": "changed"}),
+        ("Bash", {"command": "touch created.txt"}),
     ]:
         assert "read-only" in await ws.call(name, args)
     assert (root / "db.py").read_text() == "original\n"
@@ -134,8 +134,8 @@ async def test_api_review_exposes_only_read_tools_and_returns_the_log_tail(tmp_p
     review_folder.mkdir()
     (project / ".tmp-verify").mkdir(parents=True)
     (project / ".tmp-verify" / "tests.log").write_text("details\n" * 5000 + "Ran 155 tests\nOK\n")
-    args = {"path": ".tmp-verify/tests.log", "tail": True, "limit": 2}
-    calls = [("read_file", args), ("write_file", {"path": "bad.txt", "content": "bad"})]
+    args = {"file_path": ".tmp-verify/tests.log", "offset": -2}
+    calls = [("Read", args), ("Write", {"file_path": "bad.txt", "content": "bad"})]
     verdict = '{"passed":true,"reason":"verified"}'
     sent = []
 
@@ -176,8 +176,8 @@ async def test_api_review_exposes_only_read_tools_and_returns_the_log_tail(tmp_p
         offered = [tool["name"] for tool in sent[0]["tools"]]
     else:
         offered = [tool["name"] for tool in sent[0]["tools"][0]["functionDeclarations"]]
-    assert set(offered) == {"list_dir", "read_file"}
-    assert "Ran 155 tests\\nOK" in json.dumps(sent[1])
+    assert set(offered) == {"Read", "Glob", "Grep", "LS"}
+    assert "\\tRan 155 tests\\n  5002\\tOK" in json.dumps(sent[1])
     assert "Error:" in json.dumps(sent[1]) and "read-only" in json.dumps(sent[1])
     assert not (project / "bad.txt").exists() and not (review_folder / "bad.txt").exists()
 

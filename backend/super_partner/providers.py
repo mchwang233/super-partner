@@ -93,6 +93,8 @@ OUTPUT_LIMIT_REJECTED = re.compile(r"max_(?:completion_)?tokens|max_?output|outp
 UNWATCHED_TURNS = 40
 # Turns before the limit at which the model is told to wrap up.
 WRAP_UP_TURNS = 5
+# The start of each tool's output kept in the attempt's log, to see what the model saw.
+LOGGED_OUTPUT = 500
 MAX_LOGGED_CALLS = 300
 TURN_LIMIT_MARK = "在 {limit} 轮工具调用后仍未完成"
 
@@ -262,12 +264,16 @@ class ProviderRegistry:
             ) if act else None
         if agent:
             agent.watch, agent.overrun = watch, overrun
-        if provider == "anthropic":
-            return await self._anthropic(model, prompt, images, agent, spend_ok)
-        if provider == "google":
-            return await self._gemini(model, prompt, images, agent, spend_ok)
-        return await self._openai_compatible(provider, model, prompt, images, agent, spend_ok,
-                                             conversation if agent else None, effort)
+        try:
+            if provider == "anthropic":
+                return await self._anthropic(model, prompt, images, agent, spend_ok)
+            if provider == "google":
+                return await self._gemini(model, prompt, images, agent, spend_ok)
+            return await self._openai_compatible(provider, model, prompt, images, agent, spend_ok,
+                                                 conversation if agent else None, effort)
+        finally:
+            if agent:
+                agent.close()  # this attempt's /tmp
 
     async def test_provider(self, provider: str) -> str:
         urls = {
@@ -410,11 +416,12 @@ class ProviderRegistry:
                 if final:
                     raise ProviderError(f"{model_id} {TURN_LIMIT_MARK.format(limit=limit)}，最后也没有交出进度总结。")
                 results = []
-                for call_id, name, args in calls:
-                    output = await agent.call(name, args)
+                # A turn's calls together: its reads and searches run at the same time.
+                outcomes = await agent.run_all([(name, args) for _call_id, name, args in calls])
+                for (call_id, name, args), (output, ok) in zip(calls, outcomes):
                     results.append((call_id, name, output))
                     seen.append({"turn": turn, "tool": name, "detail": agent_tools.describe_call(name, args),
-                                 "ok": not output.startswith("Error:") and (name != "run_command" or output.startswith("exit code 0"))})
+                                 "ok": ok, "output": output[:LOGGED_OUTPUT]})
                     if agent.log is not None and len(agent.log) < MAX_LOGGED_CALLS:
                         agent.log.append(seen[-1])
                 if limit is not None and (note := _turn_note(limit - turn)):
