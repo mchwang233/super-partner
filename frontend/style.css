@@ -675,3 +675,29 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .chat-alert span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chat-alert button{padding:6px 14px;font-size:12px}
 .tab-dot{display:inline-block;width:7px;height:7px;margin-left:6px;border-radius:50%;background:var(--warn);vertical-align:middle}
+/* The conversation as a chat: avatars beside soft bubbles, the lead in green, the platform engineer
+   in indigo, your messages on the right; no frame inside a bubble. */
+.lead-panel,.engineer-chat{--lead-bubble:light-dark(#f2f8f5,#121c19);--engineer-bubble:light-dark(#f3f4fe,#161a2c);--engineer-ink:light-dark(#4f46e5,#a5b4fc);--me-bubble:light-dark(#e8f1ff,#1a2840)}
+.lead-panel .diagnosis-head{padding:12px 16px;background:var(--panel-2);gap:12px}
+.lead-who{display:inline-flex;align-items:center;gap:7px}
+.lead-who b{font-size:13.5px}
+.lead-who.engineer b{color:var(--engineer-ink)}
+.lead-panel .dx-thread,.engineer-chat .dx-thread{gap:14px;padding:18px 16px}
+.lead-panel .dx-ai,.engineer-chat .dx-ai{position:relative;margin-left:40px;padding:10px 14px 12px;border-radius:4px 14px 14px 14px;background:var(--lead-bubble)}
+.lead-panel .dx-ai>:not(.dx-meta),.engineer-chat .dx-ai>:not(.dx-meta){margin-left:0}
+.lead-panel .dx-ai .dx-avatar,.engineer-chat .dx-ai .dx-avatar{position:absolute;left:-40px;top:0;width:30px;height:30px;font-size:15px;box-shadow:0 1px 2px light-dark(#1c243014,#0006)}
+.lead-panel .dx-ai .dx-meta,.engineer-chat .dx-ai .dx-meta{margin-bottom:5px}
+.lead-panel .lead-engineer-msg,.engineer-chat .lead-engineer-msg{background:var(--engineer-bubble)}
+.lead-panel .lead-engineer-msg .dx-meta b,.engineer-chat .lead-engineer-msg .dx-meta b{color:var(--engineer-ink)}
+.engineer-avatar{background:light-dark(#e0e7ff,#262c4d)}
+.lead-panel .dx-report .markdown-body,.engineer-chat .dx-report .markdown-body{padding:0;background:none;border:0;font-size:13.5px;line-height:1.7}
+.lead-panel .lead-verdict{line-height:1.7}
+.lead-panel .dx-user,.engineer-chat .dx-user{max-width:min(600px,80%);padding:10px 14px;border:0;border-radius:14px 14px 4px 14px;background:var(--me-bubble)}
+.lead-panel .lead-instructions p{background:var(--panel)}
+.lead-panel .lead-repair,.engineer-chat .lead-repair{background:var(--panel);border-color:var(--line-soft)}
+.lead-panel .engineer-card,.engineer-chat .engineer-card{margin-left:40px;border-radius:12px;padding:10px 14px;border-color:light-dark(#c7d2fe,#3a4570)}
+.lead-panel .engineer-system,.engineer-chat .engineer-system{margin:0}
+.lead-panel .dx-composer.compact,.engineer-chat .dx-composer.compact{margin:6px 0 0;padding:0;border:0;background:none}
+.lead-panel .dx-input,.engineer-chat .dx-input{border-radius:14px;box-shadow:0 2px 10px light-dark(#1c24300f,#0005)}
+.lead-panel .dx-input-bar button,.engineer-chat .dx-input-bar button{border-radius:999px;padding:6px 16px}
+.lead-panel .dx-composer:not(.compact){margin-left:40px}

@@ -105,9 +105,8 @@ export function LeadPanel({ apiBase, run, models, onReply, onAsk, onOpenEngineer
     : { label: decided ? `已决策 ${decided} 次` : "跟进中", tone: "ok" };
   return <section className={`diagnosis-card dx-panel lead-panel${waiting ? " waiting" : ""}`} aria-label="负责人">
     <div className="diagnosis-head">
-      <b>负责人</b>
-      <span className="lead-model">{model(run.supervisor?.model_id)}</span>
-      {jobs.length > 0 && <span className="lead-member" title="平台工程师在这个对话里">＋ 🛠 平台工程师</span>}
+      <span className="lead-who"><span className="dx-avatar" aria-hidden="true">🧭</span><b>负责人</b><span className="lead-model">{model(run.supervisor?.model_id)}</span></span>
+      {jobs.length > 0 && <span className="lead-who engineer" title="平台工程师在这个对话里"><span className="dx-avatar engineer-avatar" aria-hidden="true">🛠</span><b>平台工程师</b></span>}
       <span className={`dx-chip ${status.tone}`}>{status.tone === "busy" && <i className="pulse" aria-hidden="true" />}{status.label}</span>
       {!joining && <button type="button" className="ghost lead-invite" onClick={() => setJoining(true)}>拉平台工程师进来</button>}
     </div>
