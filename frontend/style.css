@@ -756,3 +756,36 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .composer .project-field{margin:4px 12px 0;border-top:0}
 .composer .project-field .project-row{border-radius:10px;background:var(--panel-2);padding:0 6px 0 4px}
 .composer .formbar{border-top:0;padding:12px 12px 12px}
+/* The platform engineer's window: a clear header, one card per piece of work (finished ones folded),
+   messages without the avatar gutter, and a composer that fits. */
+.engineer-chat{border-radius:18px;background:var(--panel)}
+.engineer-chat-head{align-items:center;gap:10px;padding:14px 14px 12px 16px}
+.engineer-chat-head>div{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.engineer-chat-head>div b{font-size:14.5px}
+.engineer-chat-head>div small{flex:none;white-space:normal}
+.engineer-chat-avatar{width:34px;height:34px;font-size:17px;flex:none}
+.engineer-chat .engineer-chat-body{background:var(--bg);padding:12px;gap:10px}
+.engineer-thread{gap:8px;margin:0;padding:10px 12px 12px;border:1px solid var(--line-soft);border-radius:14px;background:var(--panel)}
+.engineer-thread.folded{padding-bottom:10px}
+.engineer-thread-head{display:flex;align-items:center;gap:10px;width:100%;padding:0;background:none;border:0;color:var(--text);text-align:left;font-weight:400}
+.engineer-thread-head:hover b{color:var(--accent)}
+.engineer-thread-title{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+.engineer-thread-title b{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.engineer-thread-title small{font-size:11px;color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.engineer-chat .dx-ai{margin-left:0;max-width:100%;width:auto;background:var(--panel-2)}
+.engineer-chat .dx-ai .dx-avatar{display:none}
+.engineer-chat .dx-ai .dx-meta{margin-bottom:3px}
+.engineer-chat .dx-ai .dx-meta b{font-size:12px}
+.engineer-chat .dx-user{max-width:88%}
+.engineer-chat .engineer-card{margin-left:0}
+.engineer-chat .engineer-system span{white-space:normal}
+.engineer-chat .dx-composer.compact.engineer-chat-composer{margin:0;padding:10px 12px 12px;border-top:1px solid var(--line)}
+.engineer-chat-target{margin-bottom:8px}
+.engineer-chat-tag{padding:2px 9px;border-radius:999px;background:light-dark(#e0e7ff,#262c4d);color:var(--engineer-ink,#4f46e5);font-weight:600}
+.engineer-chat-tag.new{background:var(--accent-bg);color:var(--accent)}
+/* The corner button wears the engineer's avatar colours, the same mark as in a task's conversation. */
+.engineer-bubble{background:light-dark(#e0e7ff,#262c4d);border:1px solid light-dark(#c7d2fe,#3a4570);color:light-dark(#4f46e5,#a5b4fc)}
+.engineer-bubble:hover{border-color:light-dark(#4f46e5,#a5b4fc)}
+/* In the window each job's card already has a header; its card shows only what to do. */
+.engineer-chat .engineer-card>.lead-repair-head{display:none}
+.engineer-chat .engineer-card>.engineer-actions{margin-top:0}

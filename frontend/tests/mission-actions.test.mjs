@@ -1480,8 +1480,11 @@ test("a bubble in the corner opens a chat with the platform engineer, for answer
   assert.equal(bubble.querySelector(".engineer-bubble-badge").textContent, "1");
   await click(bubble);
   const chat = () => document.querySelector(".engineer-chat");
-  // Every job's thread, oldest first, saying where it came from; the waiting one has its card.
-  assert.match(chat().textContent, /在这里提出 · 修复状态.*暂停后一直显示排队中.*来自任务「chip-task」 · 放行许可证端口.*方案写好了.*方案待批准/s);
+  // One card per job, oldest first, saying where it came from; finished work is folded to its header.
+  assert.match(chat().textContent, /修复状态在这里提出 · 修复已生效.*放行许可证端口来自任务「chip-task」 · 组件方案待批准.*方案写好了/s);
+  assert.doesNotMatch(chat().textContent, /暂停后一直显示排队中/);
+  await click(chat().querySelector(".engineer-thread-head"));
+  assert.match(chat().textContent, /暂停后一直显示排队中/);
   const box = chat().querySelector('[aria-label="给平台工程师的消息"]');
   const type = async value => act(async () => {
     Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(box, value);
