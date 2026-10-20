@@ -33,10 +33,22 @@ class ProviderResult:
     output_tokens: int
     used_model_id: str | None = None
     accounted_cost_usd: float = 0.0
+    # Input tokens the provider read from its prompt cache (billed at the cache price).
+    cached_input_tokens: int = 0
     # Turns of tool calls an acting API model took, and whether it hit its limit, so this text
     # is the progress summary it was asked for at the end rather than a finished answer.
     turns: int = 0
     turn_limit: bool = False
+
+
+def cached_tokens(usage: dict) -> int:
+    """Input tokens read from the prompt cache, as an OpenAI-compatible provider reports them:
+    DeepSeek's prompt_cache_hit_tokens, or prompt_tokens_details.cached_tokens (OpenAI, GLM,
+    MiniMax, Kimi and others)."""
+    if usage.get("prompt_cache_hit_tokens") is not None:
+        return int(usage["prompt_cache_hit_tokens"] or 0)
+    details = usage.get("prompt_tokens_details") or {}
+    return int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
 
 
 @dataclass
@@ -336,7 +348,7 @@ class ProviderRegistry:
             _reopen(state, conversation.followup)
         if conversation:
             conversation.model_id, conversation.state, conversation.followup = model_id, state, None
-        total_in = total_out = turn = 0
+        total_in = total_out = total_cached = turn = 0
         # Without a limit (the default) a long attempt is checked instead (progress.py).
         watch = getattr(agent, "watch", None)
         limit = (agent.max_turns or settings.api_agent_max_turns or (None if watch else UNWATCHED_TURNS)) if agent else 1
@@ -378,9 +390,10 @@ class ProviderRegistry:
                     resumed = False
                     text, calls, used_in, used_out, truncated = await stepped(state)
                 state["calls"] = calls
-                total_in, total_out = total_in + used_in, total_out + used_out
+                used_cached = state.pop("cached", 0) or 0
+                total_in, total_out, total_cached = total_in + used_in, total_out + used_out, total_cached + used_cached
                 if record := getattr(spend_ok, "record", None):
-                    await record(model_id, used_in, used_out)
+                    await record(model_id, used_in, used_out, used_cached)
                 if spend_ok and not spend_ok(model_id, total_in, total_out):
                     raise BudgetExceeded("已达到任务可用的预算，模型调用被中止。")
                 if truncated and not calls and (agent or not text):
@@ -392,7 +405,8 @@ class ProviderRegistry:
                     )
                 if not calls or not agent:
                     state["final"] = text
-                    return ProviderResult(text or "", total_in, total_out, model_id, turns=_turns(turn, limit), turn_limit=final)
+                    return ProviderResult(text or "", total_in, total_out, model_id, turns=_turns(turn, limit),
+                                          turn_limit=final, cached_input_tokens=total_cached)
                 if final:
                     raise ProviderError(f"{model_id} {TURN_LIMIT_MARK.format(limit=limit)}，最后也没有交出进度总结。")
                 results = []
@@ -419,7 +433,8 @@ class ProviderRegistry:
                     next_check = time.monotonic() + interval
             raise AssertionError("unreachable")
         except (Exception, asyncio.CancelledError) as exc:
-            exc.usage = ProviderResult("", total_in, total_out, model_id, turns=_turns(turn, limit))
+            exc.usage = ProviderResult("", total_in, total_out, model_id, turns=_turns(turn, limit),
+                                       cached_input_tokens=total_cached)
             raise
 
     def _reasoning(self, provider: str, model: str, effort: Optional[str] = None) -> dict:
@@ -498,6 +513,7 @@ class ProviderRegistry:
                 raise ProviderError(f"{provider} returned {response.status_code}: {response.text[:300]}")
             data = response.json()
             usage = data.get("usage") or {}
+            state["cached"] = cached_tokens(usage)
             choice = data["choices"][0]
             message = choice["message"]
             calls = message.get("tool_calls") or []
@@ -549,9 +565,13 @@ class ProviderRegistry:
             if calls:
                 state["history"].append({"role": "assistant", "content": blocks})
             text = "".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+            usage = data["usage"]
+            # Anthropic counts cached and cache-writing input apart from input_tokens.
+            state["cached"] = usage.get("cache_read_input_tokens") or 0
             return (
                 text, [(block["id"], block["name"], block.get("input") or {}) for block in calls],
-                data["usage"]["input_tokens"], data["usage"]["output_tokens"],
+                usage["input_tokens"] + state["cached"] + (usage.get("cache_creation_input_tokens") or 0),
+                usage["output_tokens"],
                 data.get("stop_reason") == "max_tokens",
             )
 
@@ -582,6 +602,7 @@ class ProviderRegistry:
                 raise ProviderError(f"google returned {response.status_code}: {response.text[:300]}")
             data = response.json()
             usage = data.get("usageMetadata", {})
+            state["cached"] = usage.get("cachedContentTokenCount") or 0
             candidate = data["candidates"][0]
             content = candidate.get("content") or {}
             parts = content.get("parts") or []

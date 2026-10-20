@@ -5,6 +5,7 @@ from typing import Optional
 from uuid import uuid4
 
 from . import supervisor
+from .budget import token_cost
 from .models import (
     DIFFICULTY_THRESHOLDS,
     ModelProfile,
@@ -300,8 +301,7 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
 
 
 def _cost(result, model: ModelProfile) -> float:
-    return ((result.input_tokens * (model.input_per_million or 0)
-             + result.output_tokens * (model.output_per_million or 0)) / 1_000_000)
+    return token_cost(model, result.input_tokens, result.output_tokens, getattr(result, "cached_input_tokens", 0))
 
 
 async def autonomous_plan(
@@ -351,10 +351,7 @@ async def autonomous_plan(
                 planner = backup
         charged_id = result.used_model_id or planner.id
         charged_model = next(model for model in models if model.id == charged_id)
-        planning_cost = (
-            result.input_tokens * charged_model.input_per_million
-            + result.output_tokens * charged_model.output_per_million
-        ) / 1_000_000
+        planning_cost = _cost(result, charged_model)
         plan = _validate_plan(_extract_json(result.text))
         if not in_project:
             # Without a project every node runs in its own scratch workspace, so any model will do.

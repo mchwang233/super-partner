@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from .agent import BINARY_SUFFIXES, project_map
+from .budget import token_cost
 from .models import ExecutionRun, TaskNode
 from .quality import SKIP_DIRS, review_path
 
@@ -95,8 +96,7 @@ async def planning_brief(root: Path, data_dir: Path, providers, writer) -> tuple
     async def ask(text: str) -> str:
         nonlocal spent
         result = await providers.complete(writer.id, text, effort="low")
-        spent += (result.input_tokens * (writer.input_per_million or 0)
-                  + result.output_tokens * (writer.output_per_million or 0)) / 1_000_000
+        spent += token_cost(writer, result.input_tokens, result.output_tokens, result.cached_input_tokens)
         return result.text
 
     brief = None

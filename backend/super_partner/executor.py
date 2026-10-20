@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import briefing, outline, progress, quality, scopes, supervisor
-from .budget import BudgetExceeded, RequestBudget
+from .budget import BudgetExceeded, RequestBudget, token_cost
 from .cli_channels import CLI_SPECS
 from .config import settings
 from .db import Database
@@ -733,10 +733,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         model = self.model_lookup.get(result.used_model_id or model_id or node.model_id)
         if not model or model.input_per_million is None or model.output_per_million is None:
             return 0.0 if model_id or node is None else node.estimated_cost_usd
-        return (
-            result.input_tokens * model.input_per_million
-            + result.output_tokens * model.output_per_million
-        ) / 1_000_000
+        return token_cost(model, result.input_tokens, result.output_tokens,
+                          getattr(result, "cached_input_tokens", 0))
 
     @staticmethod
     def _final_result(run: ExecutionRun, completed_only: bool = False):

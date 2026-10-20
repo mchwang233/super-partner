@@ -149,3 +149,58 @@ async def test_deepseek_thinks_as_hard_as_configured(tmp_path, monkeypatch):
     assert sent[0]["reasoning_effort"] == "max"
     assert sent[1]["reasoning_effort"] == "none"
     assert "reasoning_effort" not in sent[2]
+
+
+def priced(model_id, cached=0.003):
+    return ModelProfile(id=model_id, provider=model_id.split(":")[0], display_name=model_id, context_window=100_000,
+                        input_per_million=0.15, output_per_million=0.6, cached_input_per_million=cached)
+
+
+def test_input_read_from_the_prompt_cache_costs_the_cache_price():
+    from super_partner.budget import token_cost
+
+    model = priced("deepseek:deepseek-flash")
+    # 10,000 input tokens of which 9,000 cached, 100 output.
+    assert token_cost(model, 10_000, 100, 9_000) == pytest.approx((1_000 * 0.15 + 9_000 * 0.003 + 100 * 0.6) / 1e6)
+    # Without a cache price, cached input costs the input price; cached never exceeds input.
+    assert token_cost(priced("x:y", cached=None), 10_000, 0, 9_000) == pytest.approx(10_000 * 0.15 / 1e6)
+    assert token_cost(model, 100, 0, 500) == pytest.approx(100 * 0.003 / 1e6)
+
+
+class Recording(Reserving):
+    def __init__(self):
+        super().__init__(4096)
+        self.recorded = []
+
+    async def record(self, model_id, input_tokens, output_tokens, cached_tokens=0):
+        self.recorded.append((input_tokens, output_tokens, cached_tokens))
+
+
+async def test_each_provider_reports_its_cache_hits_and_the_budget_hears_them(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    spend = Recording()
+    registry = registry_with([
+        {"choices": [{"message": {"content": "好了"}, "finish_reason": "stop"}],
+         "usage": {"prompt_tokens": 7159, "completion_tokens": 20, "prompt_cache_hit_tokens": 6912}},
+        {"content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn",
+         "usage": {"input_tokens": 300, "output_tokens": 50, "cache_read_input_tokens": 9000,
+                   "cache_creation_input_tokens": 700}},
+    ], [])
+    try:
+        ds = await registry.complete("deepseek:deepseek-flash", "hi", spend_ok=spend)
+        claude = await registry.complete("anthropic:claude-x", "hi", spend_ok=spend)
+    finally:
+        await registry.client.aclose()
+    assert (ds.input_tokens, ds.cached_input_tokens) == (7159, 6912)
+    # Anthropic's input_tokens leaves out what was read from and written to the cache.
+    assert (claude.input_tokens, claude.cached_input_tokens) == (10_000, 9000)
+    assert spend.recorded == [(7159, 20, 6912), (10_000, 50, 9000)]
+
+
+def test_openai_compatible_cache_fields():
+    from super_partner.providers import cached_tokens
+
+    assert cached_tokens({"prompt_cache_hit_tokens": 12}) == 12
+    assert cached_tokens({"prompt_tokens_details": {"cached_tokens": 34}}) == 34
+    assert cached_tokens({"prompt_tokens": 5}) == 0

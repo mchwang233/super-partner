@@ -13,6 +13,18 @@ class BudgetExceeded(ProviderError):
     pass
 
 
+def token_cost(model, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
+    """What a call cost: uncached input at the input price, input read from the provider's prompt
+    cache at its cache price (the input price when the catalog has none), and output."""
+    if not model or model.input_per_million is None or model.output_per_million is None:
+        return 0.0
+    cached = min(max(cached_tokens or 0, 0), input_tokens)
+    cached_price = getattr(model, "cached_input_per_million", None)
+    cached_price = model.input_per_million if cached_price is None else cached_price
+    return ((input_tokens - cached) * model.input_per_million + cached * cached_price
+            + output_tokens * model.output_per_million) / 1_000_000
+
+
 class RequestBudget:
     def __init__(self, models, remaining, reservations, charge, changed):
         self.models, self.remaining = models, remaining
@@ -49,10 +61,10 @@ class RequestBudget:
                 continue
             raise BudgetExceeded("剩余预算不足以发起下一轮模型请求，任务已暂停。")
 
-    async def record(self, model_id: str, input_tokens: int, output_tokens: int):
+    async def record(self, model_id: str, input_tokens: int, output_tokens: int, cached_tokens: int = 0):
         model = self.models.get(model_id)
         if model and model.input_per_million is not None and model.output_per_million is not None:
-            cost = (input_tokens * model.input_per_million + output_tokens * model.output_per_million) / 1_000_000
+            cost = token_cost(model, input_tokens, output_tokens, cached_tokens)
             await self.charge(cost)
             self.spent += cost
         self.release()
