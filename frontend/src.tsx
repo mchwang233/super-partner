@@ -465,7 +465,7 @@ function App() {
     <div className={`workbench ${historyCollapsed?"history-collapsed":""}`}>
     <MissionHistory runs={runs} selectedId={selected?.id} deletingId={deletingRunId} error={deleteTarget?"":deleteError} onSelect={run=>{setSelected(run)}} onDelete={requestDeleteRun} collapsed={historyCollapsed} onToggle={()=>setHistoryCollapsed(value=>!value)}/>
     <div className="workbench-main">
-    {composerOpen&&<section className="composer" aria-label="新任务"><div className="composer-head"><h3>新任务</h3>{runs.length>0&&<button type="button" className="modal-close" onClick={()=>setComposerOpen(false)} aria-label="收起新任务">×</button>}</div><form onSubmit={submit} className={dragging?"dragging":undefined}
+    {composerOpen&&<section className="composer" aria-label="新任务"><div className="composer-head"><div><h3>新任务</h3><p>说清你想要的结果。负责人会先把它划分成几个大项，你确认预算后才开始执行。</p></div>{runs.length>0&&<button type="button" className="modal-close" onClick={()=>setComposerOpen(false)} aria-label="收起新任务">×</button>}</div><form onSubmit={submit} className={dragging?"dragging":undefined}
       onDragOver={e=>{if(e.dataTransfer.types.includes("Files")){e.preventDefault();setDragging(true)}}}
       onDragLeave={e=>{if(!e.currentTarget.contains(e.relatedTarget as globalThis.Node|null))setDragging(false)}}
       onDrop={e=>{if(e.dataTransfer.files.length){e.preventDefault();attachments.add([...e.dataTransfer.files])}setDragging(false)}}>

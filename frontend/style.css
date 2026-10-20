@@ -712,3 +712,20 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .catalog-sync-details{margin-top:10px}
 .catalog-sync-details>summary{cursor:pointer;font-size:12.5px;color:var(--accent);padding:4px 0}
 .catalog-sync-details[open]>summary{margin-bottom:10px}
+/* The new-task form: one card, a roomy box to write in, and settings as matching pills. */
+.composer{padding:20px 22px 18px;background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:0 8px 28px light-dark(#1c24300f,#0006)}
+.composer-head{align-items:flex-start;margin-bottom:14px}
+.composer-head h3{font-size:16px}
+.composer-head p{margin:4px 0 0;font-size:12.5px;color:var(--muted)}
+.composer form{background:var(--panel-2);border-color:var(--line);border-radius:12px;box-shadow:none;transition:border-color .15s,box-shadow .15s}
+.composer form:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent)}
+.composer textarea{min-height:120px;padding:16px 18px;font-size:15px}
+.composer .project-field{border-top-color:var(--line-soft)}
+.composer .formbar{padding:10px 10px 10px 12px;border-top-color:var(--line-soft)}
+.composer .controls{gap:8px}
+.composer .controls>.attach-button,.composer .controls>.budget-field,.composer .controls>.switch,.composer .fleet-trigger{height:32px;box-sizing:border-box;display:inline-flex;align-items:center;gap:8px;padding:0 12px;border:1px solid var(--line);border-radius:999px;background:var(--panel);color:var(--text);font-size:12.5px;font-weight:500}
+.composer .controls>.attach-button:hover,.composer .controls>.switch:hover,.composer .controls>.budget-field:focus-within{border-color:var(--accent)}
+.composer .budget-field span{margin-left:0;color:var(--muted)}
+.composer .budget-field input{width:52px;padding:0;border:0;background:transparent;font-size:13px;font-weight:600}
+.composer .budget-field input:focus{outline:none}
+.composer .submit-group button.primary{padding:9px 18px;border-radius:10px;font-size:13.5px}
