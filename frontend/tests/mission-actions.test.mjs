@@ -1297,7 +1297,7 @@ test("the lead panel shows its decisions and questions, takes replies, and lets 
   const { document, state, act, click, button } = context;
   const panel = () => document.querySelector(".lead-panel");
   assert.match(panel().textContent, /负责人Codex CLI.*等你回复/);
-  assert.match(panel().textContent, /验证没通过 · 验证.*返工 实现.*这是原有要求中的真实缺陷/);
+  assert.match(panel().textContent, /返工 实现.*验证没通过 · 验证.*这是原有要求中的真实缺陷/);
   assert.match(panel().querySelector(".lead-instructions").textContent, /到期时按完成结算/);
   // The lead's question is answered here, not in a separate diagnosis panel.
   assert.equal(document.querySelectorAll(".diagnosis-card").length, 1);

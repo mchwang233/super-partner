@@ -729,3 +729,30 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .composer .budget-field input{width:52px;padding:0;border:0;background:transparent;font-size:13px;font-weight:600}
 .composer .budget-field input:focus{outline:none}
 .composer .submit-group button.primary{padding:9px 18px;border-radius:10px;font-size:13.5px}
+/* One calm palette for the conversation: neutral bubbles for the lead and the engineer (told apart
+   by avatar and name), your words in the app's own green; flat inside the task's tab, like the others. */
+.dx-panel,.engineer-chat{--lead-bubble:var(--panel-2);--engineer-bubble:var(--panel-2);--me-bubble:var(--accent-bg)}
+.task-page .dx-panel{margin:0;border:0;border-radius:0;background:none;overflow:visible}
+.task-page .dx-panel.waiting{box-shadow:none}
+.task-page .dx-panel>.diagnosis-head{padding:2px 0 12px;background:none;border-bottom:1px solid var(--line-soft)}
+.task-page .dx-panel .dx-thread{padding:18px 0 4px}
+.task-page .dx-panel+.dx-panel{margin-top:22px}
+.dx-panel .dx-ai,.engineer-chat .dx-ai{width:fit-content;max-width:min(880px,calc(100% - 40px));box-sizing:border-box;border:1px solid var(--line-soft);border-radius:4px 14px 14px 14px}
+.dx-panel .dx-ai .dx-meta .dx-chip{padding:1px 8px;font-size:11px}
+.dx-panel .dx-user,.engineer-chat .dx-user{color:var(--text)}
+.dx-panel .engineer-card,.engineer-chat .engineer-card{border-color:var(--line);background:var(--panel)}
+.dx-panel .lead-repair,.engineer-chat .lead-repair{border-color:var(--line)}
+.dx-panel .dx-input,.engineer-chat .dx-input{border-radius:12px;background:var(--panel-2);box-shadow:none}
+.dx-panel .dx-input:focus-within,.engineer-chat .dx-input:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent)}
+.dx-panel .dx-input-bar button,.engineer-chat .dx-input-bar button{border-radius:10px}
+.lead-who b{font-size:13.5px}
+.lead-who.engineer b,.dx-panel .lead-engineer-msg .dx-meta b,.engineer-chat .lead-engineer-msg .dx-meta b{color:var(--engineer-ink)}
+/* The new-task form, simpler: no card around the box, no lines inside it, no square focus outline. */
+.composer{padding:4px 0 0;background:none;border:0;box-shadow:none;border-radius:0}
+.composer-head{margin-bottom:12px;padding:0 2px}
+.composer form{background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:0 6px 24px light-dark(#1c243012,#0007)}
+.composer textarea{resize:none;min-height:110px;padding:18px 20px 6px}
+.composer textarea:focus,.composer textarea:focus-visible,.composer input:focus,.composer input:focus-visible{outline:none}
+.composer .project-field{margin:4px 12px 0;border-top:0}
+.composer .project-field .project-row{border-radius:10px;background:var(--panel-2);padding:0 6px 0 4px}
+.composer .formbar{border-top:0;padding:12px 12px 12px}

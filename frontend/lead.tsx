@@ -129,10 +129,11 @@ export function LeadPanel({ apiBase, run, models, onReply, onAsk, onOpenEngineer
   </section>;
 }
 
-function LeadMeta({ note, at }: { note: string; at: string }) {
+function LeadMeta({ note, at, tag }: { note: string; at: string; tag?: React.ReactNode }) {
   return <div className="dx-meta">
     <span className="dx-avatar" aria-hidden="true">🧭</span>
     <b>负责人</b>
+    {tag}
     <small>{note} · {when(at)}</small>
   </div>;
 }
@@ -173,8 +174,9 @@ function DecisionMessage({ item, label, step, repairs, run, model, onReply, onOp
   model: (id?: string | null) => string; onReply: SendReply; onOpenEngineer?: (jobId: string) => void;
 }) {
   return <article className="dx-msg dx-ai lead-decision">
-    <LeadMeta note={[EVENTS[item.event] ?? item.event, step].filter(Boolean).join(" · ")} at={item.created_at} />
-    <p className="lead-verdict"><span className={`dx-chip ${TONES[item.action] ?? "ok"}`}>{label}</span>{item.reason}</p>
+    <LeadMeta note={[EVENTS[item.event] ?? item.event, step].filter(Boolean).join(" · ")} at={item.created_at}
+      tag={<span className={`dx-chip ${TONES[item.action] ?? "ok"}`}>{label}</span>} />
+    {item.reason && <p className="lead-verdict">{item.reason}</p>}
     {item.instructions && <details className="lead-instructions"><summary>具体要求</summary><p>{item.instructions}</p></details>}
     {item.engineer_job_id && <div className="lead-repair lead-engineer">
       <b>平台工程师</b>
