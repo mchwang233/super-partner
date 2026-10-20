@@ -72,8 +72,8 @@ async def test_the_next_attempt_continues_the_same_conversation(tmp_path, api):
     result = await registry.complete(FLASH, "写一个工具（重新开始）", tmp_path, act=True, conversation=conversation)
     sent = calls.requests[-1]
     assert result.text == "按要求改好了"
-    assert [m["role"] for m in sent] == ["user", "assistant", "tool", "assistant", "user"]
-    assert sent[3]["content"] == "第一次做完了" and sent[4]["content"] == "验证没通过：补上空文件的处理"
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool", "assistant", "user"]
+    assert sent[4]["content"] == "第一次做完了" and sent[5]["content"] == "验证没通过：补上空文件的处理"
     assert "重新开始" not in json.dumps(sent, ensure_ascii=False)
 
 
@@ -88,7 +88,7 @@ async def test_calls_that_never_ran_are_closed_before_continuing(tmp_path, api):
     conversation.followup = "预算已追加，接着做"
     await registry.complete(FLASH, "写一个工具", tmp_path, act=True, conversation=conversation)
     sent = calls.requests[-1]
-    assert [m["role"] for m in sent] == ["user", "assistant", "tool", "user"] and sent[2]["content"] == NOT_RUN
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool", "user"] and sent[3]["content"] == NOT_RUN
 
 
 async def test_a_conversation_the_provider_refuses_starts_afresh(tmp_path, api):
@@ -99,7 +99,7 @@ async def test_a_conversation_the_provider_refuses_starts_afresh(tmp_path, api):
     conversation.followup = "再改一下"
     result = await registry.complete(FLASH, "写一个工具（完整说明）", tmp_path, act=True, conversation=conversation)
     assert result.text == "重新做完了"
-    assert len(calls.requests[-1]) == 1 and "完整说明" in calls.requests[-1][0]["content"]
+    assert [m["role"] for m in calls.requests[-1]] == ["system", "user"] and "完整说明" in calls.requests[-1][1]["content"]
 
 
 def attempt(model_id="x:api", outcome=Outcome.REJECTED, reason="缺少 --verbose", **fields):

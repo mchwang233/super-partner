@@ -193,8 +193,12 @@ AGENT_INSTRUCTIONS = (
     "comes back to you in full. Commands have no network access{ports}.{profiles}\n"
     "- Search with Grep and Glob, read with Read, and change files with Edit or MultiEdit (Write for new "
     "files or full rewrites), not with grep, find, cat, sed or echo in Bash.\n"
-    "- Make independent tool calls in the same turn: read several files at once, run several searches "
-    "at once. Do not read a file again unless it changed, and do not re-check work that already passed.\n"
+    "- You can call several tools in one turn, and you should whenever the calls do not depend on each "
+    "other: write every file you already know how to write in the same turn, read every file you need in "
+    "the same turn, run independent searches and checks in the same turn. Every turn costs time, so plan "
+    "the next steps and batch them.\n"
+    "- Check your work once. When the checks or tests you were asked for pass, stop and report: do not "
+    "try it again by hand, list the files again or tidy up. Do not read a file again unless it changed.\n"
     "When the work is done, reply without calling a tool and summarize what you did and what you verified.{turns}"
 )
 NETWORK_NOTE = (

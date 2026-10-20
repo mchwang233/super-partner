@@ -94,7 +94,7 @@ async def test_tool_calls_continue_and_reasoning_goes_back_to_deepseek(tmp_path,
         await registry.client.aclose()
     assert result.text == "Wrote mail.py"
     assert (tmp_path / "mail.py").read_text() == "ok"
-    assert sent[1]["messages"][1]["reasoning_content"] == "plan"
+    assert sent[1]["messages"][2]["reasoning_content"] == "plan"
 
 
 async def test_a_model_with_a_lower_output_ceiling_is_retried_with_a_smaller_cap(tmp_path, monkeypatch):

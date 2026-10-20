@@ -397,9 +397,10 @@ class ProviderRegistry:
         """
         model_id = f"{provider}:{model}"
         tools = agent_tools.tools_for(agent_tools.sandbox_available(), read_only=agent.read_only) if agent else []
-        if agent:
-            prompt = f"{agent.instructions()}\n\n{prompt}"
-        state = fresh = {"prompt": prompt, "images": images, "tools": tools, "history": None, "results": None}
+        # How to work with the tools is a system prompt, as Claude Code gives it; the task is the user's.
+        system = agent.instructions() if agent else None
+        state = fresh = {"prompt": prompt, "system": system, "images": images, "tools": tools, "history": None,
+                         "results": None}
         resumed = bool(conversation and conversation.model_id == model_id and conversation.followup
                        and conversation.state and conversation.state.get("history"))
         if resumed:
@@ -553,12 +554,13 @@ class ProviderRegistry:
 
         async def step(state):
             if state["history"] is None:
-                state["history"] = [{"role": "user", "content": [
+                state["history"] = [{"role": "system", "content": state["system"]}] if state.get("system") else []
+                state["history"].append({"role": "user", "content": [
                     {"type": "text", "text": state["prompt"]},
                     *({"type": "image_url", "image_url": {
                         "url": f"data:{item.media_type};base64,{files.image_data(item)}",
                     }} for item in state["images"]),
-                ] if state["images"] else state["prompt"]}]
+                ] if state["images"] else state["prompt"]})
             for call_id, _name, output in state.pop("results", None) or []:
                 state["history"].append({"role": "tool", "tool_call_id": call_id, "content": output})
             if followup := state.pop("followup", None):
@@ -609,6 +611,8 @@ class ProviderRegistry:
                     for call_id, _name, output in state["results"]
                 ]})
             body = {"model": model, "messages": state["history"]}
+            if state.get("system"):
+                body["system"] = state["system"]
             if state["tools"]:
                 body["tools"] = [
                     {"name": tool["name"], "description": tool["description"], "input_schema": tool["parameters"]}
@@ -652,6 +656,8 @@ class ProviderRegistry:
                     for _call_id, name, output in state["results"]
                 ]})
             body = {"contents": state["history"]}
+            if state.get("system"):
+                body["systemInstruction"] = {"parts": [{"text": state["system"]}]}
             if state["tools"]:
                 body["tools"] = [{"functionDeclarations": state["tools"]}]
             response = await self._send(

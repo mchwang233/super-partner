@@ -196,3 +196,27 @@ def test_an_api_step_is_estimated_turn_by_turn_with_its_cache():
     assert routing.node_cost(step, cli) == 0
     # A hard step takes more turns and thinks harder.
     assert routing.node_cost(step.model_copy(update={"difficulty": "hard"}), api) > looped
+
+
+async def test_how_to_use_the_tools_is_a_system_prompt_for_every_provider(tmp_path, monkeypatch):
+    from test_providers import registry_with
+
+    for name in ("DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.setenv(name, "test")
+    sent = []
+    registry = registry_with([
+        {"choices": [{"message": {"content": "好了"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+        {"content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}},
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": "done"}]}}]},
+    ], sent)
+    try:
+        for model in ("deepseek:deepseek-flash", "anthropic:claude-x", "google:gemini-x"):
+            await registry.complete(model, "写一个待办工具", tmp_path, act=True)
+    finally:
+        await registry.client.aclose()
+    deepseek, anthropic, gemini = sent
+    assert deepseek["messages"][0]["role"] == "system" and "Bash, Read, Write" in deepseek["messages"][0]["content"]
+    assert deepseek["messages"][1] == {"role": "user", "content": "写一个待办工具"}
+    assert "Bash, Read, Write" in anthropic["system"] and anthropic["messages"][0]["content"] == "写一个待办工具"
+    assert "Bash, Read, Write" in gemini["systemInstruction"]["parts"][0]["text"]
+    assert "batch them" in deepseek["messages"][0]["content"]
