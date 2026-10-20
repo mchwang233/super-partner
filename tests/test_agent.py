@@ -110,6 +110,11 @@ async def test_bash_keeps_tmp_and_its_directory_through_the_attempt(command_work
         "touch /usr/sp-command-write-test 2>/dev/null && echo escaped || echo outside-blocked"
     )})
     assert output == f"module sync_tb; endmodule\n{ws.root / 'sub'}\nvar=unset\noutside-blocked"
+    # Leaving the working directory, as into a scratch folder, does not carry over: like Claude
+    # Code, the next command starts in the working directory again, and the model is told.
+    output = await ws.call("Bash", {"command": "cd /tmp/sync_chk && pwd"})
+    assert output == f"/tmp/sync_chk\nShell cwd was reset to {ws.root}"
+    assert await ws.call("Bash", {"command": "pwd"}) == str(ws.root)
     tmp = ws.tmp()
     ws.close()
     assert not Path(tmp).exists()

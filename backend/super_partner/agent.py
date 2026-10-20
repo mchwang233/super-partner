@@ -769,20 +769,28 @@ class Workspace:
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 timed_out = True
-        self._follow_cwd()
-        text = _clip(output.decode(errors="replace").rstrip("\n")) or "(the command printed no output)"
+        reset = self._follow_cwd()
+        text = (_clip(output.decode(errors="replace").rstrip("\n")) or "(the command printed no output)") + reset
         if timed_out:
             return f"Command timed out after {seconds:g}s and was stopped. Output before that:\n{text}", False
         if process.returncode:
             return f"Exit code {process.returncode}\n{text}", False
         return text, True
 
-    def _follow_cwd(self) -> None:
+    def _follow_cwd(self) -> str:
+        """Keep where the command ended up for the next one, as Claude Code's Bash does, unless it
+        left the working directory: then the next command starts there again, and the model is
+        told so. Returns that note, or ""."""
         record = Path(self.tmp()) / ".sp-cwd"
         with contextlib.suppress(OSError):
             where = Path(record.read_text().strip())
-            if where.is_dir():
+            if where == self.root or (self.root in where.parents and where.is_dir()):
                 self.cwd = where
+                return ""
+            # Outside the working directory (a sandbox-only /tmp folder, say): start there again.
+            self.cwd = self.root
+            return f"\nShell cwd was reset to {self.root}"
+        return ""
 
 
 def _listen_script(ports: list[int]) -> str:
