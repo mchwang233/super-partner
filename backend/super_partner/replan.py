@@ -7,7 +7,8 @@ from __future__ import annotations
 from uuid import uuid4
 
 from .models import ExecutionRun, ModelProfile, NodeStatus, TaskNode
-from .planner import MAX_NODES, _difficulty, package
+from .outline import MAX_TASKS
+from .planner import _difficulty, package
 from .routing import NoEligibleModelError, route_node
 
 
@@ -59,6 +60,9 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
         return resolved
 
     workspace = any(node.needs_workspace for node in run.plan.nodes)
+    parts = {part.id for part in run.plan.parts}
+    # An added step joins the part it names, or the part of the step the decision is about.
+    default_part = nodes[deciding].part_id if deciding in nodes else None
     added = []
     for raw in add:
         capability = raw.get("capability", "coding")
@@ -74,6 +78,7 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
             dependencies=resolve(raw.get("dependencies") or [], f"step {raw['key']} dependencies"),
             verifies=resolve(raw.get("verifies") or [], f"step {raw['key']} verifies"),
             needs_workspace=workspace, **_difficulty(raw), **package(raw),
+            part_id=str(raw["part"]) if str(raw.get("part")) in parts else default_part,
         ))
 
     updated = []
@@ -92,8 +97,8 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
         updated.append(node)
 
     remaining = [node for node in run.plan.nodes if node.id not in gone] + added
-    if len(remaining) > MAX_NODES:
-        raise PlanError(f"a plan may have at most {MAX_NODES} steps")
+    if len(remaining) > MAX_TASKS:
+        raise PlanError(f"a plan may have at most {MAX_TASKS} steps")
     for node in remaining:
         node.dependencies = [item for item in node.dependencies if item not in gone]
         node.verifies = [item for item in node.verifies if item not in gone]

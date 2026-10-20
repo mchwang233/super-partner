@@ -584,3 +584,40 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .lead-engineer{margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px}
 @media (max-width:820px){.engineer-layout{grid-template-columns:minmax(0,1fr)}.engineer-list{max-height:280px}}
 .app-nav button span.nav-badge{display:inline-grid;place-items:center;min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:var(--warn);color:light-dark(#ffffff,#1b1300);font:600 10px 'DM Sans',sans-serif;opacity:1}
+/* A plan made in parts: major parts as stages, each opening in place on its sub-parts and tasks. */
+.part-toggle-all{margin-left:auto;padding:4px 12px;font-size:12px}
+.part-card{display:flex;flex-direction:column;border:1px solid light-dark(#e1e7ee,#252e39);border-radius:10px;background:light-dark(#fbfcfd,#10161e);min-width:0;transition:border-color .15s,box-shadow .15s}
+.part-card.running{border-color:light-dark(#f0d39f,#5a4422)}
+.part-card.failed{border-color:light-dark(#f5c4cd,#522a32)}
+.part-card.open{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-bg)}
+.part-card-head{display:flex;flex-direction:column;align-items:stretch;gap:7px;text-align:left;font-weight:400;color:var(--text);background:none;border:0;border-radius:10px;padding:11px 12px;min-width:0}
+.part-card-head:hover .part-expand,.part-card-head:focus-visible .part-expand{color:var(--accent)}
+.part-card-line{display:flex;align-items:baseline;gap:8px;min-width:0}
+.part-card-line b{flex:1;min-width:0;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.part-card .num,.part-sub .num,.part-task .num{font:700 12px Manrope,sans-serif;color:var(--faint)}
+.part-card.succeeded>.part-card-head .num{color:var(--accent)}.part-card.running>.part-card-head .num{color:var(--warn)}
+.part-goal{font-size:12px;line-height:1.5;color:var(--muted);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.part-progress{display:flex;flex-direction:column;gap:4px}
+.part-progress small,.part-meta small{font-size:11px;color:var(--faint)}
+.part-bar{display:block;height:4px;border-radius:2px;background:light-dark(#ebeff4,#1d2630);overflow:hidden}
+.part-bar i{display:block;height:100%;background:var(--accent)}
+.part-card.running .part-bar i{background:var(--warn)}
+.part-meta{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.part-expand{font-size:11px;font-weight:600;color:var(--muted);white-space:nowrap}
+.part-body{list-style:none;margin:0;padding:4px 10px 10px;display:flex;flex-direction:column;gap:6px;border-top:1px solid var(--line-soft)}
+.part-sub .part-body{padding:4px 0 2px 14px;border-top:0;border-left:2px solid var(--line-soft);margin-left:6px}
+.part-task{border:1px solid var(--line-soft);border-radius:8px;padding:6px 8px;background:var(--panel)}
+.part-task.running{border-color:light-dark(#f0d39f,#5a4422)}
+.part-task.failed{border-color:light-dark(#f5c4cd,#522a32)}
+.part-task.selected{border-color:var(--accent)}
+.part-task-title,.part-sub-head{display:flex;align-items:baseline;gap:7px;width:100%;padding:0;background:none;border:0;color:var(--text);font-weight:500;font-size:12px;text-align:left}
+.part-task-title span:nth-child(2),.part-sub-head b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.part-task-title:hover span:nth-child(2),.part-sub-head:hover b{color:var(--accent)}
+.part-task .plan-check{margin:3px 0 0;font-size:11px}
+.part-sub{padding:4px 0}
+.part-sub-head{padding:3px 0}
+.part-sub-head b{font-size:12px}
+.part-sub-head small{font-size:11px;color:var(--faint)}
+.part-caret{width:10px;color:var(--muted);font-size:10px}
+.state.partial{color:var(--partial)}
+.part-tasks h4{margin:4px 0 0;font-size:13px;color:var(--muted)}

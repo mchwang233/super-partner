@@ -71,8 +71,41 @@ def heuristic_plan(prompt: str, in_project: bool = False) -> TaskPlan:
     return TaskPlan(summary=summary, nodes=nodes)
 
 
+# How tasks are rated and scoped; the flat planner and the lead's top-down planning (outline.py)
+# both give these rules.
+WORK_RULES = """Rate each task's difficulty for the model that will do it:
+- easy: routine, well-specified work (formatting, summarising given results, small edits).
+- normal: ordinary analysis, research or implementation with clear requirements.
+- hard: open-ended design, subtle debugging, complex multi-file changes, deep reasoning.
+Easy and normal tasks go to the cheapest capable model; hard tasks go to the strongest one.
+Every task's result is checked against its acceptance_criteria by another model and retried
+if it fails, so make the criteria concrete and checkable. A verification task lists in
+"verifies" the keys of the tasks it checks (they must also be in its dependencies); if it
+finds problems, those tasks are redone with its findings.
+What executors can do: membership CLIs (Codex, Claude Code) edit files and run shell commands
+in a sandbox that can write only to their working directory and has no network access, so
+they can run syntax checks, tests and scripts but cannot install packages or fetch URLs.
+API models that support tool calls work the same way through file and command tools in
+the same sandbox. Keep acceptance criteria within these limits.
+Work that produces files (code, tests, documents) is planned as small work packages, not areas of
+work, in a new task as much as in an existing project. Each task that writes files lists in "files"
+the 1-{max_files} files it creates or changes and in "reads" up to {max_reads} more files it must read
+for reference: in a project, by their paths in the brief given below; in a new task, by the file
+names you choose for it. Its model is given only these files, not the rest, so they must be enough
+for the job.
+"provides" says what later tasks can rely on: function names and signatures, endpoints and their
+fields, CSS classes, commands. "check" is one command that shows the package works (a test or a
+script). A package should take a capable model about 10-15 tool turns; split anything larger,
+for example one package per component, endpoint or screen. Tasks whose "files" do not overlap
+run at the same time, so packages that touch different files also finish sooner. A verification
+task lists the files it checks in "reads". Tasks that write no files (research, review, a final
+summary) leave "files" empty.
+Set needs_workspace to true only for tasks that must read or modify files in the target project.
+Token estimates must include expected dependency results and the files given.
+""".replace("{max_files}", "5").replace("{max_reads}", "8")
+
 PLANNER_PROMPT = """You are the planning engine for an autonomous multi-model executor.
-Decompose the user request into a small, executable DAG. Return JSON only, with this shape:
+Decompose the user request into a small, executable DAG of tasks (nodes). Return JSON only, with this shape:
 {
   "summary": "short objective",
   "nodes": [
@@ -95,40 +128,11 @@ Decompose the user request into a small, executable DAG. Return JSON only, with 
     }
   ]
 }
-Rate each node's difficulty for the model that will do it:
-- easy: routine, well-specified work (formatting, summarising given results, small edits).
-- normal: ordinary analysis, research or implementation with clear requirements.
-- hard: open-ended design, subtle debugging, complex multi-file changes, deep reasoning.
-Easy and normal nodes go to the cheapest capable model; hard nodes go to the strongest one.
-Every node's result is checked against its acceptance_criteria by another model and retried
-if it fails, so make the criteria concrete and checkable. A verification node lists in
-"verifies" the keys of the nodes it checks (they must also be in its dependencies); if it
-finds problems, those nodes are redone with its findings.
-What executors can do: membership CLIs (Codex, Claude Code) edit files and run shell commands
-in a sandbox that can write only to their working directory and has no network access, so
-they can run syntax checks, tests and scripts but cannot install packages or fetch URLs.
-API models that support tool calls work the same way through file and command tools in
-the same sandbox. Keep acceptance criteria within these limits.
-Work that produces files (code, tests, documents) is planned as small work packages, not areas of
-work, in a new task as much as in an existing project. Each node that writes files lists in "files"
-the 1-{max_files} files it creates or changes and in "reads" up to {max_reads} more files it must read
-for reference: in a project, by their paths in the brief given below; in a new task, by the file
-names you choose for it. Its model is given only these files, not the rest, so they must be enough
-for the job.
-"provides" says what later nodes can rely on: function names and signatures, endpoints and their
-fields, CSS classes, commands. "check" is one command that shows the package works (a test or a
-script). A package should take a capable model about 10-15 tool turns; split anything larger,
-for example one package per component, endpoint or screen. Nodes whose "files" do not overlap
-run at the same time, so packages that touch different files also finish sooner. A verification
-node lists the files it checks in "reads". Nodes that write no files (research, review, a final
-summary) leave "files" empty.
-Use 2-{max_nodes} nodes. Dependencies reference earlier node keys only. Parallelize independent work.
-Include verification and final synthesis nodes when appropriate. Set needs_workspace to true
-only for nodes that must read or modify files in the target project. Token estimates must include expected
-dependency results and the files given. Never include markdown fences.
+""" + WORK_RULES + """Use 2-{max_nodes} nodes. Dependencies reference earlier node keys only. Parallelize independent work.
+Include verification and final synthesis nodes when appropriate. Never include markdown fences.
 
 User request:
-""".replace("{max_files}", "5").replace("{max_reads}", "8").replace("{max_nodes}", "30")
+""".replace("{max_nodes}", "30")
 MAX_NODES = 30
 # A work package's scope (see the prompt above).
 MAX_SCOPE_FILES = 5
@@ -182,7 +186,6 @@ def _validate_plan(payload: dict) -> TaskPlan:
     raw_nodes = payload.get("nodes")
     if not isinstance(raw_nodes, list) or not 2 <= len(raw_nodes) <= MAX_NODES:
         raise ValueError(f"planner must return 2-{MAX_NODES} nodes")
-    allowed = {"coding", "planning", "research", "chinese", "tool_use", "structured_output"}
     key_to_id: dict[str, str] = {}
     nodes: list[TaskNode] = []
     for index, raw in enumerate(raw_nodes):
@@ -192,28 +195,37 @@ def _validate_plan(payload: dict) -> TaskPlan:
         dependencies = raw.get("dependencies", [])
         if not isinstance(dependencies, list) or any(dep not in key_to_id for dep in dependencies):
             raise ValueError(f"node {key} has a forward or unknown dependency")
-        capability = raw.get("capability", "planning")
-        if capability not in allowed:
-            raise ValueError(f"node {key} has unsupported capability: {capability}")
-        node_id = str(uuid4())[:8]
-        key_to_id[key] = node_id
-        nodes.append(TaskNode(
-            id=node_id,
-            title=str(raw.get("title", key))[:120],
-            instructions=str(raw.get("instructions", "")).strip(),
-            capability=capability,
-            dependencies=[key_to_id[dep] for dep in dependencies],
-            estimated_input_tokens=max(100, min(int(raw.get("estimated_input_tokens", 1500)), 1_000_000)),
-            estimated_output_tokens=max(50, min(int(raw.get("estimated_output_tokens", 800)), 128_000)),
-            **_difficulty(raw),
-            acceptance_criteria=str(raw.get("acceptance_criteria", "")).strip()[:1000],
-            verifies=[key_to_id[item] for item in _verified(raw, dependencies)],
-            needs_workspace=raw.get("needs_workspace") is True,
-            **package(raw),
-        ))
+        node = task_node(raw, key, [key_to_id[dep] for dep in dependencies],
+                         [key_to_id[item] for item in _verified(raw, dependencies)])
+        key_to_id[key] = node.id
+        nodes.append(node)
     if any(not node.instructions for node in nodes):
         raise ValueError("every planner node needs instructions")
     return TaskPlan(summary=str(payload.get("summary", "Autonomous task plan"))[:240], nodes=nodes)
+
+
+CAPABILITIES = {"coding", "planning", "research", "chinese", "tool_use", "structured_output"}
+
+
+def task_node(raw: dict, key: str, dependencies: list[str], verifies: list[str]) -> TaskNode:
+    """A step from a planner's (or lead's) JSON task, with its dependencies already resolved."""
+    capability = raw.get("capability", "planning")
+    if capability not in CAPABILITIES:
+        raise ValueError(f"node {key} has unsupported capability: {capability}")
+    return TaskNode(
+        id=str(uuid4())[:8],
+        title=str(raw.get("title", key))[:120],
+        instructions=str(raw.get("instructions", "")).strip(),
+        capability=capability,
+        dependencies=dependencies,
+        estimated_input_tokens=max(100, min(int(raw.get("estimated_input_tokens", 1500)), 1_000_000)),
+        estimated_output_tokens=max(50, min(int(raw.get("estimated_output_tokens", 800)), 128_000)),
+        **_difficulty(raw),
+        acceptance_criteria=str(raw.get("acceptance_criteria", "")).strip()[:1000],
+        verifies=verifies,
+        needs_workspace=raw.get("needs_workspace") is True,
+        **package(raw),
+    )
 
 
 def _paths(value) -> list[str]:
@@ -254,38 +266,23 @@ def scope_problems(plan: TaskPlan) -> list[str]:
     return problems
 
 
-SCOPE_ROUNDS = 2
-
-
 async def _plan_as_lead(request: str, models: list[ModelProfile], configured: set[str], providers,
                         session: SupervisorSession, in_project: bool) -> Optional[TaskPlan]:
-    """The best lead plans in its own conversation, which ``session`` then holds; None if none can."""
+    """The best lead plans top-down in its own conversation (outline.py), which ``session`` then
+    holds; None if none can."""
+    from . import outline
+
     for model in supervisor.candidates(models, configured)[:supervisor.MAX_LEADS]:
         fresh = supervisor.new_session(model)
-        cost = 0.0
+        spent = [0.0]
+
+        async def say(text: str, fresh=fresh, model=model, spent=spent) -> str:
+            result = await providers.converse(fresh, text)
+            spent[0] += _cost(result, model)
+            return result.text
+
         try:
-            result = await providers.converse(fresh, supervisor.ROLE + request)
-            cost += _cost(result, model)
-            try:
-                plan = _validate_plan(_extract_json(result.text))
-            except (ValueError, TypeError, KeyError):
-                # Same conversation: it knows what it meant, it only has to say it as asked.
-                result = await providers.converse(fresh, "That reply was not a valid plan. Reply with the "
-                                                         "plan as the JSON object described, and nothing else.")
-                cost += _cost(result, model)
-                plan = _validate_plan(_extract_json(result.text))
-            for _ in range(SCOPE_ROUNDS):
-                if not (problems := scope_problems(plan)):
-                    break
-                # Too broad a step makes its model explore the project; have the lead cut it up.
-                result = await providers.converse(fresh, (
-                    "Some nodes are not small, scoped work packages:\n- " + "\n- ".join(problems)
-                    + "\nReply with the whole corrected plan as the JSON object described, and nothing else."))
-                cost += _cost(result, model)
-                try:
-                    plan = _validate_plan(_extract_json(result.text))
-                except (ValueError, TypeError, KeyError):
-                    break  # keep the plan it gave before
+            plan = await outline.plan_in_parts(say, supervisor.ROLE + request)
         except Exception as exc:
             # The next lead tries; with none left, the usual single-call planner does.
             logger.warning("lead %s could not plan: %s", model.id, exc)
@@ -297,8 +294,8 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
                 node.needs_workspace = False
         plan.planning_method = "model"
         plan.planner_model_id = model.id
-        plan.planning_cost_usd = round(cost, 6)
-        plan.planning_note = f"由负责人 {model.display_name} 规划，并全程跟进这个任务"
+        plan.planning_cost_usd = round(spent[0], 6)
+        plan.planning_note = f"由负责人 {model.display_name} 逐级拆分规划，并全程跟进这个任务"
         return plan
     return None
 
@@ -317,15 +314,19 @@ async def autonomous_plan(
     session: Optional[SupervisorSession] = None,
     brief: Optional[str] = None,
 ) -> TaskPlan:
-    """Plan ``prompt``. Given ``session``, the plan is made by the task's lead in a conversation
-    that it keeps for the rest of the task (supervisor.py); ``session`` is filled in. Without a
+    """Plan ``prompt``. Given ``session``, the plan is made by the task's lead, top-down in parts
+    (outline.py), in a conversation that it keeps for the rest of the task (supervisor.py);
+    ``session`` is filled in. Without a
     lead able to plan, the best planner plans in a single call and ``session`` stays empty.
     ``brief`` is the project brief (briefing.py): with it the plan is cut into small work
     packages, each naming the files it needs, so no step has to learn the whole project."""
     in_project = project_context is not None or brief is not None
-    request = PLANNER_PROMPT + prompt + "".join(f"\n\n{part}" for part in (project_context, brief) if part)
+    body = prompt + "".join(f"\n\n{part}" for part in (project_context, brief) if part)
+    request = PLANNER_PROMPT + body
     if session is not None:
-        plan = await _plan_as_lead(request, models, configured, providers, session, in_project)
+        from .outline import OUTLINE_PROMPT
+
+        plan = await _plan_as_lead(OUTLINE_PROMPT + body, models, configured, providers, session, in_project)
         if plan:
             return plan
     planner = select_planner_model(models, configured)

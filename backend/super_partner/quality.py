@@ -107,6 +107,10 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
     """The node's prompt and a record of what it received from each upstream node."""
     by_id = {item.id: item for item in run.plan.nodes}
     sections, inputs = [f"Task: {node.instructions}"], []
+    if path := run.plan.part_path(node.part_id):
+        # Only where the task sits; its instructions are complete on their own.
+        sections.append("Part of: " + " › ".join(part.title for part in path)
+                        + (f" (goal: {path[-1].goal})" if path[-1].goal else ""))
     if run.background:
         # A requirement change: the working directory already holds the earlier task's results.
         sections.append("Context: this task changes an earlier task. Its results are already in the working "

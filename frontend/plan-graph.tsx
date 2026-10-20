@@ -10,7 +10,7 @@ export type PlanNode = {
   acceptance_criteria?: string; verifies?: string[]; attempts?: NodeAttempt[]; failed_attempts?: number;
   feedback?: string | null; unable_reason?: string | null; review_passed?: boolean | null; review?: string | null; summary?: string | null;
   changed_files?: string[]; inputs?: { node_id: string; form: string; changed_files: number }[];
-  files?: string[]; reads?: string[]; provides?: string; check?: string;
+  files?: string[]; reads?: string[]; provides?: string; check?: string; part_id?: string | null;
 };
 type ToolCall = { turn: number; tool: string; detail?: string; ok?: boolean };
 type NodeAttempt = { model_id?: string | null; outcome: string; reason?: string | null; reviewer_model_id?: string | null; cost_usd: number; finished_at?: string;
@@ -36,7 +36,7 @@ const OUTCOME_LABELS: Record<string, string> = { passed: "通过", rejected: "�
 const INPUT_LABELS: Record<string, string> = { full: "完整结果", summary: "摘要", truncated: "截断的结果" };
 
 /** One line on the card saying where the node stands right now. */
-function nodeLine(node: PlanNode, nodes: PlanNode[], number: Map<string, string>): { tone: string; text: string } {
+export function nodeLine(node: PlanNode, nodes: PlanNode[], number: Map<string, string>): { tone: string; text: string } {
   const attempts = node.attempts ?? [], last = attempts[attempts.length - 1];
   if (node.status === "succeeded") return { tone: "ok", text: node.verifies?.length ? "✓ 验证通过" : node.review_passed ? "✓ 验收通过" : "✓ 完成" };
   if (node.status === "failed") return { tone: "bad", text: `✗ ${last ? OUTCOME_LABELS[last.outcome] ?? "失败" : "失败"}` };
@@ -66,56 +66,45 @@ function selectionReason(node: PlanNode, model?: Model): string {
 const CAPABILITY_LABELS: Record<string, string> = Object.fromEntries(CAPABILITIES.map(({ key, label }) => [key, label]));
 
 /** Group nodes into stages: a node sits one stage after its latest dependency. */
-export function planStages(nodes: PlanNode[]): PlanNode[][] {
+export function planStages<T extends { id: string; dependencies?: string[] }>(nodes: T[]): T[][] {
   const byId = new Map(nodes.map(node => [node.id, node]));
   const depth = new Map<string, number>();
-  const visit = (node: PlanNode, trail: Set<string>): number => {
+  const visit = (node: T, trail: Set<string>): number => {
     if (depth.has(node.id)) return depth.get(node.id)!;
     if (trail.has(node.id)) return 0; // a cycle; the executor rejects it, keep the view usable
     trail.add(node.id);
-    const parents = (node.dependencies ?? []).map(id => byId.get(id)).filter((item): item is PlanNode => !!item);
+    const parents = (node.dependencies ?? []).map(id => byId.get(id)).filter((item): item is T => !!item);
     const value = parents.length ? Math.max(...parents.map(parent => visit(parent, trail))) + 1 : 0;
     trail.delete(node.id);
     depth.set(node.id, value);
     return value;
   };
-  const stages: PlanNode[][] = [];
+  const stages: T[][] = [];
   for (const node of nodes) (stages[visit(node, new Set())] ??= []).push(node);
   return stages.filter(Boolean);
 }
 
-export function PlanGraph({ apiBase, runId, runStatus, nodes, inProject, models, onOpenProfile, reworkRounds = 0 }: { apiBase: string; runId: string; runStatus: string; nodes: PlanNode[]; inProject: boolean; models: Model[]; onOpenProfile: (model: Model) => void; reworkRounds?: number }) {
-  const [active, setActive] = useState<string | null>(null), [openNode, setOpenNode] = useState<PlanNode | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  useEffect(() => setSelectedId(null), [runId]);
-  const stages = planStages(nodes);
-  const number = new Map(nodes.map((node, index) => [node.id, String(index + 1).padStart(2, "0")]));
-  const modelById = new Map(models.map(model => [model.id, model]));
-  const widest = Math.max(0, ...stages.map(stage => stage.length));
-  const activeNode = nodes.find(node => node.id === active);
-  const related = new Set(activeNode ? [activeNode.id, ...(activeNode.dependencies ?? []), ...nodes.filter(node => node.dependencies?.includes(activeNode.id)).map(node => node.id)] : []);
-  const retries = nodes.reduce((sum, node) => sum + Math.max(0, (node.attempts?.length ?? 0) - 1), 0);
-  const selected = nodes.find(node => node.id === selectedId);
-  // Dependency lines between cards, measured after layout and redrawn when the board resizes.
-  const board = useRef<HTMLDivElement>(null);
-  const [links, setLinks] = useState<{ id: string; from: string; to: string; d: string; done: boolean }[]>([]);
+export type Edge = { from: string; to: string; done: boolean };
+
+/** Lines from card to card inside ``board``, for cards marked ``data-{attr}``; measured after layout
+ * and redrawn when ``shape`` changes or the board resizes. */
+export function useLinks(board: React.RefObject<HTMLDivElement | null>, edges: Edge[], attr: string, shape: string) {
+  const [links, setLinks] = useState<(Edge & { id: string; d: string })[]>([]);
   const [size, setSize] = useState({ width: 0, height: 0 });
-  const shape = nodes.map(node => `${node.id}:${node.status}:${(node.dependencies ?? []).join(",")}`).join("|");
   useLayoutEffect(() => {
     const element = board.current;
     if (!element) return;
     const draw = () => {
       const box = element.getBoundingClientRect();
-      const cards = new Map([...element.querySelectorAll<HTMLElement>("[data-node]")].map(card => [card.dataset.node!, card.getBoundingClientRect()]));
+      const cards = new Map([...element.querySelectorAll<HTMLElement>(`[data-${attr}]`)].map(card => [card.dataset[attr]!, card.getBoundingClientRect()]));
       const next = [];
-      for (const node of nodes) for (const dependency of node.dependencies ?? []) {
-        const from = cards.get(dependency), to = cards.get(node.id);
+      for (const edge of edges) {
+        const from = cards.get(edge.from), to = cards.get(edge.to);
         if (!from || !to || !from.width) continue;
         const x1 = from.right - box.left + element.scrollLeft, y1 = from.top + from.height / 2 - box.top;
         const x2 = to.left - box.left + element.scrollLeft, y2 = to.top + to.height / 2 - box.top;
         const middle = (x1 + x2) / 2;
-        next.push({ id: `${dependency}>${node.id}`, from: dependency, to: node.id, d: `M${x1},${y1} C${middle},${y1} ${middle},${y2} ${x2},${y2}`,
-          done: nodes.find(item => item.id === dependency)?.status === "succeeded" });
+        next.push({ ...edge, id: `${edge.from}>${edge.to}`, d: `M${x1},${y1} C${middle},${y1} ${middle},${y2} ${x2},${y2}` });
       }
       setLinks(next);
       // Size from the stages themselves; sizing from the scroll box would keep it from shrinking.
@@ -128,6 +117,27 @@ export function PlanGraph({ apiBase, runId, runStatus, nodes, inProject, models,
     window.addEventListener("resize", draw);
     return () => { observer?.disconnect(); window.removeEventListener("resize", draw); };
   }, [shape]);
+  return { links, size };
+}
+
+/** The tasks in ``nodes`` as stages of cards. ``all`` is the whole plan when ``nodes`` is one part of it: numbers and waits refer to it. */
+export function PlanGraph({ apiBase, runId, runStatus, nodes, all = nodes, inProject, models, onOpenProfile, reworkRounds = 0 }: { apiBase: string; runId: string; runStatus: string; nodes: PlanNode[]; all?: PlanNode[]; inProject: boolean; models: Model[]; onOpenProfile: (model: Model) => void; reworkRounds?: number }) {
+  const [active, setActive] = useState<string | null>(null), [openNode, setOpenNode] = useState<PlanNode | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  useEffect(() => setSelectedId(null), [runId]);
+  const stages = planStages(nodes);
+  const number = new Map(all.map((node, index) => [node.id, String(index + 1).padStart(2, "0")]));
+  const modelById = new Map(models.map(model => [model.id, model]));
+  const widest = Math.max(0, ...stages.map(stage => stage.length));
+  const activeNode = nodes.find(node => node.id === active);
+  const related = new Set(activeNode ? [activeNode.id, ...(activeNode.dependencies ?? []), ...nodes.filter(node => node.dependencies?.includes(activeNode.id)).map(node => node.id)] : []);
+  const retries = nodes.reduce((sum, node) => sum + Math.max(0, (node.attempts?.length ?? 0) - 1), 0);
+  const selected = nodes.find(node => node.id === selectedId);
+  // Dependency lines between cards, measured after layout and redrawn when the board resizes.
+  const board = useRef<HTMLDivElement>(null);
+  const shape = nodes.map(node => `${node.id}:${node.status}:${(node.dependencies ?? []).join(",")}`).join("|");
+  const status = new Map(nodes.map(node => [node.id, node.status]));
+  const { links, size } = useLinks(board, nodes.flatMap(node => (node.dependencies ?? []).map(from => ({ from, to: node.id, done: status.get(from) === "succeeded" }))), "node", shape);
   if (!nodes.length) return null;
   return <div className="plan-graph">
     <div className="plan-summary" aria-label="计划概览">
@@ -154,7 +164,7 @@ export function PlanGraph({ apiBase, runId, runStatus, nodes, inProject, models,
             <div className="plan-stage-nodes">
               {stage.map(node => {
                 const model = modelById.get(node.model_id);
-                const line = nodeLine(node, nodes, number);
+                const line = nodeLine(node, all, number);
                 const state = active ? related.has(node.id) ? node.id === active ? "focus" : "related" : "dimmed" : "";
                 const open = () => setSelectedId(current => current === node.id ? null : node.id);
                 return <article key={node.id} data-node={node.id} className={`plan-node ${node.status} ${state} ${selectedId === node.id ? "selected" : ""}`}
@@ -171,7 +181,7 @@ export function PlanGraph({ apiBase, runId, runStatus, nodes, inProject, models,
         })}
       </ol>
     </div>
-    {selected && <NodeProgress apiBase={apiBase} runId={runId} runStatus={runStatus} node={selected} nodes={nodes} number={number}
+    {selected && <NodeProgress apiBase={apiBase} runId={runId} runStatus={runStatus} node={selected} nodes={all} number={number}
       model={modelById.get(selected.model_id)} onOpenModel={() => setOpenNode(selected)} onClose={() => setSelectedId(null)} />}
     {openNode && <ModelCapabilityDialog node={openNode} model={modelById.get(openNode.model_id)} onClose={() => setOpenNode(null)} onOpenProfile={model => { setOpenNode(null); onOpenProfile(model); }} />}
   </div>;
@@ -209,7 +219,7 @@ function describe(event: TimelineEvent, nodeId: string, number: Map<string, stri
 }
 
 /** Live progress of one node: what it is doing now, its timeline, checks, inputs and output. */
-function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, onOpenModel, onClose }: { apiBase: string; runId: string; runStatus: string; node: PlanNode; nodes: PlanNode[]; number: Map<string, string>; model?: Model; onOpenModel: () => void; onClose: () => void }) {
+export function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, onOpenModel, onClose }: { apiBase: string; runId: string; runStatus: string; node: PlanNode; nodes: PlanNode[]; number: Map<string, string>; model?: Model; onOpenModel: () => void; onClose: () => void }) {
   const [events, setEvents] = useState<TimelineEvent[]>([]), [now, setNow] = useState(() => Date.now());
   const attempts = node.attempts ?? [], inputs = node.inputs ?? [], files = node.changed_files ?? [];
   const live = ACTIVE_RUN.has(runStatus);
@@ -287,7 +297,7 @@ function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, o
   </section>;
 }
 
-function ModelCapabilityDialog({ node, model, onClose, onOpenProfile }: { node: PlanNode; model?: Model; onClose: () => void; onOpenProfile: (model: Model) => void }) {
+export function ModelCapabilityDialog({ node, model, onClose, onOpenProfile }: { node: PlanNode; model?: Model; onClose: () => void; onOpenProfile: (model: Model) => void }) {
   const id = node.model_id;
   useEffect(() => {
     const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };

@@ -208,6 +208,8 @@ class TaskNode(BaseModel):
     reads: list[str] = Field(default_factory=list)
     provides: str = ""
     check: str = ""
+    # The innermost plan part (PlanPart) this task belongs to; None in a plan without parts.
+    part_id: Optional[str] = None
     model_id: Optional[str] = None
     # Why the router chose model_id, for the plan view.
     routing_note: Optional[str] = None
@@ -257,14 +259,36 @@ class CostEstimate(BaseModel):
     hard_limit_usd: float
 
 
+class PlanPart(BaseModel):
+    """A part of a plan (大项 at the top level), split level by level into smaller parts and
+    finally tasks (outline.py). Only tasks run; parts group them."""
+    id: str
+    title: str
+    goal: str = ""
+    acceptance: str = ""
+    parent_id: Optional[str] = None
+    # Earlier parts or tasks under the same parent that this part waits for.
+    dependencies: list[str] = Field(default_factory=list)
+
+
 class TaskPlan(BaseModel):
     summary: str
     nodes: list[TaskNode]
+    parts: list[PlanPart] = Field(default_factory=list)
     estimate: Optional[CostEstimate] = None
     planning_method: str = "heuristic"
     planner_model_id: Optional[str] = None
     planning_cost_usd: float = 0.0
     planning_note: Optional[str] = None
+
+    def part_path(self, part_id: Optional[str]) -> list[PlanPart]:
+        """The parts from the top level down to ``part_id``."""
+        by_id = {part.id: part for part in self.parts}
+        path = []
+        while part_id in by_id and len(path) < 10:
+            path.insert(0, by_id[part_id])
+            part_id = by_id[part_id].parent_id
+        return path
 
 
 class Attachment(BaseModel):

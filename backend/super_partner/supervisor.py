@@ -84,7 +84,7 @@ def handover(run: ExecutionRun) -> str:
     ]
     for node in run.plan.nodes:
         deps = f" (after {', '.join(node.dependencies)})" if node.dependencies else ""
-        lines.append(f"- [{node.id}] {node.title}{deps}: {node.status.value}, {len(node.attempts)} attempts, "
+        lines.append(f"- [{node.id}] {node.title}{part_of(run, node)}{deps}: {node.status.value}, {len(node.attempts)} attempts, "
                      f"model {node.model_id}")
         if node.status == NodeStatus.SUCCEEDED and (node.summary or node.result):
             lines.append(f"  result: {(node.summary or node.result)[:MAX_RESULT_CHARS]}")
@@ -178,7 +178,8 @@ PLAN_FORMAT = (
     '"difficulty": "easy | normal | hard", "dependencies": ["ids of existing steps or keys of added ones"], '
     '"verifies": ["optional: ids or keys of steps this one verifies"], '
     '"files": ["files it creates or changes, at most 5"], "reads": ["files it reads for reference"], '
-    '"provides": "what later steps can rely on", "check": "a command that shows it works"}], '
+    '"provides": "what later steps can rely on", "check": "a command that shows it works", '
+    '"part": "optional: id of the plan part it belongs to; by default the part of the step decided on"}], '
     '"remove": ["ids of steps that have not finished"], '
     '"update": [{"id": "...", "title": "optional", "instructions": "optional", "acceptance_criteria": "optional", '
     '"dependencies": ["optional: the full new list"], "files": ["optional: the full new list"], '
@@ -209,8 +210,14 @@ DECISION_FORMAT = decision_format()
 MAX_EVIDENCE_CHARS = 1500
 
 
+def part_of(run: ExecutionRun, node) -> str:
+    """Where a step sits in a plan made in parts: " in [id] Part › Sub-part"."""
+    path = run.plan.part_path(node.part_id)
+    return f" in [{path[-1].id}] {' › '.join(part.title for part in path)}" if path else ""
+
+
 def _steps(run: ExecutionRun) -> list[str]:
-    return [f"- [{node.id}] {node.title}: {node.status.value}" for node in run.plan.nodes]
+    return [f"- [{node.id}] {node.title}{part_of(run, node)}: {node.status.value}" for node in run.plan.nodes]
 
 
 def _models(choices: list[ModelProfile], node) -> list[str]:

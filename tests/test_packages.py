@@ -17,9 +17,14 @@ BRIEF = "Project brief ...\napp.js (1447 lines): SPA\nstyle.css (308 lines): sty
 
 
 def plan(*nodes):
-    return json.dumps({"summary": "s", "nodes": [
-        {"key": key, "title": key, "instructions": f"做 {key}", "capability": "coding", "needs_workspace": True,
-         "dependencies": deps, **fields} for key, deps, fields in nodes]})
+    """The lead's split of a part into tasks."""
+    return json.dumps({"children": [
+        {"key": key, "kind": "task", "title": key, "instructions": f"做 {key}", "capability": "coding",
+         "needs_workspace": True, "acceptance_criteria": "可检查", "dependencies": deps, **fields}
+        for key, deps, fields in nodes]})
+
+
+OUTLINE = json.dumps({"summary": "s", "parts": [{"key": "p", "title": "全部", "goal": "完成请求"}]})
 
 
 AREA = plan(("界面", [], {"files": ["easylife/static/"]}), ("检查", ["界面"], {"verifies": ["界面"]}))
@@ -31,10 +36,10 @@ PACKAGES = plan(
 
 async def test_the_lead_plans_from_the_brief_and_cuts_broad_steps_into_packages():
     session = SupervisorSession()
-    leads = Leads([AREA, PACKAGES])
+    leads = Leads([OUTLINE, AREA, PACKAGES])
     result = await autonomous_plan("把界面打磨好", MODELS, CONFIGURED, leads, session=session, brief=BRIEF)
     assert [node.title for node in result.nodes] == ["按钮", "设置页", "检查"]
-    first, second = (message for _, _, message in leads.messages)
+    first, _, second = (message for _, _, message in leads.messages)
     assert BRIEF in first and "small work packages" in first
     assert "界面: names folders or patterns (easylife/static/)" in second
     button = result.nodes[0]
@@ -42,9 +47,9 @@ async def test_the_lead_plans_from_the_brief_and_cuts_broad_steps_into_packages(
 
 
 async def test_a_lead_that_keeps_planning_broadly_still_gets_its_plan_run():
-    leads = Leads([AREA, AREA, AREA])
+    leads = Leads([OUTLINE, AREA, AREA, AREA])
     result = await autonomous_plan("把界面打磨好", MODELS, CONFIGURED, leads, session=SupervisorSession(), brief=BRIEF)
-    assert [node.title for node in result.nodes] == ["界面", "检查"] and len(leads.messages) == 3
+    assert [node.title for node in result.nodes] == ["界面", "检查"] and len(leads.messages) == 4
 
 
 def test_what_makes_a_package_too_broad():
@@ -98,12 +103,12 @@ def test_the_lead_is_asked_only_about_scoped_packages(database):
 
 async def test_a_new_task_is_cut_into_packages_too():
     broad = plan(("全部", [], {}), ("说明", ["全部"], {"capability": "chinese"})).replace('"needs_workspace": true, ', '')
-    leads = Leads([broad, json.dumps(
-        {"summary": "s", "nodes": [
+    leads = Leads([OUTLINE, broad, json.dumps(
+        {"children": [
             {"key": "rtl", "title": "RTL", "instructions": "写 FIFO", "capability": "coding", "files": ["async_fifo.v"],
-             "provides": "module async_fifo #(DATA_WIDTH, DEPTH)"},
+             "provides": "module async_fifo #(DATA_WIDTH, DEPTH)", "acceptance_criteria": "仿真通过"},
             {"key": "tb", "title": "测试", "instructions": "写测试", "capability": "coding",
-             "files": ["tb_async_fifo.v", "Makefile"]}]})])
+             "files": ["tb_async_fifo.v", "Makefile"], "acceptance_criteria": "make 能跑"}]})])
     result = await autonomous_plan("写一个异步 FIFO", MODELS, CONFIGURED, leads, session=SupervisorSession())
-    assert "全部: lists no files" in leads.messages[1][2]
+    assert "全部: lists no files" in leads.messages[2][2]
     assert [node.files for node in result.nodes] == [["async_fifo.v"], ["tb_async_fifo.v", "Makefile"]]

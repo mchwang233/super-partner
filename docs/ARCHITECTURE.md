@@ -30,7 +30,8 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | HTTP API, task lifecycle endpoints | `api.py` | `create_task`, `follow_up_task`, `resume_task`, `reopen_node`, `reply_to_diagnosis`, `set_network_access` |
 | Records and statuses | `models.py` | `RunStatus`, `NodeStatus`, `Outcome` (attempt outcomes), `DiagnosisStatus`, `FINISHED`, `TaskNode`, `NodeAttempt`, `Diagnosis`, `ExecutionRun` |
 | Storage (SQLite, JSON bodies) | `db.py` | `Database.save_run`, `get_run`, events |
-| Planning | `planner.py` | `autonomous_plan` (by the lead when one is available: `_plan_as_lead`), `_validate_plan`; project work as small packages (`TaskNode.files/reads/provides/check`, `package`, `scope_problems` sends broad steps back to the lead) |
+| Planning | `planner.py` | `autonomous_plan` (by the lead when one is available: `_plan_as_lead`), `_validate_plan` (flat plan, when no lead plans), `task_node`, `WORK_RULES`; project work as small packages (`TaskNode.files/reads/provides/check`, `package`, `scope_problems` sends broad steps back to the lead) |
+| The lead plans top-down: major parts (大项), split level by level into parts or tasks until each is an independent task (docs/design/plan-parts.md) | `outline.py` | `plan_in_parts`, `OUTLINE_PROMPT`, `refine_message`, `siblings`, `task_problems`, `Tree` (a wait on a part becomes a wait on its last tasks), `MAX_DEPTH`, `MAX_TASKS`; `TaskPlan.parts`, `PlanPart`, `TaskNode.part_id`, `TaskPlan.part_path` |
 | The task's lead: one conversation from planning to the end (docs/design/supervisor.md) | `supervisor.py` | `candidates`, `ask`, `handover`, `trim`; `Executor.ask_lead`, `ProviderRegistry.converse`, `CliChannelRegistry.converse`, `ExecutionRun.supervisor` |
 | Model choice | `routing.py` | `route_node` (first pick), `strongest_for` (retry), `stronger_than` (escalation), `pick_reviewer`, `diagnosers` |
 | Scheduling, attempts, step outcomes | `executor.py` | `Executor`; see "Executor" below |
@@ -92,6 +93,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Progress checks | `test_progress.py` |
 | The lead's conversation | `test_supervisor.py` |
 | The lead's decisions | `test_leading.py`, `test_replan.py` (plan changes, final review) |
+| Planning in parts | `test_outline.py`, `test_packages.py` |
 | Review prompts and evidence | `test_quality.py`, `test_review_evidence.py` |
 | Platform self-repair | `test_platform_repair.py` |
 | The platform engineer | `test_engineer.py` |
@@ -105,5 +107,5 @@ about 35 s), `cd frontend && npm test` and `npm run build` (only when the fronte
 ## Frontend (`frontend/`)
 
 `src.tsx` (app shell, task creation, actions), `lead.tsx` (the lead's decisions, questions and messages), `result-page.tsx` (results, requirement change),
-`plan-graph.tsx` (steps and attempts), `engineer.tsx` (the platform engineer's page), `diagnosis.tsx` (diagnosis chat), `mission-history.tsx`
+`plan-parts.tsx` (the progress view: major parts as stages that open in place, `PlanView`), `plan-graph.tsx` (steps and attempts), `engineer.tsx` (the platform engineer's page), `diagnosis.tsx` (diagnosis chat), `mission-history.tsx`
 (task list), `model-profiles.tsx` (models), `style.css` (tokens and styles).

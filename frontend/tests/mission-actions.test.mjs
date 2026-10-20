@@ -619,6 +619,54 @@ test("the plan shows stages, dependencies, parallel work and each task's model",
   assert.equal([...document.querySelectorAll(".app-nav button")].find(b => b.textContent.startsWith("模型画像")).getAttribute("aria-pressed"), "true");
 });
 
+test("a plan made in parts shows its major parts as stages; each opens in place, or all at once", async t => {
+  const node = (id, part_id, status = "pending", deps = []) => ({
+    id, title: `Task ${id}`, instructions: "", capability: "coding", dependencies: deps, part_id,
+    model_id: "cli:claude", status, estimated_cost_usd: 0, difficulty: "normal", quality_threshold: 80,
+    attempts: status === "succeeded" ? [{ model_id: "cli:claude", outcome: "passed", cost_usd: 0.25 }] : [],
+  });
+  const run = mission("parted", "running");
+  run.plan.parts = [
+    { id: "api", title: "后端", goal: "提供待办接口", acceptance: "接口测试通过", parent_id: null, dependencies: [] },
+    { id: "store", title: "存储", goal: "保存待办", parent_id: "api", dependencies: [] },
+    { id: "ui", title: "前端", goal: "待办页面", parent_id: null, dependencies: ["api"] },
+  ];
+  run.plan.nodes = [node("model", "store", "succeeded"), node("db", "store", "running", ["model"]),
+    node("routes", "api", "pending", ["db"]), node("page", "ui", "pending", ["routes"])];
+  const { document, click } = await setup(t, [run]);
+
+  // Only the major parts, as stages from left to right, with how far each has come.
+  assert.match(document.querySelector(".plan-summary").textContent, /2 个大项.*4 个任务.*已完成 1/);
+  const stages = [...document.querySelectorAll(".plan-stage")];
+  assert.deepEqual(stages.map(stage => [...stage.querySelectorAll(".part-card-line b")].map(b => b.textContent)), [["后端"], ["前端"]]);
+  assert.ok(document.querySelector(".plan-board svg.plan-links"));
+  assert.equal(document.querySelector(".part-task"), null);
+  const cards = [...document.querySelectorAll(".part-card")];
+  assert.match(cards[0].textContent, /进行中.*1 \/ 3 个任务完成 · 1 个进行中.*1 个子项.*\$0\.25.*展开/);
+
+  // A part opens in place on its sub-parts and tasks, in plan order; numbers are those of the whole plan.
+  await click(cards[0].querySelector(".part-card-head"));
+  assert.equal(cards[0].querySelector(".part-card-head").getAttribute("aria-expanded"), "true");
+  const body = cards[0].querySelector(".part-body");
+  assert.deepEqual([...body.children].map(item => item.className.split(" ")[0]), ["part-sub", "part-task"]);
+  assert.match(body.querySelector(".part-sub-head").textContent, /1\.1存储1\/2/);
+  assert.match(body.querySelector(".part-task").textContent, /03Task routes.*等待 02/);
+  await click(body.querySelector(".part-sub-head"));
+  assert.deepEqual([...body.querySelectorAll(".part-task .part-task-title span:nth-child(2)")].map(n => n.textContent), ["Task model", "Task db", "Task routes"]);
+  await click(body.querySelector(".part-task-title"));
+  assert.match(document.querySelector(".node-progress.drawer h4").textContent, /Task model/);
+  await click(document.querySelector('[aria-label="关闭进行情况"]'));
+
+  // One switch opens every part, and closes them all again.
+  const all = document.querySelector(".part-toggle-all");
+  assert.equal(all.textContent, "全部展开");
+  await click(all);
+  assert.equal(all.textContent, "全部关闭");
+  assert.equal(document.querySelectorAll(".part-task").length, 4);
+  await click(all);
+  assert.equal(document.querySelectorAll(".part-task").length, 0);
+});
+
 test("the budget accepts round amounts such as 2 and can be cleared while typing", async t => {
   const { window, document, act } = await setup(t);
   const input = document.querySelector(".composer .budget-field input");
