@@ -479,6 +479,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 run, node, model_id, prompt, workspace, allow_api_fallback=fallback and not in_project,
                 attachments=run.attachments, act=act, max_turns=turns_for(node), tool_log=log,
                 watch=self._progress_watch(run, node, model_id),
+                effort=settings.reasoning_by_difficulty.get(node.difficulty),
                 **({"conversation": conversation} if conversation else {}),
                 **({"overrun": overrun} if (overrun := self._overrun_check(run, node, model_id)) else {}),
             )

@@ -107,6 +107,60 @@ def _transcript(history: list[dict], prompt: str) -> str:
     return f"The conversation so far:\n\n{turns}\n\n[USER]\n{prompt}"
 
 
+# A tool loop sends its whole history every turn. Past COMPACT_AT characters, older tool output
+# and written file contents are cut to their start, all at once, so the history stays the same
+# (and cached) for the turns after; the last KEEP_RESULTS tool results stay whole.
+COMPACT_AT = 200_000
+KEEP_RESULTS = 6
+KEPT_CHARS = 400
+ELIDED = "\n[... {n} more characters left out to keep the conversation short; read or run it again if needed]"
+
+
+def _cut(text, keep: int = KEPT_CHARS):
+    if not isinstance(text, str) or len(text) <= keep + len(ELIDED) + 20 or ELIDED[:20] in text:
+        return text
+    return text[:keep] + ELIDED.format(n=len(text) - keep)
+
+
+def _written(args) -> None:
+    """A Write call's content, in place: the file holds it now."""
+    if isinstance(args, dict) and isinstance(args.get("content"), str) and len(args["content"]) > KEPT_CHARS * 2:
+        args["content"] = _cut(args["content"])
+
+
+def compact(history: list | None) -> bool:
+    """Shorten an over-long tool-loop history in place (OpenAI-compatible, Anthropic or Gemini
+    messages). True if it changed."""
+    if not history or len(json.dumps(history, ensure_ascii=False)) < COMPACT_AT:
+        return False
+    results = []  # (container, key) of every tool result, oldest first
+    for message in history:
+        if message.get("role") == "tool":
+            results.append((message, "content"))
+        for block in message.get("content") if isinstance(message.get("content"), list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                results.append((block, "content"))
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                _written(block.get("input"))
+        for part in message.get("parts") or []:
+            if isinstance(part, dict) and isinstance((part.get("functionResponse") or {}).get("response"), dict):
+                results.append((part["functionResponse"]["response"], "result"))
+            if isinstance(part, dict) and "functionCall" in part:
+                _written(part["functionCall"].get("args"))
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            try:
+                args = json.loads(function.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(args, dict) and isinstance(args.get("content"), str) and len(args["content"]) > KEPT_CHARS * 2:
+                _written(args)
+                function["arguments"] = json.dumps(args, ensure_ascii=False)
+    for container, key in results[:-KEEP_RESULTS] if len(results) > KEEP_RESULTS else []:
+        container[key] = _cut(container[key])
+    return True
+
+
 def _turns(turn: int, limit: Optional[int]) -> int:
     return turn if limit is None else min(turn, limit)
 
@@ -386,6 +440,7 @@ class ProviderRegistry:
                 final = bool(agent) and limit is not None and turn > limit
                 if spend_ok and not spend_ok(model_id, total_in, total_out):
                     raise BudgetExceeded("已达到任务可用的预算，模型调用被中止。")
+                compact(state.get("history"))
                 try:
                     text, calls, used_in, used_out, truncated = await stepped(state)
                 except ProviderError as exc:

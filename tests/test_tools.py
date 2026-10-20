@@ -125,3 +125,48 @@ async def test_a_review_searches_only_what_it_may_read(tmp_path):
     assert found == "src/app.py"
     assert (await review.call("Bash", {"command": "ls"})).startswith("Error: review workspace is read-only")
     assert asyncio.iscoroutinefunction(review.run_all)
+
+
+async def test_a_steps_reasoning_effort_follows_its_difficulty(database):
+    """Thinking as hard as possible on every turn of an easy step only makes it slower."""
+    from super_partner.executor import Executor
+    from super_partner.providers import ProviderResult
+    from test_leading import MODELS
+
+    asked = []
+
+    class Provider:
+        def configured_models(self, ids):
+            return set(ids)
+
+        async def complete(self, model_id, prompt, workspace=None, **kwargs):
+            asked.append(kwargs.get("effort"))
+            return ProviderResult("做完了", 0, 0, model_id)
+
+    run = database.get_run("r")
+    run.plan.nodes[0].difficulty = "easy"
+    database.save_run(run)
+    await Executor(database, Provider(), MODELS).execute("r")
+    assert asked[0] == "low"
+
+
+def test_a_long_tool_loop_history_is_shortened_once_past_the_limit():
+    import json
+
+    from super_partner import providers
+
+    big = "x" * 30_000
+    write = {"id": "w", "type": "function", "function": {"name": "Write", "arguments": json.dumps(
+        {"file_path": "a.sv", "content": big})}}
+    history = [{"role": "user", "content": "task"}, {"role": "assistant", "content": None, "tool_calls": [write]}]
+    history += [{"role": "tool", "tool_call_id": f"c{i}", "content": f"result {i} " + big} for i in range(10)]
+    assert not providers.compact(history[:4])  # short histories stay as they are
+    assert providers.compact(history)
+    contents = [message["content"] for message in history if message.get("role") == "tool"]
+    assert all(len(text) < 600 and "left out" in text for text in contents[:4])
+    assert all(len(text) > 30_000 for text in contents[4:])  # the last ones stay whole
+    args = json.loads(history[1]["tool_calls"][0]["function"]["arguments"])
+    assert args["file_path"] == "a.sv" and "left out" in args["content"] and len(args["content"]) < 600
+    before = json.dumps(history)
+    providers.compact(history)
+    assert json.dumps(history) == before or len(json.dumps(history)) <= len(before)

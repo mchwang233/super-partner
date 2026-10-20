@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # run a task's steps or lead it: glm-5.3-flash leaves tool-calling requests unanswered.
     helper_only_models: list[str] = Field(default_factory=lambda: ["glm:glm-5.3-flash"])
     deepseek_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] = "max"
+    # A step's reasoning effort by its difficulty: thinking hard on every turn of an easy step only
+    # makes it slower. Calls outside steps (reviews, summaries) use deepseek_reasoning_effort.
+    reasoning_by_difficulty: dict[str, str] = Field(default_factory=lambda: {"easy": "low", "normal": "medium", "hard": "max"})
     # Seconds to wait for one API response; long outputs take minutes to generate.
     api_request_timeout: float = Field(default=600, ge=30)
     # A response not complete after this many seconds, even if data keeps arriving, fails at
