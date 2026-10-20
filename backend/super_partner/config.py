@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     # needs strace). All other network access stays blocked.
     # Needs socat.
     sandbox_host_ports: list[int] = []
+    # Shell scripts every step command sources first, e.g. an EDA tool setup that puts vcs on PATH
+    # and sets license variables. A machine's own scripts can also be recorded in
+    # .super-partner/tools/sandbox.json as "profiles" (environment.profiles).
+    sandbox_profiles: list[str] = []
     # Host environment variables copied into that sandbox, e.g. VCS_HOME or
     # SNPSLMD_LICENSE_FILE. Listing PATH replaces the sandbox's minimal PATH with the host's.
     sandbox_env: list[str] = []

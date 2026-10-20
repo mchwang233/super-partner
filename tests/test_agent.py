@@ -31,8 +31,9 @@ def command_workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "sandbox_env", [])
     monkeypatch.setattr(agent, "sandbox_ports", list)
     monkeypatch.setattr(agent, "network_available", lambda: False)
-    # Never load the machine's actual EDA setup in these tests.
-    monkeypatch.setattr(environment, "EDA_PROFILE", root / "absent.edarc", raising=False)
+    # Never load this machine's own scripts in these tests.
+    monkeypatch.setattr(settings, "sandbox_profiles", [])
+    monkeypatch.setattr(environment, "_overrides", dict)
     return agent.Workspace(root, network=True)
 
 
@@ -57,7 +58,7 @@ async def test_commands_load_eda_profile_before_running_tools(command_workspace,
         "export SNPSLMD_LICENSE_FILE=27000@license.test\n"
         "export LM_LICENSE_FILE=\"$SNPSLMD_LICENSE_FILE\"\n"
     )
-    monkeypatch.setattr(environment, "EDA_PROFILE", profile)
+    monkeypatch.setattr(settings, "sandbox_profiles", [str(profile), str(eda / "absent.sh")])
     monkeypatch.setenv("OPENAI_API_KEY", "should-not-reach-the-command")
     output = await ws.call("run_command", {"command": (
         "vcs && urg && verdi && echo license=$LM_LICENSE_FILE; "
@@ -657,3 +658,18 @@ async def test_five_turns_before_the_limit_the_model_is_told_to_wrap_up(tmp_path
 async def test_a_model_that_keeps_calling_tools_after_the_limit_fails_with_the_turn_limit(tmp_path, monkeypatch):
     with pytest.raises(ProviderError, match="在 2 轮工具调用后仍未完成"):
         await run_turns(tmp_path, monkeypatch, max_turns=2, answer_at=99)
+
+
+
+def test_profiles_come_from_the_setting_and_the_machines_record(monkeypatch):
+    """Which scripts commands load is this machine's business: none by default, then the setting
+    and the recorded sandbox.json, each once; the instructions name them only when there are some."""
+    monkeypatch.setattr(settings, "sandbox_profiles", [])
+    monkeypatch.setattr(environment, "_overrides", dict)
+    assert environment.profiles() == [] and environment.shell_setup() == ""
+    assert "Commands first load" not in agent.agent_instructions()
+    monkeypatch.setattr(settings, "sandbox_profiles", ["/opt/tools/setup.sh"])
+    monkeypatch.setattr(environment, "_overrides", lambda: {"profiles": ["/eda/env.sh", "/opt/tools/setup.sh", 3]})
+    assert environment.profiles() == ["/opt/tools/setup.sh", "/eda/env.sh"]
+    assert "if [ -r /eda/env.sh ]; then . /eda/env.sh" in environment.shell_setup()
+    assert "Commands first load /opt/tools/setup.sh, /eda/env.sh" in agent.agent_instructions()

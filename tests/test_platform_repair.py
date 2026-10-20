@@ -360,3 +360,20 @@ def test_source_symlinks_cannot_escape_the_repair(tmp_path, source_checkout):
     (source_checkout / "backend/linked.py").symlink_to(external)
     with pytest.raises(platform.RepairError, match="符号链接"):
         platform.source_files(source_checkout)
+
+
+def test_every_platform_change_is_given_the_platform_rules():
+    """Repairs and components alike get the limits on changing Super Partner: no facts about one
+    machine in its source, the sandbox closed by default, no git in the copy."""
+    from pathlib import Path
+
+    from super_partner.platform_repair import COMPONENT_GUIDES, REPAIR_GUIDES, repair_guide
+
+    root = Path(__file__).resolve().parents[1]
+    for names in (REPAIR_GUIDES, COMPONENT_GUIDES):
+        guide = repair_guide(root, names)
+        assert "<<< skills/platform-rules/SKILL.md >>>" in guide
+        assert "No facts about this machine in the source" in guide and "Do not use git" in guide
+        assert not guide.startswith("---")
+    # The map stays second: diagnosis prompts point to it by position.
+    assert REPAIR_GUIDES[1] == "docs/ARCHITECTURE.md"

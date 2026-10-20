@@ -31,9 +31,10 @@ SUFFIXES = {".py", ".ts", ".tsx", ".js", ".mjs", ".css", ".html", ".json", ".sh"
 PRIVATE = {"credentials.json", "secrets.json", ".env"}
 CHECK_TIMEOUT = 600
 # How to diagnose and repair the platform, and where its code is; given to every model that does.
-REPAIR_GUIDES = ("skills/platform-repair/SKILL.md", "docs/ARCHITECTURE.md")
+# The guide, the map, and the limits on any change to the platform (skills/platform-rules).
+REPAIR_GUIDES = ("skills/platform-repair/SKILL.md", "docs/ARCHITECTURE.md", "skills/platform-rules/SKILL.md")
 # How the platform engineer adds a component (engineer.py).
-COMPONENT_GUIDES = ("skills/platform-engineer/SKILL.md", "docs/ARCHITECTURE.md")
+COMPONENT_GUIDES = ("skills/platform-engineer/SKILL.md", "docs/ARCHITECTURE.md", "skills/platform-rules/SKILL.md")
 MAX_DIFF_CHARS = 60_000
 
 

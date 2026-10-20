@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Set by the sandbox itself, or would let a recorded value change what every command loads.
 RESERVED_ENV = {"PATH", "HOME", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LANG"}
-EDA_PROFILE = Path("/workspace/eda/.edarc")
 PROC = Path("/proc")
 LICENSE_MANAGER = "lmgrd"
 TCP_LISTEN = "0A"
@@ -288,11 +287,21 @@ def command_env(base: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def shell_setup() -> str:
-    """Load the installed EDA tools in the command's sandbox, with its sanitized environment.
+def profiles() -> list[str]:
+    """The scripts each step command sources first: the setting, then this machine's record."""
+    recorded = _overrides().get("profiles")
+    listed = [*settings.sandbox_profiles, *(recorded if isinstance(recorded, list) else [])]
+    return list(dict.fromkeys(str(item) for item in listed if isinstance(item, str) and item.strip()))
 
-    A non-interactive bash does not read this profile itself. Keep initialization in the
-    child shell: it must not run on the host or redirect the caller's stdout/stderr.
+
+def shell_setup() -> str:
+    """Source the configured profiles (``profiles``) in the command's sandbox, with its sanitized
+    environment; a missing one is skipped.
+
+    A non-interactive bash does not read a profile itself. Keep initialization in the child
+    shell: it must not run on the host or redirect the caller's stdout/stderr.
     """
-    profile = shlex.quote(str(EDA_PROFILE))
-    return f"if [ -r {profile} ]; then . {profile} || exit $?; fi\n"
+    lines = []
+    for profile in map(shlex.quote, profiles()):
+        lines.append(f"if [ -r {profile} ]; then . {profile} || exit $?; fi\n")
+    return "".join(lines)

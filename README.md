@@ -440,9 +440,9 @@ records environment variables and local ports (`{"env": {...}, "host_ports": [..
 sandboxed commands get. API models' sandbox mounts the folder read-only; CLIs get the same
 PATH, PYTHONPATH and variables. Anything that needs root becomes exact commands in the report.
 
-API step commands also load `/workspace/eda/.edarc` inside the sandbox when it is readable,
-so the installed Synopsys executables and license variables are available without a manual
-`source` in each call. `run_command` returns combined stdout/stderr, including output produced
+API step commands first source the scripts this machine lists (the `sandbox_profiles` setting,
+or `"profiles"` in `sandbox.json`), for example an EDA tool setup, so the tools and license
+variables it sets are available without a manual `source` in each call; none by default. `run_command` returns combined stdout/stderr, including output produced
 before a timeout. The working directory is writable and persists across calls. `/tmp`
 (`TMPDIR`) is writable but starts fresh for each command: create and use scratch files in
 one call, and keep files needed by later calls in the working directory. Other host paths

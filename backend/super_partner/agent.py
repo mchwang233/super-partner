@@ -5,7 +5,7 @@ its working directory and runs commands, the executor carries out each call and 
 result, until the model answers without calling a tool. File tools never leave the working
 directory; commands run under bubblewrap with the home folder hidden, no network, an empty
 environment (no API keys), and write access to the working directory and a fresh /tmp for
-each command. The installed /workspace/eda/.edarc is loaded inside the sandbox. Ports listed in
+each command. Scripts listed in ``sandbox_profiles`` (environment.profiles) are sourced first. Ports listed in
 ``sandbox_host_ports`` are the one way out: each is bridged in through a Unix socket, together
 with the vendor daemons of a license server listed by its lmgrd port (environment.py).
 A task that allows the network gets its own network namespace from pasta instead: the internet
@@ -93,7 +93,7 @@ TOOLS = [
             "Run a bash command in the working directory, in a sandbox without network access "
             "that can write to the working directory and a fresh /tmp for each command. "
             "Save files needed by later calls in the working directory; other host paths are read-only. "
-            "Loads /workspace/eda/.edarc if present. Returns exit code and combined stdout/stderr, "
+            "Loads the machine's configured environment scripts first. Returns exit code and combined stdout/stderr, "
             "including partial output on timeout."
         ),
         "parameters": {"type": "object", "properties": {
@@ -110,8 +110,7 @@ AGENT_INSTRUCTIONS = (
     "relative to the working directory. Commands can write to the working directory and /tmp. "
     "/tmp is empty at the start of each command: create temporary folders and use them in the same "
     "call; save files needed by later calls under the working directory. Other host paths are "
-    "read-only. Commands load /workspace/eda/.edarc if present, so installed EDA tools such as "
-    "vcs, urg and verdi can be called directly. Commands have no network access{ports}. When the work "
+    "read-only.{profiles} Commands have no network access{ports}. When the work "
     "is done, reply without calling a tool and summarize what you did and what you verified.{turns}"
 )
 NETWORK_NOTE = (
@@ -158,7 +157,12 @@ def sandbox_ports() -> list[int]:
 def agent_instructions(max_turns: int | None = None, network: bool = False) -> str:
     ports = sandbox_ports()
     note = f", except to local ports {', '.join(map(str, ports))} (host services such as a license server)" if ports else ""
-    text = AGENT_INSTRUCTIONS.format(ports=note, turns=TURN_NOTE.format(limit=max_turns) if max_turns else "\n\n" + BATCH_NOTE)
+    loaded = environment.profiles()
+    # Only when this machine set some up: then the tools they put on PATH can be called directly.
+    setup = (f" Commands first load {', '.join(loaded)}, so the tools they set up can be called directly."
+             if loaded else "")
+    text = AGENT_INSTRUCTIONS.format(ports=note, profiles=setup,
+                                     turns=TURN_NOTE.format(limit=max_turns) if max_turns else "\n\n" + BATCH_NOTE)
     return text.replace(f"network access{note}", NETWORK_NOTE.format(ports=note)) if network else text
 
 
