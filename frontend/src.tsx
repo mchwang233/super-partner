@@ -125,8 +125,8 @@ function stepOf(status:string):{at:number;problem:boolean}{
 function defaultTab(status:string,waiting=false):Tab{return waiting?"chat":status==="succeeded"||status==="incomplete"?"result":"progress"}
 /** What the task's conversation waits for you to answer, if anything: the lead's question, or a component to approve. */
 function waitingForYou(run:Run):string|null{
-  const question=(run.diagnoses??[]).find(item=>item.id===run.waiting_diagnosis_id&&(item.trigger==="lead"||item.trigger==="lead_repair"));
-  if(question)return `负责人在问你：${question.question||"需要你回复"}`;
+  const question=(run.diagnoses??[]).find(item=>item.id===run.waiting_diagnosis_id);
+  if(question)return `${question.trigger==="lead"||question.trigger==="lead_repair"?"负责人":"诊断"}在问你：${question.question||"需要你回复"}`;
   if(run.engineer_job_id)return "任务在等平台工程师的组件：请看过方案后批准";
   return null;
 }
@@ -173,6 +173,11 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "run.rework":(data,title)=>`${title(data.verifier)} 发现问题，第 ${data.round} 轮返工：${data.problems??""}`,
   "approval.required":data=>`暂停：${({budget_insufficient:"预算不足以启动下一步",budget_exceeded:"花费超过预算",interrupted:"服务重启打断了执行",user_paused:"你手动暂停了任务",quota_exhausted:"模型额度用完，且没有其它可用模型",model_unavailable:"模型服务不可用，且没有其它可用模型",diagnosis_unresolved:"诊断后仍无法自动解决，请查看诊断报告",decision_limit:"负责人决策次数已用完，等你查看后继续"} as Record<string,string>)[data.reason]??data.reason}`,
   "run.succeeded":data=>`任务完成，共花费 ${formatUsd(data.actual_cost_usd??0)}`,
+  "run.incomplete":data=>`任务结束，有 ${(data.unable??[]).length} 个步骤无法完成 · 共花费 ${formatUsd(data.actual_cost_usd??0)}`,
+  "run.cancelled":()=>"任务已取消",
+  "node.unable":(data,title)=>`${title(data.node_id)}：判定无法完成${data.reason?`（${data.reason}）`:""}`,
+  "run.engineer_joined":data=>`${data.origin==="lead"?"负责人":"你"}请平台工程师加入：${data.title??""}`,
+  "run.lead_message":data=>data.role==="user"?`你给负责人留言：${data.text??""}`:data.status==="failed"?"负责人没能回复":"负责人回复了留言",
   "run.failed":data=>`任务失败：${data.error??""}`,
   "run.published":data=>`已上传到 ${data.url}`,
   "run.diagnosis_started":(data,title)=>data.trigger==="auto"?`${data.model_id??"—"} 开始排查${data.node_id?`「${title(data.node_id)}」`:""}卡住的原因，并尝试修复环境`:`开始诊断${data.node_id?`（${title(data.node_id)}）`:""}，由 ${data.model_id??"—"} 分析`,
@@ -215,7 +220,7 @@ function TaskDetails({run,onNetwork}:{run:Run;onNetwork:SetNetwork}){
       <div><dt>工作位置</dt><dd>{run.project_dir?`📁 ${run.project_dir}`:"独立的临时工作区"}</dd></div>
       {run.created_at&&<div><dt>创建时间</dt><dd>{new Date(run.created_at).toLocaleString("zh-CN",{hour12:false})}</dd></div>}
     </dl>
-    <section><h5>事件记录</h5>{events.length?<ol className="event-log">{events.map(event=><li key={event.id} className={event.kind.replace(".","-")}><time>{new Date(event.created_at).toLocaleTimeString("zh-CN",{hour12:false})}</time><span>{EVENT_LABELS[event.kind]?.(event.data??{},title)??event.kind}</span></li>)}</ol>:<p className="empty">还没有事件。</p>}</section>
+    <section><h5>事件记录</h5>{events.length?<ol className="event-log">{events.map(event=><li key={event.id} className={event.kind.replace(".","-")}><time>{new Date(event.created_at).toLocaleTimeString("zh-CN",{hour12:false})}</time>{(text=><span title={text}>{text}</span>)(EVENT_LABELS[event.kind]?.(event.data??{},title)??event.kind)}</li>)}</ol>:<p className="empty">还没有事件。</p>}</section>
   </div>;
 }
 
@@ -237,7 +242,10 @@ type SetNetwork=(run:Run,allow:boolean)=>Promise<string|null>;
 
 function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,onCancel,onDelete,onOpenModel,onPause,onDiagnose,onReply,onAsk,onOpenEngineer,onChange,onNetwork,parent,onOpenRun}:{onAsk:(run:Run,text:string)=>Promise<string|null>;onOpenEngineer:(jobId:string)=>void;onNetwork:SetNetwork;onChange:(run:Run,prompt:string,budget:number,options:ChangeOptions)=>Promise<string|null>;parent?:Run;onOpenRun:(run:Run)=>void;run:Run|null;models:Model[];onOpenModel:(model:Model)=>void;onPause:(run:Run)=>Promise<string|null>;onDiagnose:(run:Run)=>Promise<string|null>;onReply:ReplyToDiagnosis;deletingId:string|null;cancellingId:string|null;onConfirm:(run:Run,budget:number)=>Promise<string|null>;onResume:(run:Run,budget:number)=>Promise<string|null>;onCancel:(run:Run)=>void;onDelete:(run:Run)=>void}) {
   const [budget,setBudget]=useState(run?.budget_usd??2),[error,setError]=useState(""),[busy,setBusy]=useState(false);
-  const waiting=run&&hasLead(run)?waitingForYou(run):null;
+  // The task's conversation: its lead, and diagnoses no lead ran or asked for.
+  const diagnoses=(run?.diagnoses??[]).filter(item=>item.trigger!=="lead"&&!leadRepairIds(run?.diagnoses).has(item.id));
+  const hasChat=!!run&&(hasLead(run)||diagnoses.length>0);
+  const waiting=run&&hasChat?waitingForYou(run):null;
   const [tab,setTab]=useState<Tab>(defaultTab(run?.status??"",!!waiting)),picked=useRef(false),[now,setNow]=useState(()=>Date.now());
   useEffect(()=>{setBudget(run?.budget_usd??2);setError("");picked.current=false;setTab(defaultTab(run?.status??"",!!waiting))},[run?.id]);
   // Follow the task's phase (e.g. jump to the result when it finishes) until the user picks a tab.
@@ -269,7 +277,7 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
         <span className={`pill ${run.status}`}>{run.waiting_diagnosis_id?"等待回复":run.maintenance_id?"平台修复生效中":statusLabel(run.status)}</span>
         {(run.status==="succeeded"||run.status==="incomplete")&&tab!=="result"&&<button type="button" className="primary" onClick={()=>pick("result")}>查看结果</button>}
         {canPause&&<button type="button" className="ghost" disabled={busy} onClick={()=>act(onPause)} title="不再启动新步骤；正在运行的步骤会跑完">暂停</button>}
-        {canDiagnose&&<button type="button" className="ghost" disabled={busy||diagnosing||!!run.maintenance_id} onClick={()=>act(onDiagnose)} title="排查原因；对已停止的失败步骤执行修复或切换模型，并在现有预算内继续">{diagnosing?"诊断中…":"诊断"}</button>}
+        {canDiagnose&&<button type="button" className="ghost" disabled={busy||diagnosing||!!run.maintenance_id} onClick={()=>{pick("chat");void act(onDiagnose)}} title="排查原因；对已停止的失败步骤执行修复或切换模型，并在现有预算内继续">{diagnosing?"诊断中…":"诊断"}</button>}
         {canCancelRun(run)&&<button type="button" className="danger" disabled={cancellingId!==null} onClick={()=>onCancel(run)}>{cancellingId===run.id?"取消中…":"取消任务"}</button>}
         <DeleteMissionButton mission={run} deletingId={deletingId} onDelete={onDelete}/>
       </div>
@@ -297,10 +305,10 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
     {error&&<div className="error" role="alert">{error}</div>}
     {run.error&&<div className="error">{run.error}</div>}
     {waiting&&tab!=="chat"&&<div className="chat-alert" role="status"><span>{waiting}</span><button type="button" className="primary" onClick={()=>pick("chat")}>去回复</button></div>}
-    {/* Diagnoses that run when no lead decides, or that the lead sends to repair something. */}
-    <DiagnosisPanel run={{...run,diagnoses:(run.diagnoses??[]).filter(item=>item.trigger!=="lead"&&!leadRepairIds(run.diagnoses).has(item.id))}} models={models} onReply={(id,body)=>onReply(run,id,body)}/>
-    <nav className="task-tabs" aria-label="任务内容">{([...(hasLead(run)?[["chat","对话"]]:[]),["progress","进度"],["result","结果"],["details","详情"]] as [Tab,string][]).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}{id==="chat"&&waiting&&<i className="tab-dot" title="在等你回复"/>}</button>)}</nav>
+    <nav className="task-tabs" aria-label="任务内容">{([...(hasChat?[["chat","对话"]]:[]),["progress","进度"],["result","结果"],["details","详情"]] as [Tab,string][]).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}{id==="chat"&&waiting&&<i className="tab-dot" title="在等你回复"/>}</button>)}</nav>
     {tab==="chat"&&hasLead(run)&&<LeadPanel apiBase={API} run={run} models={models} onReply={(id,body)=>onReply(run,id,body)} onAsk={(text=>onAsk(run,text)) satisfies AskLead} onOpenEngineer={onOpenEngineer}/>}
+    {/* Diagnoses that run when no lead decides, or that the lead sends to repair something. */}
+    {tab==="chat"&&<DiagnosisPanel run={{...run,diagnoses}} models={models} onReply={(id,body)=>onReply(run,id,body)}/>}
     {tab==="progress"&&<PlanView apiBase={API} runId={run.id} runStatus={run.status} nodes={nodes} parts={run.plan.parts} inProject={!!run.project_dir} models={models} onOpenProfile={onOpenModel} reworkRounds={run.rework_rounds}/>}
     {tab==="result"&&<ResultPage apiBase={API} run={run} embedded onChange={(prompt,budget,options)=>onChange(run,prompt,budget,options)}/>}
     {tab==="details"&&<TaskDetails run={run} onNetwork={onNetwork}/>}

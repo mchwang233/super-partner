@@ -385,6 +385,11 @@ pre.result-text{max-height:none}
 .task-facts dt{font-size:10px;color:var(--faint)}.task-facts dd{margin:2px 0 0;font-size:12.5px;overflow-wrap:anywhere}
 .event-log{list-style:none;margin:0;padding:0 0 0 12px;border-left:2px solid var(--line);display:grid;gap:7px;font-size:12px}
 .event-log time{display:inline-block;min-width:64px;color:var(--faint);font-variant-numeric:tabular-nums}
+.event-log li{position:relative;display:flex;gap:8px;align-items:baseline;line-height:1.55}
+.event-log li::before{content:"";position:absolute;left:-17px;top:.55em;width:8px;height:8px;border-radius:50%;background:var(--panel);border:2px solid var(--line)}
+.event-log li.run-succeeded::before{border-color:var(--accent);background:var(--accent)}
+.event-log li.node-failed::before,.event-log li.run-failed::before{border-color:var(--danger)}
+.event-log li span{flex:1;min-width:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .event-log li.node-failed,.event-log li.run-failed{color:var(--danger)}.event-log li.run-succeeded{color:var(--accent)}.event-log li.run-rework,.event-log li.approval-required{color:var(--warn)}
 .result-page.embedded{padding:0}
 .result-page.embedded .result-page-head{justify-content:flex-end}
@@ -677,27 +682,33 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .tab-dot{display:inline-block;width:7px;height:7px;margin-left:6px;border-radius:50%;background:var(--warn);vertical-align:middle}
 /* The conversation as a chat: avatars beside soft bubbles, the lead in green, the platform engineer
    in indigo, your messages on the right; no frame inside a bubble. */
-.lead-panel,.engineer-chat{--lead-bubble:light-dark(#f2f8f5,#121c19);--engineer-bubble:light-dark(#f3f4fe,#161a2c);--engineer-ink:light-dark(#4f46e5,#a5b4fc);--me-bubble:light-dark(#e8f1ff,#1a2840)}
-.lead-panel .diagnosis-head{padding:12px 16px;background:var(--panel-2);gap:12px}
+.dx-panel,.engineer-chat{--lead-bubble:light-dark(#f2f8f5,#121c19);--engineer-bubble:light-dark(#f3f4fe,#161a2c);--engineer-ink:light-dark(#4f46e5,#a5b4fc);--me-bubble:light-dark(#e8f1ff,#1a2840)}
+.dx-panel>.diagnosis-head{padding:12px 16px;background:var(--panel-2);gap:12px}
 .lead-who{display:inline-flex;align-items:center;gap:7px}
 .lead-who b{font-size:13.5px}
 .lead-who.engineer b{color:var(--engineer-ink)}
-.lead-panel .dx-thread,.engineer-chat .dx-thread{gap:14px;padding:18px 16px}
-.lead-panel .dx-ai,.engineer-chat .dx-ai{position:relative;margin-left:40px;padding:10px 14px 12px;border-radius:4px 14px 14px 14px;background:var(--lead-bubble)}
-.lead-panel .dx-ai>:not(.dx-meta),.engineer-chat .dx-ai>:not(.dx-meta){margin-left:0}
-.lead-panel .dx-ai .dx-avatar,.engineer-chat .dx-ai .dx-avatar{position:absolute;left:-40px;top:0;width:30px;height:30px;font-size:15px;box-shadow:0 1px 2px light-dark(#1c243014,#0006)}
-.lead-panel .dx-ai .dx-meta,.engineer-chat .dx-ai .dx-meta{margin-bottom:5px}
-.lead-panel .lead-engineer-msg,.engineer-chat .lead-engineer-msg{background:var(--engineer-bubble)}
-.lead-panel .lead-engineer-msg .dx-meta b,.engineer-chat .lead-engineer-msg .dx-meta b{color:var(--engineer-ink)}
+.dx-panel .dx-thread,.engineer-chat .dx-thread{gap:14px;padding:18px 16px}
+.dx-panel .dx-ai,.engineer-chat .dx-ai{position:relative;margin-left:40px;padding:10px 14px 12px;border-radius:4px 14px 14px 14px;background:var(--lead-bubble)}
+.dx-panel .dx-ai>:not(.dx-meta),.engineer-chat .dx-ai>:not(.dx-meta){margin-left:0}
+.dx-panel .dx-ai .dx-avatar,.engineer-chat .dx-ai .dx-avatar{position:absolute;left:-40px;top:0;width:30px;height:30px;font-size:15px;box-shadow:0 1px 2px light-dark(#1c243014,#0006)}
+.dx-panel .dx-ai .dx-meta,.engineer-chat .dx-ai .dx-meta{margin-bottom:5px}
+.dx-panel .lead-engineer-msg,.engineer-chat .lead-engineer-msg{background:var(--engineer-bubble)}
+.dx-panel .lead-engineer-msg .dx-meta b,.engineer-chat .lead-engineer-msg .dx-meta b{color:var(--engineer-ink)}
 .engineer-avatar{background:light-dark(#e0e7ff,#262c4d)}
-.lead-panel .dx-report .markdown-body,.engineer-chat .dx-report .markdown-body{padding:0;background:none;border:0;font-size:13.5px;line-height:1.7}
-.lead-panel .lead-verdict{line-height:1.7}
-.lead-panel .dx-user,.engineer-chat .dx-user{max-width:min(600px,80%);padding:10px 14px;border:0;border-radius:14px 14px 4px 14px;background:var(--me-bubble)}
-.lead-panel .lead-instructions p{background:var(--panel)}
-.lead-panel .lead-repair,.engineer-chat .lead-repair{background:var(--panel);border-color:var(--line-soft)}
-.lead-panel .engineer-card,.engineer-chat .engineer-card{margin-left:40px;border-radius:12px;padding:10px 14px;border-color:light-dark(#c7d2fe,#3a4570)}
-.lead-panel .engineer-system,.engineer-chat .engineer-system{margin:0}
-.lead-panel .dx-composer.compact,.engineer-chat .dx-composer.compact{margin:6px 0 0;padding:0;border:0;background:none}
-.lead-panel .dx-input,.engineer-chat .dx-input{border-radius:14px;box-shadow:0 2px 10px light-dark(#1c24300f,#0005)}
-.lead-panel .dx-input-bar button,.engineer-chat .dx-input-bar button{border-radius:999px;padding:6px 16px}
-.lead-panel .dx-composer:not(.compact){margin-left:40px}
+.dx-panel .dx-report .markdown-body,.engineer-chat .dx-report .markdown-body{padding:0;background:none;border:0;font-size:13.5px;line-height:1.7}
+.dx-panel .lead-verdict{line-height:1.7}
+.dx-panel .dx-user,.engineer-chat .dx-user{max-width:min(600px,80%);padding:10px 14px;border:0;border-radius:14px 14px 4px 14px;background:var(--me-bubble)}
+.dx-panel .lead-instructions p{background:var(--panel)}
+.dx-panel .lead-repair,.engineer-chat .lead-repair{background:var(--panel);border-color:var(--line-soft)}
+.dx-panel .engineer-card,.engineer-chat .engineer-card{margin-left:40px;border-radius:12px;padding:10px 14px;border-color:light-dark(#c7d2fe,#3a4570)}
+.dx-panel .engineer-system,.engineer-chat .engineer-system{margin:0}
+.dx-panel .dx-composer.compact,.engineer-chat .dx-composer.compact{margin:6px 0 0;padding:0;border:0;background:none}
+.dx-panel .dx-input,.engineer-chat .dx-input{border-radius:14px;box-shadow:0 2px 10px light-dark(#1c24300f,#0005)}
+.dx-panel .dx-input-bar button,.engineer-chat .dx-input-bar button{border-radius:999px;padding:6px 16px}
+.dx-panel .dx-composer:not(.compact){margin-left:40px}
+
+.dx-panel .markdown-view .markdown-toggle{display:none}
+.dx-panel .markdown-view{padding:0}
+.catalog-sync-details{margin-top:10px}
+.catalog-sync-details>summary{cursor:pointer;font-size:12.5px;color:var(--accent);padding:4px 0}
+.catalog-sync-details[open]>summary{margin-bottom:10px}

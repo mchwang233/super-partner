@@ -1152,6 +1152,8 @@ test("diagnosis reply remains available for legacy reports without choices", asy
   delete run.diagnoses[0].question;
   run.diagnoses[0].verdict = "blocked";
   const context = await setup(t, [run], [], { openComposer: false });
+  // Not waiting for you, the conversation does not open by itself.
+  await context.click([...context.document.querySelectorAll(".task-tabs button")].find(node => node.textContent.startsWith("对话")));
   assert.equal(context.document.querySelectorAll('.diagnosis-choices input').length, 0);
   await fillDiagnosisReply(context, "这个权限已经配置好了，请继续检查。");
   await context.click(context.button("发送并继续诊断"));
