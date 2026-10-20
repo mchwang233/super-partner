@@ -93,7 +93,7 @@ export function EngineerEntry({ job, message, first, last, act, onOpenEngineer }
           <div className="dx-report"><MarkdownView text={message.text} /></div>
         </article>
       : message.role === "engineer"
-        ? <article className="dx-msg dx-ai engineer-msg"><EngineerMeta note={`${kind} · ${job.title}`} at={message.created_at} />
+        ? <article className="dx-msg dx-ai lead-engineer-msg"><EngineerMeta note={`${kind} · ${job.title}`} at={message.created_at} />
             <Folded text={message.text} /></article>
         : <p className="engineer-system" role="note"><span>🛠 {job.title} · {message.text} · {when(message.created_at)}</span></p>;
   return <>{line}{last && <JobCard job={job} act={act} onOpenEngineer={onOpenEngineer} />}</>;

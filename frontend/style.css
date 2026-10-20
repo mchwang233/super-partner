@@ -638,7 +638,6 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .lead-invite{margin-left:auto;padding:4px 10px;font-size:12px}
 .lead-invite+.diagnosis-fold{margin-left:6px}
 .engineer-avatar{background:light-dark(#eef2ff,#1d2236)}
-.engineer-msg{border-left:2px solid light-dark(#c7d2fe,#3a4570);padding-left:10px}
 .engineer-system{display:flex;align-items:center;gap:10px;margin:4px 0;font-size:11px;color:var(--faint)}
 .engineer-system::before,.engineer-system::after{content:"";flex:1;height:1px;background:var(--line-soft)}
 .engineer-system span{max-width:80%;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
