@@ -5,7 +5,8 @@ its working directory and runs commands, the executor carries out each call and 
 result, until the model answers without calling a tool. File tools never leave the working
 directory; commands run under bubblewrap with the home folder hidden, no network, an empty
 environment (no API keys), and write access only to the working directory. Ports listed in
-``sandbox_host_ports`` are the one way out: each is bridged in through a Unix socket.
+``sandbox_host_ports`` are the one way out: each is bridged in through a Unix socket, together
+with the vendor daemons of a license server listed by its lmgrd port (environment.py).
 A task that allows the network gets its own network namespace from pasta instead: the internet
 is reachable, this machine's local services are not, except a local proxy the user relies on.
 """

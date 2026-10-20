@@ -56,7 +56,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Checking long attempts instead of turn limits and timeouts | `progress.py` | `check_prompt`, `parse`, `api_evidence`, `cli_evidence`, `Stopped`; the check itself is `Executor._progress_watch` (review.py) |
 | Per-request budget reservations | `budget.py` | `RequestBudget.reserve` |
 | Quota / outage detection and cooldown | `quota.py` | `QuotaTracker.classify`, `mark`, `exhausted` |
-| Shared machine fixes (tools dir, env) | `environment.py` | `tools_dir`, `command_env` |
+| Shared machine fixes (tools dir, env) | `environment.py` | `tools_dir`, `command_env`, `host_ports` (with `license_daemon_ports`: a license server's vendor daemons, from lmgrd's process tree in /proc, or for an lmgrd of another user by tracing `lmutil lmstat`: `_probe`, cached `PROBE_TTL`) |
 | Self-repair: isolated copy, checks, activation | `platform_repair.py` | `PlatformRepairs.prepare`, `check`, `load`, `stale`, `diff`, `activate`, `SOURCE_DIRS` |
 | Model catalog and benchmark scores | `catalog_sync.py`, `benchmarks.py`, `scoring.py` | `public_models`, `match_results`, `rescore` |
 | Results listing, ZIP, GitHub publish | `publish.py` | `SKIP`, `result_markdown` |

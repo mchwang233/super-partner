@@ -207,7 +207,13 @@ def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str,
         f"- npm packages: `npm install --prefix {tools}/node ...`, then symlink their binaries into {tools}/bin;",
         (f"- environment variables, and local TCP ports (such as a license server) that sandboxed "
          f"commands must reach, go in {tools}/sandbox.json: "
-         '`{"env": {"NAME": "value"}, "host_ports": [26585]}`; keep what is already there.'),
+         '`{"env": {"NAME": "value"}, "host_ports": [26585]}`; keep what is already there. '
+         "For a FlexLM license server list only lmgrd's port: the ports of its vendor daemons "
+         "(snpslmd, ...) are found and bridged automatically, from lmgrd's process tree or, when "
+         "lmgrd runs as another user, by tracing `lmutil lmstat` with strace (both must be on the "
+         "host's PATH or next to lmgrd). Only if that fails, pin the vendor daemon's port in the "
+         "license file (`VENDOR snpslmd PORT=27021`), restart lmgrd and add that port too, or ask "
+         "the user to."),
         ("The folder is mounted read-only into the sandbox at the same path, so symlinks to elsewhere "
          "under the home folder do not work there; copy or install into the folder instead."),
         ("Then check the repair the way the step will use it, e.g. run the tool by its name with PATH "

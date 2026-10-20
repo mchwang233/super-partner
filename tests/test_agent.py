@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import httpx
@@ -113,6 +114,149 @@ async def test_only_listed_host_ports_reach_the_sandbox(monkeypatch):
         import shutil
         shutil.rmtree(root, ignore_errors=True)
 
+
+
+def fake_proc(root, processes, tcp6=()):
+    """A /proc with ``processes``: (pid, name, parent pid, [listening ports][, uid]); ports in tcp6
+    go to net/tcp6. The uid defaults to 1000."""
+    header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+    rows = {"tcp": [header], "tcp6": [header]}
+    for pid, name, parent, ports, *owner in processes:
+        uid = owner[0] if owner else 1000
+        folder = root / str(pid)
+        (folder / "fd").mkdir(parents=True)
+        (folder / "stat").write_text(f"{pid} ({name}) S {parent} {pid} {pid} 0 -1 4194560\n")
+        (folder / "status").write_text(f"Name:\t{name}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+        (folder / "fd" / "0").symlink_to("/dev/null")
+        for fd, port in enumerate(ports, start=3):
+            inode = str(pid * 100 + fd)
+            (folder / "fd" / str(fd)).symlink_to(f"socket:[{inode}]")
+            table, address = ("tcp6", "00000000000000000000000000000000") if port in tcp6 else ("tcp", "0100007F")
+            rows[table].append(f"   0: {address}:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  {uid}        0 {inode}\n")
+            # A connection on the same port is not a listener.
+            rows[table].append(f"   1: {address}:{port:04X} 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  {uid}        0 9{inode}\n")
+    (root / "net").mkdir()
+    for table, lines in rows.items():
+        (root / "net" / table).write_text("".join(lines))
+    return root
+
+
+def test_vendor_daemon_ports_of_lmgrd_reach_the_sandbox(tmp_path, monkeypatch):
+    proc = fake_proc(tmp_path, [
+        (100, "lmgrd", 1, [26585]),
+        (101, "snpslmd", 100, [41237]),
+        (200, "python", 1, [8000]),
+    ])
+    monkeypatch.setattr(environment, "PROC", proc)
+    monkeypatch.setattr(settings, "sandbox_host_ports", [26585])
+    assert environment.host_ports() == [26585, 41237]
+    # The vendor daemon restarts on another port: the next command follows it.
+    (proc / "net" / "tcp").write_text((proc / "net" / "tcp").read_text().replace(f":{41237:04X} ", f":{43001:04X} "))
+    assert environment.host_ports() == [26585, 43001]
+
+
+def test_only_lmgrd_children_count(tmp_path, monkeypatch):
+    proc = fake_proc(tmp_path, [
+        (100, "lmgrd", 1, [26585]),
+        (101, "snpslmd", 100, [41237]),
+        (150, "snpslmd", 1, [41500]),
+        (200, "python", 1, [8000]),
+        (201, "worker", 200, [8001]),
+    ])
+    monkeypatch.setattr(environment, "PROC", proc)
+    monkeypatch.setattr(settings, "sandbox_host_ports", [8000])
+    assert environment.host_ports() == [8000]
+    monkeypatch.setattr(settings, "sandbox_host_ports", [26585])
+    assert environment.host_ports() == [26585, 41237]
+    assert environment.license_daemon_ports([], proc) == set()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every fd")
+def test_unreadable_daemon_fds_fall_back_to_listed_ports(tmp_path, monkeypatch, caplog):
+    proc = fake_proc(tmp_path / "proc", [(300, "lmgrd", 1, [26585], 0), (301, "snpslmd", 300, [41237], 0)])
+    monkeypatch.setattr(environment, "PROC", proc)
+    monkeypatch.setattr(environment, "_probes", {})
+    monkeypatch.setattr(settings, "sandbox_host_ports", [26585])
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))  # no strace or lmutil to probe with
+    (proc / "300" / "fd").chmod(0)
+    try:
+        with caplog.at_level("WARNING", logger="super_partner.environment"):
+            assert environment.host_ports() == [26585]
+    finally:
+        (proc / "300" / "fd").chmod(0o755)
+    assert "VENDOR snpslmd PORT=" in caplog.text
+
+
+def fake_tracer(folder, connects):
+    """strace and lmutil in ``folder``: strace prints connect() lines to the ports in the file
+    ``connects`` ("address port" per line) and counts its runs in ``runs``."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "connects").write_text(connects)
+    strace = folder / "strace"
+    strace.write_text(f"""#!/bin/sh
+echo run >> {folder}/runs
+while read address port; do
+  case "$address" in
+    *:*) echo "[pid 7] connect(3, {{sa_family=AF_INET6, sin6_port=htons($port), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, \\"$address\\", &sin6_addr), sin6_scope_id=0}}, 28) = 0" >&2 ;;
+    *) echo "connect(3, {{sa_family=AF_INET, sin_port=htons($port), sin_addr=inet_addr(\\"$address\\")}}, 16) = -1 EINPROGRESS" >&2 ;;
+  esac
+done < {folder}/connects
+""")
+    lmutil = folder / "lmutil"
+    lmutil.write_text("#!/bin/sh\n")
+    for tool in (strace, lmutil):
+        tool.chmod(0o755)
+    return lambda: len((folder / "runs").read_text().split()) if (folder / "runs").exists() else 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every fd")
+def test_root_lmgrd_vendor_daemons_are_found_by_tracing_lmstat(tmp_path, monkeypatch):
+    processes = [
+        (300, "lmgrd", 1, [26585], 0),
+        (301, "snpslmd", 300, [48457], 0),
+        (400, "sshd", 1, [2222], 0),       # root, but lmstat never connects to it
+        (500, "uvicorn", 1, [8000]),       # Super Partner itself, another user
+    ]
+    proc = fake_proc(tmp_path / "proc", processes)
+    for pid in (300, 301, 400):
+        (proc / str(pid) / "fd").chmod(0)
+    tools = tmp_path / "eda" / "bin"
+    runs = fake_tracer(tools, "127.0.0.53 53\n127.0.0.1 26585\n127.0.0.1 48457\n127.0.0.1 8000\n10.0.0.9 2222\n")
+    (proc / "300" / "cmdline").write_text(f"{tools}/lmgrd\0-c\0/opt/license.dat\0")
+    monkeypatch.setattr(environment, "PROC", proc)
+    monkeypatch.setattr(environment, "_probes", {})
+    monkeypatch.setattr(settings, "sandbox_host_ports", [26585])
+    # strace is on PATH; lmutil only next to lmgrd, found from its command line.
+    path = tmp_path / "path"
+    path.mkdir()
+    (path / "strace").symlink_to(tools / "strace")
+    monkeypatch.setenv("PATH", str(path))
+    try:
+        assert environment.host_ports() == [26585, 48457]
+        assert environment.host_ports() == [26585, 48457]
+        assert runs() == 1  # reused, not traced for every command
+
+        # snpslmd restarts on another port: the old one stops listening, so it is traced again.
+        tcp = proc / "net" / "tcp"
+        tcp.write_text(tcp.read_text().replace(f":{48457:04X} ", f":{50111:04X} "))
+        (tools / "connects").write_text("127.0.0.1 26585\n::1 50111\n")
+        assert environment.host_ports() == [26585, 50111]
+        assert runs() == 2
+
+        # And at the latest after PROBE_TTL.
+        monkeypatch.setattr(environment, "PROBE_TTL", 0)
+        assert environment.host_ports() == [26585, 50111]
+        assert runs() == 3
+    finally:
+        for pid in (300, 301, 400):
+            (proc / str(pid) / "fd").chmod(0o755)
+
+
+def test_tcp6_listeners_are_found(tmp_path, monkeypatch):
+    proc = fake_proc(tmp_path, [(100, "lmgrd", 1, [26585]), (101, "snpslmd", 100, [41237])], tcp6={26585, 41237})
+    monkeypatch.setattr(environment, "PROC", proc)
+    monkeypatch.setattr(settings, "sandbox_host_ports", [26585])
+    assert environment.host_ports() == [26585, 41237]
 
 
 @needs_bwrap

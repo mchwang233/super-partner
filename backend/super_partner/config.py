@@ -53,8 +53,10 @@ class Settings(BaseSettings):
     # once without a retry: its model counts as unavailable for a while, and another takes over.
     api_reply_deadline: float = Field(default=300, ge=30)
     # Local TCP ports that API models' sandboxed commands may still reach, such as an EDA
-    # license server: lmgrd's port plus its vendor daemon's, which must be pinned in the license
-    # file (VENDOR snpslmd port=...). All other network access stays blocked. Needs socat.
+    # license server's lmgrd port; its vendor daemons' ports (snpslmd, ...) are found and added at
+    # each command (environment.license_daemon_ports; for a root lmgrd by tracing lmutil lmstat,
+    # needs strace). All other network access stays blocked.
+    # Needs socat.
     sandbox_host_ports: list[int] = []
     # Host environment variables copied into that sandbox, e.g. VCS_HOME or
     # SNPSLMD_LICENSE_FILE. Listing PATH replaces the sandbox's minimal PATH with the host's.
