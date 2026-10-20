@@ -512,7 +512,7 @@ class Engineering:
         if run.status in {RunStatus.RUNNING, RunStatus.QUEUED}:
             run.status = RunStatus.PAUSED
         run.engineer_job_id = job.id
-        run.error = "负责人请平台工程师添加一个组件。请在“平台工程师”页面看过方案后批准，组件生效后任务继续。"
+        run.error = "负责人请平台工程师添加一个组件。请在负责人对话里看过平台工程师的方案后批准，组件生效后任务继续。"
         return job
 
     def _record_platform_repair(self, run, diagnosis, node, problem: str, copy: dict) -> EngineerJob:

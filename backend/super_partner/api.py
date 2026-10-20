@@ -629,7 +629,7 @@ async def confirm_task(run_id: str, body: ConfirmTask):
     if run.waiting_diagnosis_id or run.maintenance_id:
         raise HTTPException(409, "请先回复诊断问题，或等待平台修复自动生效。")
     if run.engineer_job_id:
-        raise HTTPException(409, "任务在等平台工程师添加组件：请到“平台工程师”页面批准或放弃这项工作。")
+        raise HTTPException(409, "任务在等平台工程师添加组件：请在负责人对话里的平台工程师卡片上批准或放弃这项工作。")
     diagnosis = executor.diagnosing.get(run_id)
     if diagnosis and not diagnosis.done():
         raise HTTPException(409, "诊断或修复仍在进行，完成后会自动继续；也可以取消任务。")
@@ -787,7 +787,7 @@ async def resume_task(run_id: str, body: ConfirmTask):
     if run.waiting_diagnosis_id or run.maintenance_id:
         raise HTTPException(409, "请先回复诊断问题，或等待平台修复自动生效。")
     if run.engineer_job_id:
-        raise HTTPException(409, "任务在等平台工程师添加组件：请到“平台工程师”页面批准或放弃这项工作。")
+        raise HTTPException(409, "任务在等平台工程师添加组件：请在负责人对话里的平台工程师卡片上批准或放弃这项工作。")
     diagnosis = executor.diagnosing.get(run_id)
     if diagnosis and not diagnosis.done():
         raise HTTPException(409, "诊断或修复仍在进行，完成后会自动继续；也可以取消任务。")

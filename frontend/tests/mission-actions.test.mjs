@@ -1349,15 +1349,18 @@ function engineerJob(fields) {
     created_at: "2026-10-19T08:00:00Z", updated_at: "2026-10-19T08:00:00Z", ...fields };
 }
 
-test("the platform engineer page takes requests, shows finished work, and the user approves its plan", async t => {
-  const { state, document, click, act, window } = await setup(t, [mission("finished-task", "succeeded")], [], { openComposer: false });
-  state.engineer = { available: true, jobs: [engineerJob({}), engineerJob({ id: "job0", title: "修复状态", status: "applied", kind: "repair",
+test("the platform engineer page opens from a task's conversation, shows finished work, and takes approvals", async t => {
+  const run = mission("finished-task", "succeeded");
+  run.supervisor = { model_id: "cli:claude", calls: 1 };
+  const { state, document, click, act, window } = await setup(t, [run], [], { openComposer: false });
+  state.engineer = { available: true, jobs: [engineerJob({ run_id: "finished-task", messages: [{ role: "user", text: "加导出按钮", created_at: "2026-10-19T08:00:00Z" }] }),
+    engineerJob({ id: "job0", title: "修复状态", status: "applied", kind: "repair",
     report: "改好了", files: ["backend/super_partner/executor.py"], checks: ["Backend tests"], diff: "+fixed", commit: "abcdef1234" })] };
+  state.records[0] = { ...state.records[0], updated_at: "2026-10-19T08:00:01Z" };
   await act(async () => state.poll());
-  const nav = [...document.querySelectorAll(".app-nav button")].find(node => node.textContent.startsWith("平台工程师"));
-  // One job waits for the user.
-  assert.equal(nav.querySelector(".nav-badge").textContent, "1");
-  await click(nav);
+  // The engineer has no page of its own in the navigation: it works in tasks' conversations.
+  assert.equal([...document.querySelectorAll(".app-nav button")].some(node => node.textContent.startsWith("平台工程师")), false);
+  await click([...document.querySelectorAll(".lead-panel button")].find(node => node.textContent === "在平台工程师页面查看"));
   const page = document.querySelector(".engineer-page");
   assert.match(page.querySelector(".engineer-job").textContent, /方案待批准.*结果页可以导出 CSV/s);
   await click([...page.querySelectorAll("button")].find(node => node.textContent === "批准方案，开始实施"));
@@ -1453,4 +1456,44 @@ test("the lead's panel is a group chat the platform engineer joins, where its pl
   await click(button("拉它进来"));
   assert.deepEqual(state.engineerActions.at(-1), { path: "/api/tasks/chat-task/engineer", body: { request: "加一个 EDA 许可证检查", kind: "component" } });
   assert.equal(panel().querySelector(".engineer-join"), null);
+});
+
+test("a bubble in the corner opens a chat with the platform engineer, for answers and new requests", async t => {
+  const run = mission("chip-task", "succeeded");
+  const { state, document, click, act, window } = await setup(t, [run], [], { openComposer: false });
+  state.engineer = { available: true, jobs: [
+    engineerJob({ id: "job1", run_id: "chip-task", title: "放行许可证端口", status: "plan_ready", updated_at: "2026-10-20T06:41:00Z",
+      messages: [{ role: "lead", text: "让沙箱连许可证端口", created_at: "2026-10-20T06:40:00Z" },
+                 { role: "engineer", text: "方案写好了，请看过后批准。", created_at: "2026-10-20T06:41:00Z" }] }),
+    engineerJob({ id: "job0", title: "修复状态", status: "applied", kind: "repair", updated_at: "2026-10-19T08:00:00Z",
+      messages: [{ role: "user", text: "暂停后一直显示排队中", created_at: "2026-10-19T08:00:00Z" }] }),
+  ] };
+  state.records[0] = { ...state.records[0], updated_at: "2026-10-20T06:41:01Z" };
+  await act(async () => state.poll());
+  const bubble = document.querySelector(".engineer-bubble");
+  assert.equal(bubble.querySelector(".engineer-bubble-badge").textContent, "1");
+  await click(bubble);
+  const chat = () => document.querySelector(".engineer-chat");
+  // Every job's thread, oldest first, saying where it came from; the waiting one has its card.
+  assert.match(chat().textContent, /在这里提出 · 修复状态.*暂停后一直显示排队中.*来自任务「chip-task」 · 放行许可证端口.*方案写好了.*方案待批准/s);
+  const box = chat().querySelector('[aria-label="给平台工程师的消息"]');
+  const type = async value => act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(box, value);
+    box.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  // By default a message answers the job waiting for the user.
+  assert.match(chat().querySelector(".engineer-chat-target").textContent, /回复：放行许可证端口/);
+  await type("只放行 26585");
+  await click([...chat().querySelectorAll("button")].find(node => node.textContent === "发送"));
+  assert.deepEqual(state.engineerActions.at(-1), { path: "/api/engineer/jobs/job1/reply", body: { text: "只放行 26585" } });
+  // Or it starts a new request; asking for something new is a component.
+  state.engineer.jobs[0].status = "plan_ready";
+  state.records[0] = { ...state.records[0], updated_at: "2026-10-20T06:42:00Z" };
+  await act(async () => state.poll());
+  await click([...chat().querySelectorAll("button")].find(node => node.textContent === "改为提新需求"));
+  await type("给结果页加一个导出 PDF 的功能");
+  await click([...chat().querySelectorAll("button")].find(node => node.textContent === "发送"));
+  assert.deepEqual(state.engineerActions.at(-1), { path: "/api/engineer/jobs", body: { request: "给结果页加一个导出 PDF 的功能", kind: "component" } });
+  await click(document.querySelector('[aria-label="关闭平台工程师聊天"]'));
+  assert.equal(chat(), null);
 });

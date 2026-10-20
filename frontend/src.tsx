@@ -9,7 +9,8 @@ import { MarkdownView } from "./markdown";
 import { DiagnosisPanel, type Diagnosis } from "./diagnosis";
 import { LeadPanel, hasLead, leadRepairIds, type AskLead, type Decision, type LeadMessage, type LeadThinking } from "./lead";
 import { ProjectField, rememberProject } from "./project-picker";
-import { EngineerPage, waitingJobs, type EngineerJob } from "./engineer";
+import { EngineerPage } from "./engineer";
+import { EngineerBubble } from "./engineer-bubble";
 import { canCancelMission, canDeleteMission, CancelMissionDialog, DeleteMissionButton, DeleteMissionDialog, formatUsd, MissionHistory, needsAttention, statusLabel } from "./mission-history";
 import "./style.css";
 
@@ -155,7 +156,7 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "run.decision":(data,title)=>`负责人决定${data.node_id?`（${title(data.node_id)}）`:""}：${({retry:"按要求重试",switch_model:`换成 ${data.model_id??"其它模型"}`,accept:"接受当前结果",unable:"判定无法完成",ask_user:"需要问你",repair_environment:"修复环境",repair_platform:"修复 Super Partner",request_component:"请平台工程师添加组件",rework:`返工 ${(data.targets??[]).map(title).join("、")}`,replan:"调整计划",done:"确认任务完成",fallback:"暂时无法决策，交给诊断"} as Record<string,string>)[data.action]??data.action}${data.reason?` · ${data.reason}`:""}`,
   "run.plan_changed":data=>`负责人调整了计划：${[data.added?.length?`新增 ${data.added.join("、")}`:"",data.removed?.length?`删除 ${data.removed.join("、")}`:"",data.updated?.length?`修改 ${data.updated.join("、")}`:""].filter(Boolean).join("；")}`,
   "run.lead_thinking":(data,title)=>`负责人开始判断${data.node_id?`（${title(data.node_id)}）`:""}：${({attempt_failed:"尝试失败后怎么处理",verify_failed:"验证没通过是否返工",user_answer:"根据你的回答下一步做什么",all_done:"整体结果是否满足需求",repair_done:"修复是否真的生效",engineer_done:"平台工程师的结果如何处理",overrun:"超出预计轮数是否继续"} as Record<string,string>)[data.event]??data.event}`,
-  "run.engineer_requested":(data,title)=>`负责人请平台工程师添加组件${data.node_id?`（${title(data.node_id)}）`:""}，等你在“平台工程师”页面批准方案`,
+  "run.engineer_requested":(data,title)=>`负责人请平台工程师添加组件${data.node_id?`（${title(data.node_id)}）`:""}，等你在负责人对话里批准方案`,
   "run.lead_changed":data=>`负责人换成 ${data.model_id}${data.previous_model_id?`（原为 ${data.previous_model_id}）`:""}`,
   "node.succeeded":(data,title)=>`${title(data.node_id)}：完成`,
   "node.overrun_check":(data,title)=>data.stop?`${title(data.node_id)}：已用 ${data.turns} 轮（预计 ${data.expected} 轮），负责人停止了这次尝试（${data.reason??""}）`:`${title(data.node_id)}：已用 ${data.turns} 轮（预计 ${data.expected} 轮），负责人判断仍在推进，继续执行`,
@@ -304,7 +305,7 @@ const NOTICE: Record<string,{text:string;tone:Toast["tone"]}> = {
 
 function App() {
   const [runs,setRuns]=useState<Run[]>([]),[models,setModels]=useState<Model[]>([]),[providerList,setProviderList]=useState<Provider[]>([]);
-  const [view,setView]=useState<"missions"|"models"|"engineer">("missions"),[engineerFocus,setEngineerFocus]=useState<string|null>(null),[engineerWaiting,setEngineerWaiting]=useState(0),[selectedModelId,setSelectedModelId]=useState("");
+  const [view,setView]=useState<"missions"|"models"|"engineer">("missions"),[engineerFocus,setEngineerFocus]=useState<string|null>(null),[selectedModelId,setSelectedModelId]=useState("");
   const [selected,setSelected]=useState<Run|null>(null),[selectedProvider,setSelectedProvider]=useState<Provider|null>(null),[prompt,setPrompt]=useState(""),[budget,setBudget]=useState(2),[useCli,setUseCli]=useState(true),[allowNetwork,setAllowNetwork]=useState(false),[busy,setBusy]=useState(false),[projectDir,setProjectDir]=useState(savedProjectDir);
   const [formError,setFormError]=useState(""),[offline,setOffline]=useState(false);
   const attachments=useAttachments(API),[dragging,setDragging]=useState(false);
@@ -320,11 +321,9 @@ function App() {
   const [quota,setQuota]=useState<Quota[]>([]);
   // Separate from the main load: an older API without this route must not look offline.
   const loadQuota=async(init?:RequestInit,path="")=>{try{const r=await fetch(`${API}/api/models/quota${path}`,init);if(r.ok)setQuota(await r.json())}catch{}};
-  // How many platform engineer jobs wait for the user, for the badge; an older API has no route.
-  const loadEngineer=async()=>{try{const r=await fetch(`${API}/api/engineer`);if(r.ok)setEngineerWaiting(waitingJobs(((await r.json()).jobs??[]) as EngineerJob[]))}catch{}};
   const load=async(withModels=true)=>{
     const revision=loadRevision.current;
-    void loadQuota();void loadEngineer();
+    void loadQuota();
     try{
       const urls=[`${API}/api/tasks`,...(withModels?[`${API}/api/models`,`${API}/api/providers`]:[])];
       const data=await Promise.all((await Promise.all(urls.map(url=>fetch(url)))).map(r=>r.json()));
@@ -442,7 +441,7 @@ function App() {
   function configureModel(model:Model){setSelectedProvider(providerList.find(provider=>provider.id===model.provider)||null)}
   return <main className={view==="models"?"profiles-view":undefined}>
     {quota.length>0&&<QuotaBanner quota={quota} models={models} onReset={id=>loadQuota({method:"DELETE"},`/${encodeURIComponent(id)}`)}/>}
-    <header><div><span className="logo">SP</span><h1>Super Partner</h1></div><div className="header-actions"><button type="button" className="primary new-task" aria-expanded={view==="missions"&&composerOpen} onClick={()=>{setView("missions");setComposerOpen(open=>view!=="missions"||!open);window.scrollTo({top:0})}}>＋ 新任务</button><nav className="app-nav" aria-label="页面导航"><button aria-pressed={view==="missions"} onClick={()=>setView("missions")}>任务工作台</button><button aria-pressed={view==="engineer"} onClick={()=>{setEngineerFocus(null);setView("engineer")}} title="修复 Super Partner 自身，或给它添加组件">平台工程师{engineerWaiting>0&&<span className="nav-badge" title="等你处理">{engineerWaiting}</span>}</button><button aria-pressed={view==="models"} onClick={()=>setView("models")}>模型画像<span>{models.length}</span></button></nav><ThemeSwitch/></div></header>
+    <header><div><span className="logo">SP</span><h1>Super Partner</h1></div><div className="header-actions"><button type="button" className="primary new-task" aria-expanded={view==="missions"&&composerOpen} onClick={()=>{setView("missions");setComposerOpen(open=>view!=="missions"||!open);window.scrollTo({top:0})}}>＋ 新任务</button><nav className="app-nav" aria-label="页面导航"><button aria-pressed={view==="missions"} onClick={()=>setView("missions")}>任务工作台</button><button aria-pressed={view==="models"} onClick={()=>setView("models")}>模型画像<span>{models.length}</span></button></nav><ThemeSwitch/></div></header>
     {offline&&<p className="offline" role="status">无法连接本地 API（{API}），正在重试…</p>}
     {view==="engineer"?<EngineerPage apiBase={API} runs={runs} focusId={engineerFocus} onOpenRun={id=>{const run=runs.find(item=>item.id===id);if(run){autoSelected.current=true;setSelected(run);setView("missions")}}}/>:view==="models"?<ModelProfiles apiBase={API} models={models} selectedId={selectedModelId} onSelect={setSelectedModelId} onToggle={toggleModel} onConfigure={configureModel}/>:<>
     <div className={`workbench ${historyCollapsed?"history-collapsed":""}`}>
@@ -469,6 +468,8 @@ function App() {
     {deleteTarget&&<DeleteMissionDialog mission={deleteTarget} pending={deletingRunId===deleteTarget.id} error={deleteError} onCancel={closeDeleteDialog} onConfirm={()=>deleteRun(deleteTarget)}/>}
     {cancelTarget&&<CancelMissionDialog mission={cancelTarget} pending={cancellingRunId===cancelTarget.id} error={cancelError} onCancel={closeCancelDialog} onConfirm={()=>cancelRun(cancelTarget)}/>}
     {selectedProvider&&<div className="modal-backdrop" onMouseDown={()=>setSelectedProvider(null)}><section className="provider-modal" role="dialog" aria-modal="true" aria-label={`配置 ${selectedProvider.name}`} onMouseDown={e=>e.stopPropagation()}><div className="modal-title"><div><p className="eyebrow">API 连接</p><h3>配置 {selectedProvider.name}</h3></div><button className="modal-close" onClick={()=>setSelectedProvider(null)} aria-label="关闭">×</button></div><p className="modal-note">Key 只会发送到本机 API，并保存在操作系统的密钥环中。</p><ProviderCard provider={selectedProvider} onChanged={async()=>{await load();const refreshed=(await (await fetch(`${API}/api/providers`)).json()) as Provider[];setSelectedProvider(refreshed.find(p=>p.id===selectedProvider.id)||null)}}/></section></div>}
+    <EngineerBubble apiBase={API} runs={runs} tick={runs.map(run=>`${run.id}:${run.updated_at??""}`).join("|")}
+      onOpenPage={id=>{setEngineerFocus(id);setView("engineer")}}/>
   </main>
 }
 createRoot(document.getElementById("root")!).render(<App/>);

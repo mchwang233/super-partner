@@ -13,13 +13,17 @@ export const MENTION = /^@平台工程师[\s:：,，]*/;
 
 export type Act = (path: string, body?: unknown) => Promise<string | null>;
 
-/** The task's engineer jobs, kept fresh while the task or any job is under way; ``signal`` changes
- * when the task does. */
-export function useEngineerJobs(apiBase: string, runId: string, signal: string, live: boolean) {
-  const [jobs, setJobs] = useState<EngineerJob[]>([]);
-  const load = useCallback(() => fetch(`${apiBase}/api/engineer?run_id=${encodeURIComponent(runId)}`)
+/** A task's engineer jobs (all jobs without ``runId``), kept fresh while ``live`` or any job is
+ * under way; ``signal`` changes when the task does. */
+export function useEngineerJobs(apiBase: string, runId: string | null, signal: string, live: boolean) {
+  const [jobs, setJobs] = useState<EngineerJob[]>([]), [available, setAvailable] = useState(true);
+  const load = useCallback(() => fetch(`${apiBase}/api/engineer${runId ? `?run_id=${encodeURIComponent(runId)}` : ""}`)
     .then(response => response.ok ? response.json() : null)
-    .then(data => { if (data && Array.isArray(data.jobs)) setJobs(data.jobs.filter((job: EngineerJob) => job.run_id === runId)); })
+    .then(data => {
+      if (!data || !Array.isArray(data.jobs)) return;
+      setJobs(runId ? data.jobs.filter((job: EngineerJob) => job.run_id === runId) : data.jobs);
+      setAvailable(data.available !== false);
+    })
     .catch(() => {}), [apiBase, runId]);
   useEffect(() => { load(); }, [load, signal]);
   const active = live || jobs.some(job => !ENGINEER_DONE.has(job.status));
@@ -43,7 +47,13 @@ export function useEngineerJobs(apiBase: string, runId: string, signal: string, 
       return failure instanceof Error ? failure.message : String(failure);
     }
   };
-  return { jobs, act };
+  return { jobs, act, available };
+}
+
+/** Whether a request asks for something new (a component) rather than a fix. */
+export function kindOf(text: string): "repair" | "component" {
+  return /添加|新增|增加|加一个|加个|支持|组件|功能|接入|集成/.test(text) && !/修复|修一下|报错|失败|不能|无法|连不上|bug/i.test(text)
+    ? "component" : "repair";
 }
 
 /** A message for the platform engineer (``@平台工程师 ...``): an answer to the job waiting for the

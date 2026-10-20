@@ -267,7 +267,7 @@ class Leading:
                     self.emit(run_id, "run.engineer_requested", node_id=node_id, job_id=job.id)
                 else:
                     self._mark_unable(run, node, f"这一步需要 Super Partner 新增能力，但平台工程师当前不可用：{instructions or reason}",
-                                      user_action="启用平台自修复后，可以在“平台工程师”页面提出这个需求。")
+                                      user_action="启用平台自修复后，可以在负责人对话里点“拉平台工程师进来”提出这个需求。")
             elif action == "ask_user":
                 question = Diagnosis(
                     id=uuid4().hex[:8], trigger="lead", node_id=node_id,
