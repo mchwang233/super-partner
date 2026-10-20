@@ -1,5 +1,5 @@
 import React, { FormEvent, useCallback, useEffect, useState } from "react";
-import { MarkdownView } from "./markdown";
+import { Markdown as MarkdownView } from "./markdown";
 import { UserMessage, when } from "./diagnosis";
 import { ENGINEER_STATUS, type EngineerJob, type EngineerMessage } from "./engineer";
 
@@ -10,6 +10,12 @@ export const ENGINEER_WAITING = new Set(["plan_ready", "ready", "needs_input"]);
 const ENGINEER_DONE = new Set(["applied", "failed", "rejected", "cancelled"]);
 const KIND = { repair: "修复", component: "组件" } as const;
 export const MENTION = /^@平台工程师[\s:：,，]*/;
+
+/** A job's title short enough for a line: up to its first stop, at most about 20 characters. */
+export function shortTitle(title: string): string {
+  const head = title.split(/[，。：:；;,.！？!?\n]/)[0].trim() || title;
+  return head.length > 22 ? `${head.slice(0, 20)}…` : head;
+}
 
 export type Act = (path: string, body?: unknown) => Promise<string | null>;
 
@@ -103,9 +109,9 @@ export function EngineerEntry({ job, message, first, last, act, onOpenEngineer }
           <div className="dx-report"><MarkdownView text={message.text} /></div>
         </article>
       : message.role === "engineer"
-        ? <article className="dx-msg dx-ai lead-engineer-msg"><EngineerMeta note={`${kind} · ${job.title}`} at={message.created_at} />
+        ? <article className="dx-msg dx-ai lead-engineer-msg"><EngineerMeta note={`${kind} · ${shortTitle(job.title)}`} at={message.created_at} />
             <Folded text={message.text} /></article>
-        : <p className="engineer-system" role="note"><span>🛠 {job.title} · {message.text} · {when(message.created_at)}</span></p>;
+        : <p className="engineer-system" role="note"><span>🛠 {shortTitle(job.title)} · {message.text} · {when(message.created_at)}</span></p>;
   return <>{line}{last && <JobCard job={job} act={act} onOpenEngineer={onOpenEngineer} />}</>;
 }
 
@@ -121,7 +127,7 @@ function JobCard({ job, act, onOpenEngineer }: { job: EngineerJob; act: Act; onO
   const open = !ENGINEER_DONE.has(job.status) && job.status !== "applying";
   return <div className={`lead-repair engineer-card ${job.status}`} aria-label={`平台工程师：${job.title}`}>
     <div className="lead-repair-head">
-      <b>平台工程师</b><span className="lead-model">{KIND[job.kind] ?? job.kind} · {job.title}</span>
+      <b>平台工程师</b><span className="lead-model" title={job.title}>{KIND[job.kind] ?? job.kind} · {shortTitle(job.title)}</span>
       <span className={`dx-chip ${status.tone}`}>{status.tone === "busy" && <i className="pulse" aria-hidden="true" />}{status.label}</span>
     </div>
     {job.status === "plan_ready" && job.plan && <details className="lead-instructions" open><summary>方案</summary><div className="dx-report"><MarkdownView text={job.plan} /></div></details>}

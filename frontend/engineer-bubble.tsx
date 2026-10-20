@@ -1,6 +1,6 @@
 import React, { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import { type EngineerJob } from "./engineer";
-import { ENGINEER_WAITING, EngineerEntry, kindOf, useEngineerJobs } from "./lead-engineer";
+import { ENGINEER_WAITING, EngineerEntry, kindOf, shortTitle, useEngineerJobs } from "./lead-engineer";
 
 type RunRef = { id: string; plan: { summary: string } };
 
@@ -57,7 +57,7 @@ export function EngineerBubble({ apiBase, runs, tick, onOpenPage }: {
         {!available && <p className="error">平台工程师不可用：平台自修复没有启用，或这里没有可编辑的 Super Partner 源码。</p>}
         {!threads.length && <p className="muted engineer-chat-empty">还没有工作记录。直接在下面说要修什么、加什么；修复通过检查后自动生效，组件先写方案给你批准。</p>}
         {threads.map(job => <div key={job.id} className="engineer-thread">
-          <p className="engineer-system" role="note"><span>{taskOf(job) ? `来自任务「${taskOf(job)}」` : "在这里提出"} · {job.title}</span></p>
+          <p className="engineer-system" role="note"><span>{taskOf(job) ? `来自任务「${taskOf(job)}」` : "在这里提出"} · {shortTitle(job.title)}</span></p>
           {(job.messages ?? []).map((message, index, all) => <EngineerEntry key={index} job={job} message={message} first={index === 0}
             last={index === all.length - 1} act={act} onOpenEngineer={onOpenPage} />)}
           {ENGINEER_WAITING.has(job.status) && replyTo?.id !== job.id &&
@@ -67,7 +67,7 @@ export function EngineerBubble({ apiBase, runs, tick, onOpenPage }: {
       </div>
       <form className="dx-composer compact engineer-chat-composer" onSubmit={submit} aria-label="给平台工程师留言">
         <div className="engineer-chat-target">
-          {replyTo ? <>回复：{replyTo.title}<button type="button" className="link" onClick={() => setTarget("new")}>改为提新需求</button></>
+          {replyTo ? <>回复：{shortTitle(replyTo.title)}<button type="button" className="link" onClick={() => setTarget("new")}>改为提新需求</button></>
             : <>新需求{waiting.length > 0 && <button type="button" className="link" onClick={() => setTarget(null)}>改为回复等你的那一项</button>}</>}
         </div>
         <fieldset disabled={busy || !available}>

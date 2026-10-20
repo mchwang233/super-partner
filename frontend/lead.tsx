@@ -1,5 +1,5 @@
 import React, { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
-import { MarkdownView } from "./markdown";
+import { Markdown as MarkdownView } from "./markdown";
 import { Composer, UserMessage, when, type Diagnosis, type SendReply } from "./diagnosis";
 import type { EngineerJob, EngineerMessage } from "./engineer";
 import { ENGINEER_WAITING, EngineerEntry, JoinEngineer, MENTION, tellEngineer, useEngineerJobs, type Act } from "./lead-engineer";
@@ -77,7 +77,7 @@ type Entry =
 export function LeadPanel({ apiBase, run, models, onReply, onAsk, onOpenEngineer }: {
   apiBase: string; run: RunLike; models: ModelLike[]; onReply: SendReply; onAsk: AskLead; onOpenEngineer?: (jobId: string) => void;
 }) {
-  const [open, setOpen] = useState(true), [joining, setJoining] = useState(false);
+  const [joining, setJoining] = useState(false);
   const signal = `${run.status}|${run.updated_at ?? ""}|${run.lead_messages?.length ?? 0}|${run.decisions?.length ?? 0}|${run.engineer_job_id ?? ""}`;
   const { jobs, act } = useEngineerJobs(apiBase, run.id, signal, ["queued", "running", "paused"].includes(run.status));
   const model = (id?: string | null) => models.find(m => m.id === id)?.display_name ?? id ?? "—";
@@ -109,11 +109,9 @@ export function LeadPanel({ apiBase, run, models, onReply, onAsk, onOpenEngineer
       <span className="lead-model">{model(run.supervisor?.model_id)}</span>
       {jobs.length > 0 && <span className="lead-member" title="平台工程师在这个对话里">＋ 🛠 平台工程师</span>}
       <span className={`dx-chip ${status.tone}`}>{status.tone === "busy" && <i className="pulse" aria-hidden="true" />}{status.label}</span>
-      {open && !joining && <button type="button" className="ghost lead-invite" onClick={() => setJoining(true)}>拉平台工程师进来</button>}
-      <button type="button" className="ghost diagnosis-fold" onClick={() => setOpen(o => !o)} aria-expanded={open}>{open ? "收起" : "展开"}</button>
+      {!joining && <button type="button" className="ghost lead-invite" onClick={() => setJoining(true)}>拉平台工程师进来</button>}
     </div>
-    {open && <div className="dx-thread">
-      <p className="lead-intro">规划这个任务的模型，会全程跟进：步骤失败、验证没通过时由它决定怎么办，并写明理由。需要你决定的事它会在这里问你；你也可以随时给它留言。Super Partner 自身有问题或缺少能力时，负责人或你都可以把平台工程师拉进来，用「@平台工程师」直接对它说。</p>
+    <div className="dx-thread">
       {joining && <JoinEngineer runId={run.id} act={act} onDone={() => setJoining(false)} />}
       {entries.map(entry => entry.kind === "decision"
         ? <DecisionMessage key={entry.item.id} item={entry.item} label={actionLabel(entry.item, title, model)} step={entry.item.node_id ? title(entry.item.node_id) : undefined}
@@ -128,7 +126,7 @@ export function LeadPanel({ apiBase, run, models, onReply, onAsk, onOpenEngineer
             : <ChatMessage key={entry.item.id} item={entry.item} />)}
       {thinking && <ThinkingMessage thinking={thinking} step={thinking.node_id ? title(thinking.node_id) : undefined} />}
       {!waiting && <AskBox disabled={answering} onAsk={send} engineer={jobs.length > 0} />}
-    </div>}
+    </div>
   </section>;
 }
 

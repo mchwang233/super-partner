@@ -109,6 +109,6 @@ about 35 s), `cd frontend && npm test` and `npm run build` (only when the fronte
 
 ## Frontend (`frontend/`)
 
-`src.tsx` (app shell, task creation, actions), `lead.tsx` (the task's conversation: the lead's decisions, questions and messages), `lead-engineer.tsx` (the platform engineer in that conversation: its jobs' lines and cards, @平台工程师, bringing it in), `engineer-bubble.tsx` (the platform engineer's own chat, from a bubble in the page's corner; no navigation entry), `result-page.tsx` (results, requirement change),
+`src.tsx` (app shell, task creation, actions), `lead.tsx` (the task's conversation, in its own "对话" tab that opens when it waits for you: the lead's decisions, questions and messages), `lead-engineer.tsx` (the platform engineer in that conversation: its jobs' lines and cards, @平台工程师, bringing it in), `engineer-bubble.tsx` (the platform engineer's own chat, from a bubble in the page's corner; no navigation entry), `result-page.tsx` (results, requirement change),
 `plan-parts.tsx` (the progress view: major parts as stages that open in place, `PlanView`), `plan-graph.tsx` (steps and attempts), `engineer.tsx` (the platform engineer's page), `diagnosis.tsx` (diagnosis chat), `mission-history.tsx`
 (task list), `model-profiles.tsx` (models), `style.css` (tokens and styles).

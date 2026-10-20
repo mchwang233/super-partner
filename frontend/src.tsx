@@ -112,7 +112,7 @@ function BudgetInput({value,onChange,...rest}:{value:number;onChange:(value:numb
   return <input {...rest} type="number" min="0.01" step="any" inputMode="decimal" value={text} onChange={e=>{setText(e.target.value);onChange(e.target.value===""?0:+e.target.value)}}/>;
 }
 
-type Tab = "progress"|"result"|"details";
+type Tab = "chat"|"progress"|"result"|"details";
 const STEPS = ["计划","确认","执行","结果"];
 /** Where the task is in plan → confirm → run → result, and whether that step went wrong. */
 function stepOf(status:string):{at:number;problem:boolean}{
@@ -122,7 +122,14 @@ function stepOf(status:string):{at:number;problem:boolean}{
   if(status==="failed"||status==="cancelled")return {at:2,problem:true};
   return {at:2,problem:status==="paused"};
 }
-function defaultTab(status:string):Tab{return status==="succeeded"||status==="incomplete"?"result":"progress"}
+function defaultTab(status:string,waiting=false):Tab{return waiting?"chat":status==="succeeded"||status==="incomplete"?"result":"progress"}
+/** What the task's conversation waits for you to answer, if anything: the lead's question, or a component to approve. */
+function waitingForYou(run:Run):string|null{
+  const question=(run.diagnoses??[]).find(item=>item.id===run.waiting_diagnosis_id&&(item.trigger==="lead"||item.trigger==="lead_repair"));
+  if(question)return `负责人在问你：${question.question||"需要你回复"}`;
+  if(run.engineer_job_id)return "任务在等平台工程师的组件：请看过方案后批准";
+  return null;
+}
 function duration(ms:number){const s=Math.max(0,Math.round(ms/1000));if(s<60)return `${s} 秒`;const m=Math.floor(s/60);return m<60?`${m} 分 ${s%60} 秒`:`${Math.floor(m/60)} 小时 ${m%60} 分`}
 function elapsedOf(run:Run,now:number){
   const starts=run.plan.nodes.map(node=>node.started_at?new Date(node.started_at).getTime():NaN).filter(Number.isFinite);
@@ -230,10 +237,12 @@ type SetNetwork=(run:Run,allow:boolean)=>Promise<string|null>;
 
 function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,onCancel,onDelete,onOpenModel,onPause,onDiagnose,onReply,onAsk,onOpenEngineer,onChange,onNetwork,parent,onOpenRun}:{onAsk:(run:Run,text:string)=>Promise<string|null>;onOpenEngineer:(jobId:string)=>void;onNetwork:SetNetwork;onChange:(run:Run,prompt:string,budget:number,options:ChangeOptions)=>Promise<string|null>;parent?:Run;onOpenRun:(run:Run)=>void;run:Run|null;models:Model[];onOpenModel:(model:Model)=>void;onPause:(run:Run)=>Promise<string|null>;onDiagnose:(run:Run)=>Promise<string|null>;onReply:ReplyToDiagnosis;deletingId:string|null;cancellingId:string|null;onConfirm:(run:Run,budget:number)=>Promise<string|null>;onResume:(run:Run,budget:number)=>Promise<string|null>;onCancel:(run:Run)=>void;onDelete:(run:Run)=>void}) {
   const [budget,setBudget]=useState(run?.budget_usd??2),[error,setError]=useState(""),[busy,setBusy]=useState(false);
-  const [tab,setTab]=useState<Tab>(defaultTab(run?.status??"")),picked=useRef(false),[now,setNow]=useState(()=>Date.now());
-  useEffect(()=>{setBudget(run?.budget_usd??2);setError("");picked.current=false;setTab(defaultTab(run?.status??""))},[run?.id]);
+  const waiting=run&&hasLead(run)?waitingForYou(run):null;
+  const [tab,setTab]=useState<Tab>(defaultTab(run?.status??"",!!waiting)),picked=useRef(false),[now,setNow]=useState(()=>Date.now());
+  useEffect(()=>{setBudget(run?.budget_usd??2);setError("");picked.current=false;setTab(defaultTab(run?.status??"",!!waiting))},[run?.id]);
   // Follow the task's phase (e.g. jump to the result when it finishes) until the user picks a tab.
-  useEffect(()=>{if(!picked.current)setTab(defaultTab(run?.status??""))},[run?.status]);
+  // The conversation opens when it starts waiting for you, and is never closed under you.
+  useEffect(()=>{if(!picked.current)setTab(current=>waiting?"chat":current==="chat"?current:defaultTab(run?.status??""))},[run?.status,!!waiting]);
   useEffect(()=>{if(run?.status!=="running")return;const timer=window.setInterval(()=>setNow(Date.now()),1000);return()=>window.clearInterval(timer)},[run?.status]);
   if(!run)return <section className="panel detail"><div className="empty big">在左侧选择一个任务，或点右上角的“＋ 新任务”。</div></section>;
   const needsConfirm=(run.status==="awaiting_confirmation"||run.status==="paused")&&!run.waiting_diagnosis_id&&!run.maintenance_id;
@@ -287,10 +296,11 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
     </div>}
     {error&&<div className="error" role="alert">{error}</div>}
     {run.error&&<div className="error">{run.error}</div>}
-    {hasLead(run)&&<LeadPanel apiBase={API} run={run} models={models} onReply={(id,body)=>onReply(run,id,body)} onAsk={(text=>onAsk(run,text)) satisfies AskLead} onOpenEngineer={onOpenEngineer}/>}
+    {waiting&&tab!=="chat"&&<div className="chat-alert" role="status"><span>{waiting}</span><button type="button" className="primary" onClick={()=>pick("chat")}>去回复</button></div>}
     {/* Diagnoses that run when no lead decides, or that the lead sends to repair something. */}
     <DiagnosisPanel run={{...run,diagnoses:(run.diagnoses??[]).filter(item=>item.trigger!=="lead"&&!leadRepairIds(run.diagnoses).has(item.id))}} models={models} onReply={(id,body)=>onReply(run,id,body)}/>
-    <nav className="task-tabs" aria-label="任务内容">{([["progress","进度"],["result","结果"],["details","详情"]] as const).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}</button>)}</nav>
+    <nav className="task-tabs" aria-label="任务内容">{([...(hasLead(run)?[["chat","对话"]]:[]),["progress","进度"],["result","结果"],["details","详情"]] as [Tab,string][]).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}{id==="chat"&&waiting&&<i className="tab-dot" title="在等你回复"/>}</button>)}</nav>
+    {tab==="chat"&&hasLead(run)&&<LeadPanel apiBase={API} run={run} models={models} onReply={(id,body)=>onReply(run,id,body)} onAsk={(text=>onAsk(run,text)) satisfies AskLead} onOpenEngineer={onOpenEngineer}/>}
     {tab==="progress"&&<PlanView apiBase={API} runId={run.id} runStatus={run.status} nodes={nodes} parts={run.plan.parts} inProject={!!run.project_dir} models={models} onOpenProfile={onOpenModel} reworkRounds={run.rework_rounds}/>}
     {tab==="result"&&<ResultPage apiBase={API} run={run} embedded onChange={(prompt,budget,options)=>onChange(run,prompt,budget,options)}/>}
     {tab==="details"&&<TaskDetails run={run} onNetwork={onNetwork}/>}

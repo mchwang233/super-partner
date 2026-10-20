@@ -1333,7 +1333,8 @@ test("the lead panel shows the lead deciding, and the repair it asked for under 
   run.diagnoses = [{ id: "r1", trigger: "lead_repair", decision_id: "d1", node_id: "d", model_id: "cli:codex",
     status: "done", verdict: "retry", report: "没找到可读的私钥。", created_at: "2026-10-16T07:19:05Z" }];
   const models = [{ id: "cli:codex", provider: "openai", display_name: "Codex CLI", channel: "cli", enabled: true, configured: true, scores: null }];
-  const { document } = await setup(t, [run], models, { openComposer: false });
+  const { document, click } = await setup(t, [run], models, { openComposer: false });
+  await click([...document.querySelectorAll(".task-tabs button")].find(node => node.textContent.startsWith("对话")));
   const panel = document.querySelector(".lead-panel");
   assert.match(panel.textContent, /判断中/);
   assert.match(panel.querySelector(".lead-thinking").textContent, /尝试失败了，正在判断怎么处理：「发布」 · 已 4\d 秒/);
@@ -1358,6 +1359,7 @@ test("the platform engineer page opens from a task's conversation, shows finishe
     report: "改好了", files: ["backend/super_partner/executor.py"], checks: ["Backend tests"], diff: "+fixed", commit: "abcdef1234" })] };
   state.records[0] = { ...state.records[0], updated_at: "2026-10-19T08:00:01Z" };
   await act(async () => state.poll());
+  await click([...document.querySelectorAll(".task-tabs button")].find(node => node.textContent.startsWith("对话")));
   // The engineer has no page of its own in the navigation: it works in tasks' conversations.
   assert.equal([...document.querySelectorAll(".app-nav button")].some(node => node.textContent.startsWith("平台工程师")), false);
   await click([...document.querySelectorAll(".lead-panel button")].find(node => node.textContent === "在平台工程师页面查看"));
@@ -1391,6 +1393,7 @@ test("the lead panel shows a component the lead asked for, and opens it on the e
   run.decisions = [{ id: "d1", node_id: "a", event: "attempt_failed", action: "request_component", engineer_job_id: "job1",
     reason: "缺一个读 PDF 的工具。", instructions: "给执行模型加一个读 PDF 的工具", created_at: "2026-10-19T07:00:00Z" }];
   const { state, document, click } = await setup(t, [run], [], { openComposer: false });
+  await click([...document.querySelectorAll(".task-tabs button")].find(node => node.textContent.startsWith("对话")));
   state.engineer = { available: true, jobs: [engineerJob({ origin: "lead", run_id: "waiting-task", node_id: "a", title: "PDF 工具" })] };
   const panel = document.querySelector(".lead-panel");
   assert.match(panel.textContent, /请平台工程师添加组件.*任务在等这个组件/s);
@@ -1419,6 +1422,7 @@ test("the lead's panel is a group chat the platform engineer joins, where its pl
   // The panel looks again whenever the task changes.
   state.records[0] = { ...state.records[0], updated_at: "2026-10-20T06:18:01Z" };
   await act(async () => state.poll());
+  await click([...document.querySelectorAll(".task-tabs button")].find(node => node.textContent.startsWith("对话")));
   const panel = () => document.querySelector(".lead-panel");
   const button = text => [...panel().querySelectorAll("button")].find(node => node.textContent === text);
   assert.match(panel().querySelector(".diagnosis-head").textContent, /负责人.*平台工程师/);
@@ -1496,4 +1500,23 @@ test("a bubble in the corner opens a chat with the platform engineer, for answer
   assert.deepEqual(state.engineerActions.at(-1), { path: "/api/engineer/jobs", body: { request: "给结果页加一个导出 PDF 的功能", kind: "component" } });
   await click(document.querySelector('[aria-label="关闭平台工程师聊天"]'));
   assert.equal(chat(), null);
+});
+
+test("the task's conversation is a tab that opens when the lead asks you, with a bar from the other tabs", async t => {
+  const run = mission("asking-task", "paused");
+  run.plan.nodes = [{ id: "a", title: "存数据", dependencies: [], status: "pending", estimated_cost_usd: 0, attempts: [] }];
+  run.supervisor = { model_id: "cli:claude", calls: 1 };
+  run.waiting_diagnosis_id = "q1";
+  run.diagnoses = [{ id: "q1", trigger: "lead", node_id: "a", status: "done", verdict: "needs_input", question: "用 SQLite 还是 JSON？",
+    choices: ["SQLite", "JSON"], report: "两种都行", created_at: "2026-10-20T07:00:00Z" }];
+  const { document, click } = await setup(t, [run], [], { openComposer: false });
+  const tabs = () => [...document.querySelectorAll(".task-tabs button")];
+  assert.deepEqual(tabs().map(tab => tab.textContent), ["对话", "进度", "结果", "详情"]);
+  assert.equal(tabs()[0].getAttribute("aria-pressed"), "true");
+  assert.ok(tabs()[0].querySelector(".tab-dot") && document.querySelector(".lead-panel"));
+  await click(tabs()[1]);
+  assert.equal(document.querySelector(".lead-panel"), null);
+  assert.match(document.querySelector(".chat-alert").textContent, /负责人在问你：用 SQLite 还是 JSON？/);
+  await click(document.querySelector(".chat-alert button"));
+  assert.ok(document.querySelector(".lead-panel") && !document.querySelector(".chat-alert"));
 });

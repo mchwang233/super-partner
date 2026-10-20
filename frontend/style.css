@@ -533,7 +533,6 @@ pre.result-text{max-height:none}
 
 /* The task's lead: its decisions, its questions, and messages with it. */
 .lead-model{font-size:12px;color:var(--muted)}
-.lead-intro{margin:0;font-size:12.5px;line-height:1.6;color:var(--muted)}
 .lead-verdict{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:0;font-size:13px;line-height:1.6}
 .lead-verdict .dx-chip{flex:0 0 auto}
 .lead-question{margin:6px 0 0;font-size:13.5px;font-weight:600;line-height:1.55}
@@ -671,3 +670,8 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .engineer-chat-target{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;font-size:11px;color:var(--muted);margin-bottom:6px}
 .engineer-chat-target button{font-size:11px}
 @media (max-width:640px){.engineer-bubble{right:16px;bottom:16px}.engineer-chat{right:16px;bottom:80px}}
+/* The task's conversation lives in its own tab; a bar says when it waits for you. */
+.chat-alert{display:flex;align-items:center;gap:12px;padding:10px 14px;border-radius:10px;border:1px solid light-dark(#f0d39f,#5a4422);background:light-dark(#fff8ec,#2a2113);color:var(--text);font-size:13px}
+.chat-alert span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-alert button{padding:6px 14px;font-size:12px}
+.tab-dot{display:inline-block;width:7px;height:7px;margin-left:6px;border-radius:50%;background:var(--warn);vertical-align:middle}
