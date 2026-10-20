@@ -4,7 +4,8 @@ A node run by an API model becomes a tool-calling loop: the model reads and edit
 its working directory and runs commands, the executor carries out each call and returns the
 result, until the model answers without calling a tool. File tools never leave the working
 directory; commands run under bubblewrap with the home folder hidden, no network, an empty
-environment (no API keys), and write access only to the working directory. Ports listed in
+environment (no API keys), and write access to the working directory and a fresh /tmp for
+each command. The installed /workspace/eda/.edarc is loaded inside the sandbox. Ports listed in
 ``sandbox_host_ports`` are the one way out: each is bridged in through a Unix socket, together
 with the vendor daemons of a license server listed by its lmgrd port (environment.py).
 A task that allows the network gets its own network namespace from pasta instead: the internet
@@ -90,7 +91,10 @@ TOOLS = [
         "name": "run_command",
         "description": (
             "Run a bash command in the working directory, in a sandbox without network access "
-            "that can only write to the working directory. Returns exit code and output."
+            "that can write to the working directory and a fresh /tmp for each command. "
+            "Save files needed by later calls in the working directory; other host paths are read-only. "
+            "Loads /workspace/eda/.edarc if present. Returns exit code and combined stdout/stderr, "
+            "including partial output on timeout."
         ),
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"},
@@ -103,7 +107,11 @@ AGENT_INSTRUCTIONS = (
     "You can act on the working directory with tools: list_dir, read_file, write_file, "
     "edit_file and run_command. Do the work with them rather than only describing it: create "
     "and change the files, and run checks such as syntax checks or tests when useful. Paths are "
-    "relative to the working directory. Commands have no network access{ports}. When the work "
+    "relative to the working directory. Commands can write to the working directory and /tmp. "
+    "/tmp is empty at the start of each command: create temporary folders and use them in the same "
+    "call; save files needed by later calls under the working directory. Other host paths are "
+    "read-only. Commands load /workspace/eda/.edarc if present, so installed EDA tools such as "
+    "vcs, urg and verdi can be called directly. Commands have no network access{ports}. When the work "
     "is done, reply without calling a tool and summarize what you did and what you verified.{turns}"
 )
 NETWORK_NOTE = (
@@ -402,7 +410,7 @@ class Workspace:
         if self.network:
             env.update({name: os.environ[name] for name in PROXY_ENV if name in os.environ})
         env = environment.command_env(env)
-        env.update(HOME=str(self.root), LANG="C.UTF-8")
+        env.update(HOME=str(self.root), LANG="C.UTF-8", TMPDIR="/tmp")
         bridge = ["--bind", ports_dir, SANDBOX_PORTS_DIR] if ports_dir else []
         tools = str(environment.tools_dir())
         shared = ["--ro-bind", tools, tools] if os.path.isdir(tools) else []
@@ -417,7 +425,8 @@ class Workspace:
             *hidden, *shared, "--bind", str(self.root), str(self.root),
             *isolated, "--unshare-pid", "--die-with-parent", "--new-session",
             "--clearenv", *[arg for name, value in env.items() for arg in ("--setenv", name, value)],
-            "--chdir", str(self.root), "--", "/bin/bash", "-c", _listen_script(ports) + 'exec /bin/bash -c "$1"',
+            "--chdir", str(self.root), "--", "/bin/bash", "-c",
+            _listen_script(ports) + environment.shell_setup() + 'exec /bin/bash -c "$1"',
             "bash", command,
         ]
 
@@ -446,15 +455,18 @@ class Workspace:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, start_new_session=True,
             )
+            # wait_for must not cancel communicate: it may already have read output that
+            # would then be lost when a long compilation or simulation times out.
+            talk = asyncio.create_task(process.communicate())
             try:
-                output, _ = await asyncio.wait_for(process.communicate(), timeout=seconds)
+                output, _ = await asyncio.wait_for(asyncio.shield(talk), timeout=seconds)
             except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
-                await process.wait()
+                output, _ = await talk
                 if isinstance(exc, asyncio.CancelledError):
                     raise
-                raise ToolError(f"command timed out after {seconds}s")
+                raise ToolError(f"command timed out after {seconds}s\n" + _clip(output.decode(errors="replace")))
         return f"exit code {process.returncode}\n" + _clip(output.decode(errors="replace"))
 
 

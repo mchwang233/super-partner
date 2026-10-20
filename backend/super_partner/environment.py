@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Set by the sandbox itself, or would let a recorded value change what every command loads.
 RESERVED_ENV = {"PATH", "HOME", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LANG"}
+EDA_PROFILE = Path("/workspace/eda/.edarc")
 PROC = Path("/proc")
 LICENSE_MANAGER = "lmgrd"
 TCP_LISTEN = "0A"
@@ -284,3 +286,13 @@ def command_env(base: dict[str, str]) -> dict[str, str]:
     env["PATH"] = f"{root / 'bin'}:{base.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
     env["PYTHONPATH"] = ":".join(filter(None, [str(root / "python"), base.get("PYTHONPATH")]))
     return env
+
+
+def shell_setup() -> str:
+    """Load the installed EDA tools in the command's sandbox, with its sanitized environment.
+
+    A non-interactive bash does not read this profile itself. Keep initialization in the
+    child shell: it must not run on the host or redirect the caller's stdout/stderr.
+    """
+    profile = shlex.quote(str(EDA_PROFILE))
+    return f"if [ -r {profile} ]; then . {profile} || exit $?; fi\n"

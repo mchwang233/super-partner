@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 from pathlib import Path
 
 import httpx
@@ -20,6 +21,144 @@ from super_partner.models import (
 from super_partner.providers import ProviderError, ProviderRegistry
 
 needs_bwrap = pytest.mark.skipif(not agent.sandbox_available(), reason="bubblewrap is not installed")
+
+
+@pytest.fixture
+def command_workspace(tmp_path, monkeypatch):
+    """Exercise command I/O and file isolation without needing a network namespace."""
+    root = tmp_path / "command work"
+    root.mkdir()
+    monkeypatch.setattr(settings, "sandbox_env", [])
+    monkeypatch.setattr(agent, "sandbox_ports", list)
+    monkeypatch.setattr(agent, "network_available", lambda: False)
+    # Never load the machine's actual EDA setup in these tests.
+    monkeypatch.setattr(environment, "EDA_PROFILE", root / "absent.edarc", raising=False)
+    return agent.Workspace(root, network=True)
+
+
+@needs_bwrap
+async def test_commands_load_eda_profile_before_running_tools(command_workspace, monkeypatch):
+    ws = command_workspace
+    eda = ws.root / "EDA tool's setup"
+    vcs_home, verdi_home = eda / "vcs", eda / "verdi"
+    for tool, folder in (("vcs", vcs_home / "linux64/bin"), ("urg", vcs_home / "linux64/bin"),
+                         ("verdi", verdi_home / "bin")):
+        folder.mkdir(parents=True, exist_ok=True)
+        executable = folder / tool
+        executable.write_text(
+            f"#!/bin/sh\nprintf '%s:%s:%s\\n' {tool} \"$VCS_HOME\" \"$SNPSLMD_LICENSE_FILE\"\n"
+        )
+        executable.chmod(0o755)
+    profile = eda / ".edarc"
+    profile.write_text(
+        f"export VCS_HOME={shlex.quote(str(vcs_home))}\n"
+        f"export VERDI_HOME={shlex.quote(str(verdi_home))}\n"
+        "PATH=\"$PATH:$VCS_HOME/linux64/bin:$VERDI_HOME/bin\"\n"
+        "export SNPSLMD_LICENSE_FILE=27000@license.test\n"
+        "export LM_LICENSE_FILE=\"$SNPSLMD_LICENSE_FILE\"\n"
+    )
+    monkeypatch.setattr(environment, "EDA_PROFILE", profile)
+    monkeypatch.setenv("OPENAI_API_KEY", "should-not-reach-the-command")
+    output = await ws.call("run_command", {"command": (
+        "vcs && urg && verdi && echo license=$LM_LICENSE_FILE; "
+        "echo key=${OPENAI_API_KEY:-none}"
+    )})
+    assert output.startswith("exit code 0\n")
+    for tool in ("vcs", "urg", "verdi"):
+        assert f"{tool}:{vcs_home}:27000@license.test\n" in output
+    assert "license=27000@license.test\n" in output
+    assert "key=none\n" in output
+
+
+@needs_bwrap
+@pytest.mark.parametrize("exit_code", [0, 7])
+async def test_commands_return_stdout_and_stderr_without_an_eda_profile(command_workspace, exit_code):
+    output = await command_workspace.call("run_command", {"command": (
+        "echo stdout-visible; printf '%s\\n' 'literal \"$HOME\"'; "
+        f"echo stderr-visible >&2; exit {exit_code}"
+    )})
+    assert output == f'exit code {exit_code}\nstdout-visible\nliteral "$HOME"\nstderr-visible\n'
+
+
+@needs_bwrap
+async def test_command_timeout_keeps_stdout_and_stderr(command_workspace):
+    output = await command_workspace.call("run_command", {
+        "command": "echo before-timeout; echo error-before-timeout >&2; sleep 5",
+        "timeout_seconds": 1,
+    })
+    assert output.startswith("Error: command timed out after 1s")
+    assert "before-timeout" in output.splitlines()
+    assert "error-before-timeout" in output.splitlines()
+
+
+@needs_bwrap
+async def test_command_tmp_is_writable_but_persistent_results_belong_in_workspace(command_workspace):
+    ws = command_workspace
+    output = await ws.call("run_command", {"command": (
+        "test \"$TMPDIR\" = /tmp && mkdir -p \"$TMPDIR/sync_chk\" && "
+        "printf '%s\\n' 'module sync_tb; endmodule' > \"$TMPDIR/sync_chk/sync_tb.sv\" && "
+        "cat \"$TMPDIR/sync_chk/sync_tb.sv\" && "
+        "printf '%s\\n' saved > result.txt && "
+        f"printf '%s\\n' absolute > {shlex.quote(str(ws.root / 'absolute.txt'))}"
+    )})
+    assert output == "exit code 0\nmodule sync_tb; endmodule\n"
+    assert (ws.root / "result.txt").read_text() == "saved\n"
+    assert (ws.root / "absolute.txt").read_text() == "absolute\n"
+    output = await ws.call("run_command", {"command": (
+        "test ! -e /tmp/sync_chk/sync_tb.sv && cat result.txt absolute.txt; "
+        "touch /usr/sp-command-write-test 2>/dev/null && echo escaped || echo outside-blocked"
+    )})
+    assert output == "exit code 0\nsaved\nabsolute\noutside-blocked\n"
+    instructions = ws.instructions()
+    assert "/tmp" in instructions and "each command" in instructions
+    assert "working directory" in instructions and "read-only" in instructions
+
+
+@needs_bwrap
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "google"])
+async def test_command_output_reaches_the_next_model_turn(command_workspace, monkeypatch, provider):
+    command = {"command": "echo model-stdout; echo model-stderr >&2; exit 3"}
+    if provider == "openai":
+        monkeypatch.setenv("OPENAI_API_KEY", "test")
+        replies = [
+            {"choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "run_command", "arguments": json.dumps(command)}},
+            ]}}]},
+            {"choices": [{"message": {"content": "received"}}]},
+        ]
+    elif provider == "anthropic":
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+        replies = [
+            {"content": [{"type": "tool_use", "id": "c1", "name": "run_command", "input": command}],
+             "usage": {"input_tokens": 1, "output_tokens": 1}},
+            {"content": [{"type": "text", "text": "received"}],
+             "usage": {"input_tokens": 1, "output_tokens": 1}},
+        ]
+    else:
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setenv("GOOGLE_API_KEY", "test")
+        replies = [
+            {"candidates": [{"content": {"role": "model", "parts": [
+                {"functionCall": {"name": "run_command", "args": command}},
+            ]}}]},
+            {"candidates": [{"content": {"role": "model", "parts": [{"text": "received"}]}}]},
+        ]
+    sent = []
+    registry = registry_with(scripted(replies, sent))
+    try:
+        result = await registry.complete(f"{provider}:test-model", "Run the command", command_workspace.root,
+                                         act=True, network=True)
+    finally:
+        await registry.client.aclose()
+    assert result.text == "received"
+    expected = "exit code 3\nmodel-stdout\nmodel-stderr\n"
+    if provider == "openai":
+        assert sent[1]["messages"][-1]["content"] == expected
+    elif provider == "anthropic":
+        assert sent[1]["messages"][-1]["content"][0]["content"] == expected
+    else:
+        assert sent[1]["contents"][-1]["parts"][0]["functionResponse"]["response"]["result"] == expected
 
 
 async def test_file_tools_stay_inside_the_working_directory(tmp_path):

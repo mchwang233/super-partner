@@ -440,6 +440,14 @@ records environment variables and local ports (`{"env": {...}, "host_ports": [..
 sandboxed commands get. API models' sandbox mounts the folder read-only; CLIs get the same
 PATH, PYTHONPATH and variables. Anything that needs root becomes exact commands in the report.
 
+API step commands also load `/workspace/eda/.edarc` inside the sandbox when it is readable,
+so the installed Synopsys executables and license variables are available without a manual
+`source` in each call. `run_command` returns combined stdout/stderr, including output produced
+before a timeout. The working directory is writable and persists across calls. `/tmp`
+(`TMPDIR`) is writable but starts fresh for each command: create and use scratch files in
+one call, and keep files needed by later calls in the working directory. Other host paths
+remain read-only; file tools only access the working directory.
+
 Its answer ends with one status line:
 
 - `STATUS: FIXED` with what it changed (`## 修复内容`): the step runs again on its own model with
