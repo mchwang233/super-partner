@@ -12,6 +12,7 @@ from super_partner.models import (
     CapabilityScore,
     ExecutionRun,
     ModelProfile,
+    NodeStatus,
     RunStatus,
     TaskNode,
     TaskPlan,
@@ -223,5 +224,107 @@ async def test_new_changes_do_not_hide_earlier_files_and_review_uses_the_project
         assert folder != project
         await executor._finish(run.id, task.id, ProviderResult("done", 0, 0), verdict, [], ["DELIVERY.md"], 0, None)
         assert set(database.get_run(run.id).plan.nodes[0].changed_files) == {"db.py", "DELIVERY.md"}
+    finally:
+        database.connection.close()
+
+
+@pytest.mark.parametrize("name", ["build/tb/compile.log", "build/reports/coverage.txt", "rtl/build/sim.out"])
+async def test_explicit_build_log_is_reviewable_without_entering_source_inventory(tmp_path, name):
+    log = tmp_path / name
+    log.parent.mkdir(parents=True)
+    log.write_text("simulation detail\n" * 5000 + "SIMULATION_PASS\nRC=0\n")
+    (log.parent / "unreferenced.log").write_text("not cited\n")
+
+    assert name not in quality.file_state(tmp_path)
+    assert name not in quality.workspace_listing(tmp_path)
+    references = quality.mentioned_files(tmp_path, f"Check `{name}` and `{log}`.")
+    assert references == [name]
+    assert "SIMULATION_PASS\nRC=0" in quality.change_evidence(tmp_path, references, referenced=references)
+    assert "SIMULATION_PASS" not in quality.change_evidence(tmp_path, [name])
+
+    ws = agent.Workspace(tmp_path, read_only=True, readable_files=references)
+    assert "SIMULATION_PASS" in await ws.call("Read", {"file_path": name, "offset": -2})
+    assert (await ws.call("Read", {"file_path": str(log.parent / "unreferenced.log")})).startswith("Error:")
+    for tool, args in [
+        ("Bash", {"command": "echo changed"}),
+        ("Write", {"file_path": name, "content": "changed"}),
+        ("Edit", {"file_path": name, "old_string": "RC=0", "new_string": "RC=1"}),
+    ]:
+        assert "read-only" in await ws.call(tool, args)
+    assert log.read_text().endswith("SIMULATION_PASS\nRC=0\n")
+
+
+async def test_explicit_build_logs_cannot_bypass_private_paths_or_symlink_targets(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    blocked = [
+        "build/.env.log", "build/credentials.txt", "build/secrets.log", "build/server.pem",
+        "build/.aws/check.log", "build/.git/check.log", "build/.super-partner/check.log",
+        "build/node_modules/check.log", "build/.venv/check.log", "build/.review/check.log",
+        "build/program.py", "build/simulation", "build/summary.json", "dist/check.log",
+    ]
+    for name in blocked:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("private-value\n")
+    outside = tmp_path / "outside.log"
+    outside.write_text("outside-value\n")
+    (root / "build/outside.log").symlink_to(outside)
+    (root / "build/alias.log").symlink_to(root / "build/credentials.txt")
+    (root / "build/private").symlink_to(root / "build/.aws", target_is_directory=True)
+    blocked += ["build/outside.log", "build/alias.log", "build/private/check.log", "../outside.log"]
+
+    assert quality.mentioned_files(root, " ".join(blocked)) == []
+    evidence = quality.change_evidence(root, blocked, referenced=blocked)
+    assert "private-value" not in evidence and "outside-value" not in evidence
+    ws = agent.Workspace(root, read_only=True, readable_files=blocked)
+    for name in blocked:
+        assert (await ws.call("Read", {"file_path": name})).startswith("Error:"), name
+
+
+@pytest.mark.parametrize("passed", [True, False])
+async def test_review_receives_build_log_and_keeps_simulation_failure(tmp_path, monkeypatch, passed):
+    monkeypatch.setattr(settings, "review_nodes", True)
+    project = tmp_path / "project"
+    log = project / "build/tb/compile.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("SIMULATION_PASS\nRC=0\n" if passed else "SIMULATION_FAIL: assertion failed\nRC=1\n")
+    task = TaskNode(id="work", title="Work", instructions="Run simulation", capability="coding",
+                    model_id="openai:worker")
+    other = TaskNode(id="other", title="Other", instructions="Preserve revised coverage plan",
+                     capability="coding", model_id="openai:worker", status=NodeStatus.SUCCEEDED,
+                     result="revised coverage model")
+    run = ExecutionRun(id="build-review", prompt="simulate", status=RunStatus.RUNNING, budget_usd=10,
+                       use_cli=False, project_dir=str(project), plan=TaskPlan(summary="simulate", nodes=[task, other]))
+    reviewer = ModelProfile(id="openai:reviewer", provider="openai", display_name="Reviewer",
+                            context_window=1_000_000, input_per_million=1, output_per_million=1,
+                            scores=CapabilityScore(coding=99, reliability=99))
+
+    class Providers:
+        def configured_models(self, ids):
+            return set(ids)
+
+        async def complete(self, model_id, prompt, workspace=None, **kwargs):
+            assert log.read_text() in prompt
+            assert kwargs["review_workspace"] == project
+            assert kwargs["review_files"] == ["build/tb/compile.log"]
+            ws = agent.Workspace(project, read_only=True, readable_files=kwargs["review_files"])
+            output = await ws.call("Read", {"file_path": "build/tb/compile.log"})
+            assert "RC=" in output
+            return ProviderResult(json.dumps({"passed": "RC=0" in output, "reason": output}), 10, 10, model_id)
+
+    database = Database(tmp_path / "test.db")
+    try:
+        database.save_run(run)
+        executor = Executor(database, Providers(), {reviewer.id: reviewer})
+        # A worker's PASS claim must not replace the log's actual failure in the evidence.
+        result = ProviderResult("Simulation passed; see build/tb/compile.log", 0, 0)
+        verdict = await executor._check(run, task, result.text, [], project)
+        assert verdict.passed is passed
+        await executor._finish(run.id, task.id, result, verdict, [], [], 0, None)
+        saved = database.get_run(run.id)
+        assert saved.plan.nodes[0].attempts[-1].outcome == ("passed" if passed else "rejected")
+        assert saved.plan.nodes[1] == other
+        assert saved.rework_rounds == 0
     finally:
         database.connection.close()

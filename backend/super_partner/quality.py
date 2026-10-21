@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from . import skills
 from .models import ExecutionRun, NodeInput, TaskNode
 
 # Marks a review request so the offline demo model can answer it with a verdict.
@@ -21,7 +22,7 @@ MAX_INVENTORY_FILES = 200
 # Relative or absolute paths, or bare file names with an extension, mentioned in a result.
 PATH_MENTION = re.compile(r"/?[\w.-]+(?:/[\w.-]+)+|[\w-]+\.[A-Za-z0-9]{1,8}\b")
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".super-partner"}
-# Explicitly cited verification logs may live in hidden scratch folders. This exception
+# Explicitly cited verification logs may live in build or hidden scratch folders. This exception
 # never grants access to credentials, agent state or repository metadata.
 PRIVATE_DIRS = {".ssh", ".aws", ".azure", ".config", ".kube", ".docker", ".gnupg",
                 ".codex", ".claude", ".agents", ".review", "credentials", "secrets"}
@@ -150,12 +151,42 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
     if others:
         # So a step knows what is someone else's job, and neither does it nor reports it undone.
         sections.append("Other steps of this task, not yours: " + "; ".join(others[:MAX_OTHER_STEPS]))
+    if note := cli_environment(node.model_id, run.allow_network):
+        # API models are told this in their tools' instructions (agent.AGENT_INSTRUCTIONS).
+        sections.append(note)
+    # How to use the tools it names, as this machine's skills and the general ones say (skills.py).
+    if known := skills.section(skills.for_step("\n".join([node.title, node.instructions, node.check or "",
+                                                           node.acceptance_criteria or ""]))):
+        sections.append(known)
     sections.append(UNABLE_RULE)
     if node.verifies:
         sections.append(_verdict_rule(node, by_id))
     elif scoped:
         sections.append(SCOPED_ANSWER)
     return "\n\n".join(sections), inputs
+
+
+def cli_environment(model_id: Optional[str], network: bool) -> str:
+    """Where a membership CLI does a step, as it runs there, so it does not take itself for
+    being on an open machine. Empty for other models; the same for every CLI."""
+    if not model_id or not model_id.startswith("cli:"):
+        return ""
+    lines = [
+        ("Where you are: Super Partner runs you in your own sandbox. You can write only the working "
+         "directory and /tmp; the rest of the system is read-only. You are an ordinary user, not root: sudo, "
+         "system packages and system files are out of reach. The tools installed on this machine for every "
+         "step are on PATH."),
+        ("This task allows the internet: commands may download packages (into the working directory) and "
+         "call external services." if network else "Commands have no network access."),
+    ]
+    # The same for every CLI: a step can be handed from one to another with its prompt.
+    lines.append("Deleting files in the working directory is allowed: name them (rm -f a.o b.o, rm -rf build) "
+                 "or use find (find . -name '*.o' -delete). Codex refuses rm with wildcards or $(...) as "
+                 "dangerous. If your tool still refuses a command, do not retry it the same way: do without it "
+                 "if you can, and say so in your answer.")
+    lines.append("When something the task needs is missing or blocked here, do not work around it with "
+                 "stand-ins or fake results: say exactly what is missing.")
+    return "\n".join(lines)
 
 
 def _verdict_rule(node: TaskNode, by_id: dict) -> str:
@@ -375,7 +406,7 @@ def _tracked(root: Path, files: list[str]) -> set[str]:
 def review_path(root: Path, name: str, *, allow_hidden_log: bool = False) -> Optional[Path]:
     """One access policy for inline evidence and API review tools, including symlink targets.
 
-    Only an explicitly referenced log may bypass the normal hidden-folder exclusion.
+    Only an explicitly referenced log may bypass the build/hidden-folder exclusion.
     Both its written path and resolved target must be safe and inside the workspace.
     """
     try:
@@ -387,15 +418,17 @@ def review_path(root: Path, name: str, *, allow_hidden_log: bool = False) -> Opt
             for i, part in enumerate(parts):
                 lower = part.lower()
                 stem = Path(lower).stem
-                if (lower in SKIP_DIRS or lower in PRIVATE_DIRS or lower in PRIVATE_NAMES
+                referenced_log = (allow_hidden_log and i < len(parts) - 1
+                                  and relative.suffix.lower() in LOG_SUFFIXES)
+                if (lower in SKIP_DIRS and not (lower == "build" and referenced_log)
+                        or lower in PRIVATE_DIRS or lower in PRIVATE_NAMES
                         or lower.startswith((".env", "id_rsa.", "id_dsa.", "id_ecdsa.", "id_ed25519."))
                         or stem in {"credentials", "secrets", "token", "tokens"}
                         and Path(lower).suffix in {".json", ".yaml", ".yml", ".toml", ".ini", ".txt", ".log"}
                         or Path(lower).suffix in PRIVATE_SUFFIXES):
                     return None
                 if part.startswith(".") and not (
-                    allow_hidden_log and i < len(parts) - 1 and part not in {".", ".."}
-                    and relative.suffix.lower() in LOG_SUFFIXES
+                    referenced_log and part not in {".", ".."}
                 ):
                     return None
         return resolved
