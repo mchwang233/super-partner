@@ -10,6 +10,7 @@ executor sees an ordinary DAG of tasks."""
 
 from __future__ import annotations
 
+import math
 from collections.abc import Awaitable
 from typing import Callable, Optional
 from uuid import uuid4
@@ -242,16 +243,32 @@ def siblings(items, deepest: bool, parts_only: bool = False, room: int = MAX_TAS
     return checked
 
 
-def task_problems(children: list[dict]) -> list[str]:
-    """Why some tasks of a split are not yet independent, clear and small, to send back."""
+def longest_chain(children: list[dict]) -> list[str]:
+    """The titles along the longest line of children each waiting for the one before (a smaller
+    part counts as one): those run one after another however many models are free."""
+    lines: dict[str, list[str]] = {}
+    for item in children:  # dependencies name earlier children only
+        before = max((lines[key] for key in item["dependencies"] if key in lines), key=len, default=[])
+        lines[item["key"]] = [*before, str(item.get("title") or item["key"])]
+    return max(lines.values(), key=len, default=[])
+
+
+def task_problems(children: list[dict], expected: Optional[int] = None) -> list[str]:
+    """Why some tasks of a split are not yet independent, clear and small, to send back.
+    ``expected`` is how many tasks the outline expected the part to take (PlanPart.size)."""
     nodes = [item["node"] for item in children if item["kind"] == "task"]
     problems = scope_problems(TaskPlan(summary="", nodes=nodes))
     problems += [f"{node.title}: no acceptance_criteria; say how a reviewer can tell it is done"
                  for node in nodes if not node.acceptance_criteria]
-    tasks = [item for item in children if item["kind"] == "task"]
-    if len(tasks) >= CHAIN_LIMIT and all(before["key"] in after["dependencies"] for before, after in zip(tasks, tasks[1:])):
-        problems.append(f"the {len(tasks)} tasks form one chain, each waiting for the one before; a task should "
-                        "wait only for tasks whose files or results it needs, so that the others run at the same time")
+    if len(chain := longest_chain(children)) >= CHAIN_LIMIT:
+        problems.append(f"{len(chain)} of these form one chain, each waiting for the one before ("
+                        + " → ".join(chain) + "); a task should wait only for tasks whose files or results it "
+                        "needs, so that the others run at the same time")
+    limit = max(expected + 2, math.ceil(expected * 1.5)) if expected else None
+    if limit and len(nodes) == len(children) and len(nodes) > limit:
+        problems.append(f"{len(nodes)} tasks, but this part was expected to take about {expected}; merge tasks "
+                        "that change the same files or are checked together, so that there are at most "
+                        f"{limit}")
     return problems
 
 
@@ -332,7 +349,7 @@ async def refine(say: Say, plan: TaskPlan, part: PlanPart, opening: str = "") ->
         message = refine_message(current, path, depth, room, waited)
         children = await _ask(say, opening + message if current is part else message, read)
         for _ in range(ROUNDS):
-            if not (problems := task_problems(children)):
+            if not (problems := task_problems(children, part.size if current is part else None)):
                 break
             # Too broad or vague a task makes its model explore or guess; the planner cuts it up.
             try:

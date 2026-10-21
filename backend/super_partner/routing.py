@@ -18,10 +18,12 @@ class NoEligibleModelError(ValueError):
 # How an API model's tool loop costs grow, turn by turn: its prompt, instructions and tool
 # definitions; what each turn adds to the conversation (tool output and the model's own message);
 # and what it writes each turn, by reasoning effort. Each turn resends the conversation, all but
-# the newest part of it read from the provider's prompt cache.
+# the newest part of it read from the provider's prompt cache. Fitted to measured runs (DeepSeek
+# Flash at max effort, 2026-10-21: about 1,500 tokens written and 1,300 added per turn);
+# the other efforts scale with it.
 LOOP_BASE_TOKENS = 3_000
-LOOP_TURN_GROWTH = 1_000
-LOOP_TURN_OUTPUT = {"none": 200, "minimal": 200, "low": 300, "medium": 600, "high": 900, "max": 1_200}
+LOOP_TURN_GROWTH = 1_300
+LOOP_TURN_OUTPUT = {"none": 250, "minimal": 250, "low": 400, "medium": 750, "high": 1_100, "max": 1_500}
 
 
 def loop_turns(node: TaskNode) -> int:
@@ -148,6 +150,32 @@ def route_node(
     return node
 
 
+def spread_to(
+    node: TaskNode, models: list[ModelProfile], configured: set[str], busy: set[str],
+    needs_vision: bool = False,
+) -> Optional[ModelProfile]:
+    """Another model for ``node`` while the providers in ``busy`` carry enough of the task's
+    running steps: one of another API provider that clears the node's threshold, chosen as
+    route_node would choose, for at most ``settings.spread_cost_factor`` times the cost of the
+    node's own model. None when there is no such model: the node then stays where it is."""
+    current = next((model for model in models if model.id == node.model_id), None)
+    if current is None:
+        return None
+    ceiling = node_cost(node, current) * settings.spread_cost_factor
+    pool = [
+        model for model in eligible_for_node(node, models, configured, needs_vision)
+        if model.channel != "cli" and model.provider not in busy
+        and model.scores.score_for(node.capability) >= node.quality_threshold
+        and node_cost(node, model) <= ceiling + 1e-12
+    ]
+    if not pool:
+        return None
+    if node.difficulty == "hard":
+        return min(pool, key=lambda model: (-model.scores.score_for(node.capability), -model.scores.reliability,
+                                            node_cost(node, model)))
+    return min(pool, key=lambda model: (node_cost(node, model), -model.scores.score_for(node.capability)))
+
+
 def strongest_for(
     node: TaskNode, models: list[ModelProfile], configured: set[str], needs_vision: bool = False,
 ) -> Optional[ModelProfile]:
@@ -184,9 +212,11 @@ def stronger_than(
 def pick_reviewer(
     models: list[ModelProfile], configured: set[str], exclude: Optional[str], tokens: int,
 ) -> Optional[ModelProfile]:
-    """Who checks a result: preferably not the model that produced it; then API models under
-    the API-first policy (membership CLIs first otherwise), then the most reliable, then the
-    cheapest."""
+    """Who checks a result (or whether an attempt is stuck): preferably not the model that
+    produced it; then API models under the API-first policy (membership CLIs first otherwise);
+    then the cheapest model at least as capable in general as the one checked, since a weaker
+    one cannot be trusted to judge its work; failing that, the most capable. Reliability breaks
+    ties."""
     available = [
         model for model in models
         if model.enabled and model.routing_ready and model.id in configured
@@ -194,12 +224,19 @@ def pick_reviewer(
     ]
     if not available:
         return None
-    return min(available, key=lambda model: (
-        model.id == exclude,
-        (model.channel == "cli") if settings.subtasks_prefer_api else model.execution_priority,
-        -model.scores.reliability,
-        model.input_per_million + model.output_per_million,
-    ))
+    checked = next((model for model in models if model.id == exclude), None)
+    floor = checked.scores.overall if checked else 0.0
+
+    def key(model):
+        able = model.scores.overall >= floor
+        return (
+            model.id == exclude,
+            (model.channel == "cli") if settings.subtasks_prefer_api else model.execution_priority,
+            not able,
+            (model.input_per_million + model.output_per_million) if able else -model.scores.overall,
+            -model.scores.reliability,
+        )
+    return min(available, key=key)
 
 
 def brief_writer(models: list[ModelProfile], configured: set[str]) -> Optional[ModelProfile]:

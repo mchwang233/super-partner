@@ -100,6 +100,79 @@ async def test_thinking_written_into_the_answer_is_kept_for_the_model_but_not_re
     assert sent[1]["messages"][2]["content"] == "<think>\nwrite it\n</think>\n"
 
 
+def anthropic_reply(blocks: list, stop: str = "end_turn") -> dict:
+    return {"content": blocks, "stop_reason": stop,
+            "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0}}
+
+
+def breakpoints(body: dict) -> int:
+    blocks = [*(body.get("system") or []), *(block for message in body["messages"]
+                                              if isinstance(message["content"], list) for block in message["content"])]
+    return sum("cache_control" in block for block in blocks)
+
+
+async def test_anthropic_tool_loops_read_the_conversation_from_the_prompt_cache(tmp_path, monkeypatch):
+    """Anthropic caches only up to blocks marked cache_control: the system prompt (with the tools
+    before it) and, each turn, the newest message, so the next turn reads all of it from the cache.
+    At most four marks are allowed, so older turns lose theirs."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    sent = []
+    write = {"type": "tool_use", "id": "t1", "name": "Write", "input": {"file_path": "a.txt", "content": "x"}}
+    registry = registry_with([
+        anthropic_reply([write], "tool_use"), anthropic_reply([{**write, "id": "t2"}], "tool_use"),
+        anthropic_reply([{"type": "text", "text": "done"}]),
+    ], sent)
+    try:
+        result = await registry.complete("anthropic:claude-x", "work", tmp_path, act=True)
+    finally:
+        await registry.client.aclose()
+    assert result.text == "done"
+    for body in sent:
+        assert body["system"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert body["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert breakpoints(body) == 2
+    # The marks are added to what is sent, not kept in the conversation.
+    assert "cache_control" not in json.dumps(sent[2]["messages"][:-1])
+
+
+async def test_each_provider_is_asked_for_the_effort_in_its_own_fields(monkeypatch):
+    for name in ("ZHIPU_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "MINIMAX_API_KEY"):
+        monkeypatch.setenv(name, "test")
+    sent = []
+    done = deepseek({"content": "ok"}, "stop")
+    registry = registry_with([done, done, done, anthropic_reply([{"type": "text", "text": "ok"}]),
+                              {"candidates": [{"content": {"parts": [{"text": "ok"}]}}], "usageMetadata": {}}], sent)
+    try:
+        await registry.complete("glm:glm-5.3", "plan", effort="medium")
+        await registry.complete("openai:gpt-x", "plan", effort="max")
+        await registry.complete("minimax:MiniMax-M3", "plan")  # no effort asked: none sent
+        await registry.complete("anthropic:claude-x", "plan", effort="none")
+        await registry.complete("google:gemini-x", "plan", effort="high")
+    finally:
+        await registry.client.aclose()
+    assert sent[0]["reasoning_effort"] == "high" and sent[1]["reasoning_effort"] == "xhigh"  # GLM: low, high or max
+    assert "reasoning_effort" not in sent[2]
+    assert sent[3]["output_config"] == {"effort": "low"}
+    assert sent[4]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "high"}
+    assert sent[4]["generationConfig"]["maxOutputTokens"] > 0
+
+
+async def test_a_model_that_rejects_the_effort_answers_without_it_from_then_on(monkeypatch):
+    monkeypatch.setenv("ZHIPU_API_KEY", "test")
+    sent = []
+    rejected = httpx.Response(400, json={"error": {"code": "1210", "message": "该模型始终思考，不支持关闭思考；请使用 low、high 或 max。"}})
+    done = deepseek({"content": "ok"}, "stop")
+    registry = registry_with([rejected, done, done], sent)
+    try:
+        first = await registry.complete("glm:glm-x", "plan", effort="medium")
+        second = await registry.complete("glm:glm-x", "plan", effort="medium")
+    finally:
+        await registry.client.aclose()
+    assert first.text == second.text == "ok"
+    assert sent[0]["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in sent[1] and "reasoning_effort" not in sent[2]
+
+
 async def test_tool_calls_continue_and_reasoning_goes_back_to_deepseek(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
     sent = []

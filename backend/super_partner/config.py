@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     allow_host_shell: bool = False
     default_budget_usd: float = 2.0
     max_parallel_nodes: int = 3
+    # Steps of one task running on one API provider at once; a step past it goes to another
+    # provider's model if one can do it for at most spread_cost_factor times the cost. Off (0) by
+    # default: steps one after another on one provider are fine (a failing one switches model
+    # anyway), and spreading would hand everyday steps to weaker models.
+    max_steps_per_provider: int = Field(default=0, ge=0)
+    spread_cost_factor: float = Field(default=3.0, ge=1.0)
     # API models work on files and run sandboxed commands through tools (agent.py); off, they
     # only return text and cannot be routed to nodes that change a project.
     api_agent: bool = True

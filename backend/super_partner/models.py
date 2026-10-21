@@ -76,6 +76,12 @@ class CapabilityScore(BaseModel):
     def score_for(self, capability: str) -> float:
         return float(getattr(self, capability, self.reliability))
 
+    @property
+    def overall(self) -> float:
+        """The mean of all scores: how capable the model is in general."""
+        return (self.coding + self.planning + self.research + self.chinese + self.tool_use
+                + self.structured_output + self.reliability) / 7
+
 
 class ModelProfile(BaseModel):
     id: str

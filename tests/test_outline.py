@@ -284,6 +284,21 @@ async def test_a_task_that_only_needs_a_contract_starts_before_the_part_it_build
     assert order[0] == "Task: 做页面" and database.get_run("o").status == RunStatus.SUCCEEDED
 
 
+def test_a_long_line_of_waits_goes_back_even_with_a_task_beside_it():
+    """Not only a split whose tasks all wait one after another: any line of four, in any order."""
+    near = outline.siblings([task("a", "A"), task("b", "B", ["a"]), task("x", "X"), task("c", "C", ["b"]),
+                             task("d", "D", ["c"])], False)
+    [problem] = [item for item in outline.task_problems(near) if "form one chain" in item]
+    assert "A → B → C → D" in problem
+
+
+def test_a_part_split_into_far_more_tasks_than_expected_goes_back():
+    six = outline.siblings([task(key, key.upper()) for key in "abcdef"], False)
+    assert any("expected to take about 3" in problem for problem in outline.task_problems(six, expected=3))
+    assert not any("expected" in problem for problem in outline.task_problems(six, expected=4))
+    assert not any("expected" in problem for problem in outline.task_problems(six))
+
+
 def test_a_part_split_into_one_long_chain_goes_back():
     chain = outline.siblings([task("a", "A"), task("b", "B", ["a"]), task("c", "C", ["b"]), task("d", "D", ["c"])], False)
     assert any("form one chain" in problem for problem in outline.task_problems(chain))

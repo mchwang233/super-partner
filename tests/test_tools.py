@@ -189,13 +189,28 @@ def test_an_api_step_is_estimated_turn_by_turn_with_its_cache():
     assert looped > 5 * one_call
     context, expected = routing.LOOP_BASE_TOKENS + 4000, 0.0
     for turn in range(15):
-        expected += token_cost(api, context, 600, context - routing.LOOP_TURN_GROWTH if turn else 0)
+        expected += token_cost(api, context, routing.LOOP_TURN_OUTPUT["medium"], context - routing.LOOP_TURN_GROWTH if turn else 0)
         context += routing.LOOP_TURN_GROWTH
     expected += token_cost(api, context, 800, context - routing.LOOP_TURN_GROWTH)
     assert looped == expected
     assert routing.node_cost(step, cli) == 0
     # A hard step takes more turns and thinks harder.
     assert routing.node_cost(step.model_copy(update={"difficulty": "hard"}), api) > looped
+
+
+@pytest.mark.parametrize("turns, actual", [(10, 0.01382), (12, 0.01341), (10, 0.01099)])
+def test_an_api_steps_estimate_matches_what_measured_runs_cost(turns, actual, monkeypatch):
+    """DeepSeek Flash at its highest effort on small coding tasks (2026-10-21): 10-12 turns of the
+    tool loop cost $0.011-0.014. Given the turns, the estimate is within a quarter of that."""
+    from super_partner import routing
+    from super_partner.models import ModelProfile, TaskNode
+
+    flash = ModelProfile(id="deepseek:flash", provider="deepseek", display_name="flash", context_window=1_000_000,
+                         input_per_million=0.15, output_per_million=0.6, cached_input_per_million=0.003)
+    step = TaskNode(id="a", title="A", instructions="i", capability="coding", difficulty="hard",
+                    estimated_input_tokens=1500, estimated_output_tokens=800)
+    monkeypatch.setattr(routing, "loop_turns", lambda node: turns)
+    assert 0.8 <= routing.node_cost(step, flash) / actual <= 1.25
 
 
 async def test_how_to_use_the_tools_is_a_system_prompt_for_every_provider(tmp_path, monkeypatch):
@@ -217,7 +232,8 @@ async def test_how_to_use_the_tools_is_a_system_prompt_for_every_provider(tmp_pa
     deepseek, anthropic, gemini = sent
     assert deepseek["messages"][0]["role"] == "system" and "Bash, Read, Write" in deepseek["messages"][0]["content"]
     assert deepseek["messages"][1] == {"role": "user", "content": "写一个待办工具"}
-    assert "Bash, Read, Write" in anthropic["system"] and anthropic["messages"][0]["content"] == "写一个待办工具"
+    assert "Bash, Read, Write" in anthropic["system"][0]["text"]
+    assert anthropic["messages"][0]["content"] == [{"type": "text", "text": "写一个待办工具", "cache_control": {"type": "ephemeral"}}]
     assert "Bash, Read, Write" in gemini["systemInstruction"]["parts"][0]["text"]
     assert "batch them" in deepseek["messages"][0]["content"]
 

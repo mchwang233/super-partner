@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -22,7 +23,14 @@ from .quota import ModelUnavailable, failure_kind
 from .recovery import retry_model, turns_for
 from .refining import PREFIX, Refining
 from .review import Reviewing
-from .routing import NoEligibleModelError, can_act, eligible_for_node, node_cost, route_node
+from .routing import (
+    NoEligibleModelError,
+    can_act,
+    eligible_for_node,
+    node_cost,
+    route_node,
+    spread_to,
+)
 from .self_repair import SelfRepair
 
 # How a model call that ran out of turns reads in an attempt's reason (providers.TURN_LIMIT_MARK).
@@ -280,6 +288,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                     self._save(run)
                     self.emit(run_id, "approval.required", reason="model_unavailable", node_id=node.id)
                     return
+                self._spread(run, node)
                 if node.estimated_cost_usd and run.actual_cost_usd + node.estimated_cost_usd > run.budget_usd:
                     self._pause_for_budget(run)
                     return
@@ -390,6 +399,28 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                        any(item.kind == "image" for item in run.attachments))
             self.emit(run.id, "node.model_switched", node_id=node.id, model_id=previous,
                       next_model_id=node.model_id, reason="model_configuration_changed")
+
+    def _spread(self, run, node) -> None:
+        """Keep one API provider from carrying all of the task's running steps, so that its
+        outage or rate limit does not stop them all: past ``max_steps_per_provider`` the node
+        goes to another provider's model when one fits (routing.spread_to)."""
+        cap = settings.max_steps_per_provider
+        provider = (node.model_id or "").split(":", 1)[0]
+        if not cap or not node.model_id or provider in ("cli", "mock"):
+            return
+        running = Counter((item.model_id or "").split(":", 1)[0] for item in run.plan.nodes
+                          if item.status == NodeStatus.RUNNING and item.id != node.id)
+        if running[provider] < cap:
+            return
+        busy = {name for name, count in running.items() if count >= cap}
+        other = spread_to(node, list(self.model_lookup.values()), self._configured(run), busy,
+                          any(item.kind == "image" for item in run.attachments))
+        if other is None:
+            return
+        previous, node.model_id = node.model_id, other.id
+        node.estimated_cost_usd = round(node_cost(node, other), 6)
+        self.emit(run.id, "node.model_switched", node_id=node.id, model_id=previous,
+                  next_model_id=other.id, reason="spread_across_providers")
 
     def _out_of_quota(self, model_id: Optional[str]) -> bool:
         quota = getattr(self.providers, "quota", None)

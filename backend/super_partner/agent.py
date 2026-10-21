@@ -736,17 +736,38 @@ class Workspace:
         # Without pasta, an allowed network falls back to the host's own (local services included).
         network = (network_prefix(proxy_ports()) if network_available() else []) if self.network else []
         isolated = [] if self.network else ["--unshare-net"]
+        outer, inner, masked = self._platform_data()
         return [
             *network,
             "bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--bind", self.tmp(), "/tmp", *bridge,
-            # Hide the user's home (keys, tokens, other projects), then expose only this folder
-            # and the tools the environment repairs installed.
-            *hidden, *shared, "--bind", str(self.root), str(self.root),
+            # Hide the user's home (keys, tokens, other projects) and the platform's data (its
+            # database, every task's folder), then expose only this folder and the tools the
+            # environment repairs installed.
+            *hidden, *outer, "--bind", str(self.root), str(self.root), *inner, *masked, *shared,
             *isolated, "--unshare-pid", "--die-with-parent", "--new-session",
             "--clearenv", *[arg for name, value in env.items() for arg in ("--setenv", name, value)],
             "--chdir", str(self.root), "--", "/bin/bash", "-c",
             _listen_script(ports) + self._script("/tmp/.sp-cwd"), "bash", str(self.cwd), command,
         ]
+
+    def _platform_data(self) -> tuple[list[str], list[str], list[str]]:
+        """bwrap arguments hiding Super Partner's own data from a step: the data folder and the
+        folder of all tasks, as empty folders (those around this task's folder before it is
+        mounted, those inside it after), and the database file if it is kept elsewhere.
+        Anything under /tmp is already out of sight: the sandbox has its own /tmp."""
+        def visible(path: Path) -> bool:
+            return not _within(path, Path("/tmp").resolve()) and path != Path("/")
+
+        folders = {Path(settings.data_dir).resolve(), Path(settings.workspace_root).resolve()} - {self.root}
+        folders = {folder for folder in folders if visible(folder) and folder.is_dir()}
+        outer = [arg for folder in sorted(folders) if not _within(folder, self.root) for arg in ("--tmpfs", str(folder))]
+        inner = [arg for folder in sorted(folders) if _within(folder, self.root) for arg in ("--tmpfs", str(folder))]
+        database = Path(settings.db_path).resolve()
+        files = [Path(f"{database}{suffix}") for suffix in ("", "-wal", "-shm", "-journal")]
+        masked = [arg for file in files
+                  if file.is_file() and visible(file) and not any(_within(file, folder) for folder in folders)
+                  for arg in ("--ro-bind", "/dev/null", str(file))]
+        return outer, inner, masked
 
     def host_args(self, command: str) -> list[str]:
         """The host as the user, network included, minus API keys; bubblewrap still sets

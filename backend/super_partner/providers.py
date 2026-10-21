@@ -15,7 +15,7 @@ import httpx
 
 from . import agent as agent_tools
 from . import attachments as files
-from . import progress
+from . import progress, streaming
 from .budget import BudgetExceeded, ProviderError
 from .cli_channels import CLI_SPECS, CliChannelRegistry, SessionLost
 from .config import settings
@@ -197,6 +197,8 @@ class ProviderRegistry:
         # The live catalog (updated in place by catalog sync), for each model's output ceiling.
         self.models = models if models is not None else {}
         self.max_attempts = 4
+        # Models that rejected a reasoning effort: they are sent none (see _send).
+        self.no_effort: set[str] = set()
         self.retry_base_delay = 1.0
         self.retry_max_delay = 30.0
 
@@ -331,9 +333,9 @@ class ProviderRegistry:
             agent.watch, agent.overrun = watch, overrun
         try:
             if provider == "anthropic":
-                return await self._anthropic(model, prompt, images, agent, spend_ok)
+                return await self._anthropic(model, prompt, images, agent, spend_ok, effort)
             if provider == "google":
-                return await self._gemini(model, prompt, images, agent, spend_ok)
+                return await self._gemini(model, prompt, images, agent, spend_ok, effort)
             return await self._openai_compatible(provider, model, prompt, images, agent, spend_ok,
                                                  conversation if agent else None, effort)
         finally:
@@ -372,17 +374,28 @@ class ProviderRegistry:
             )
         return "Connection verified"
 
-    async def _post(self, provider: str, url: str, **kwargs) -> httpx.Response:
-        """POST with exponential backoff on rate limits, server errors, and network failures."""
+    async def _post(self, provider: str, url: str, stream: Optional[streaming.Assemble] = None,
+                    **kwargs) -> httpx.Response:
+        """POST with exponential backoff on rate limits, server errors, and network failures.
+
+        With ``stream`` the reply comes as server-sent events, put back together by ``stream``
+        into the reply the provider sends without streaming. The request is then stopped only
+        when nothing at all arrives for ``api_reply_deadline``: a model may think for long, as
+        long as it keeps sending."""
+        deadline = settings.api_reply_deadline
         for attempt in range(1, self.max_attempts + 1):
             delay = self.retry_base_delay * 2 ** (attempt - 1)
             try:
-                response = await asyncio.wait_for(self.client.post(url, **kwargs), settings.api_reply_deadline)
+                response = await (self._stream(url, stream, deadline, **kwargs) if stream
+                                  else asyncio.wait_for(self.client.post(url, **kwargs), deadline))
             except asyncio.TimeoutError as exc:
                 # Sending it again would most likely hang again: fail now so another model takes over
-                # (quota.UNAVAILABLE matches "request failed").
-                raise ProviderError(f"{provider} request failed: {settings.api_reply_deadline / 60:g} 分钟没有回复，"
+                # (quota.UNAVAILABLE matches "request failed"). A stream that stopped is StreamSilent.
+                silence = "回复中途停了，没有收到任何数据" if isinstance(exc, StreamSilent) else "没有回复"
+                raise ProviderError(f"{provider} request failed: {deadline / 60:g} 分钟{silence}，"
                                     "已停止这次请求") from exc
+            except streaming.StreamError as exc:
+                raise ProviderError(f"{provider} returned an error in its stream: {exc}") from exc
             except httpx.TransportError as exc:
                 if attempt == self.max_attempts:
                     raise ProviderError(f"{provider} request failed: {exc}") from exc
@@ -395,6 +408,27 @@ class ProviderRegistry:
                     pass
             await asyncio.sleep(min(delay, self.retry_max_delay))
         raise AssertionError("unreachable")
+
+    async def _stream(self, url: str, assemble: streaming.Assemble, deadline: float, **kwargs) -> httpx.Response:
+        """One streamed POST, waiting at most ``deadline`` for each piece. An error, or a reply
+        that is not a stream (a provider that ignores ``stream``), is returned as it came."""
+        request = self.client.build_request("POST", url, **kwargs)
+        response = await asyncio.wait_for(self.client.send(request, stream=True), deadline)
+        try:
+            if response.is_error or "text/event-stream" not in response.headers.get("content-type", ""):
+                await asyncio.wait_for(response.aread(), deadline)
+                return response
+            lines, pieces = [], response.aiter_lines()
+            while True:
+                try:
+                    lines.append(await asyncio.wait_for(pieces.__anext__(), deadline))
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as exc:
+                    raise StreamSilent() from exc
+            return httpx.Response(200, json=assemble(streaming.events(lines)), request=request)
+        finally:
+            await response.aclose()
 
     async def _loop(self, provider: str, model: str, prompt: str, images, agent, spend_ok, step,
                     conversation: Optional[Conversation] = None):
@@ -512,11 +546,15 @@ class ProviderRegistry:
             raise
 
     def _reasoning(self, provider: str, model: str, effort: Optional[str] = None) -> dict:
-        """DeepSeek's reasoning effort, for its models that reason (or are not known not to)."""
-        known = self.models.get(f"{provider}:{model}")
-        if provider != "deepseek" or getattr(known, "supports_reasoning", None) is False:
+        """How hard the model should think, in the request fields its API takes: ``effort``
+        (settings.reasoning_by_difficulty for steps), or for DeepSeek without one its configured
+        effort. Nothing for a model known not to reason, or that rejected these fields before."""
+        model_id = f"{provider}:{model}"
+        known = self.models.get(model_id)
+        effort = effort or (settings.deepseek_reasoning_effort if provider == "deepseek" else None)
+        if not effort or getattr(known, "supports_reasoning", None) is False or model_id in self.no_effort:
             return {}
-        return {"reasoning_effort": effort or settings.deepseek_reasoning_effort}
+        return reasoning_fields(provider, effort)
 
     def output_ceiling(self, model_id: str) -> int:
         model = self.models.get(model_id)
@@ -546,6 +584,13 @@ class ProviderRegistry:
             ):
                 maximum = state["maximum"] = max(PLAIN_OUTPUT_TOKENS, state["limit"] // 2)
                 continue
+            if response.status_code == 400 and EFFORT_REJECTED.search(response.text) and _drop_reasoning(body):
+                # A model that does not take the effort (or this value of it) answers without one,
+                # and is sent none from then on if that works.
+                retried = await self._post(provider, url, json=body, **kwargs)
+                if not retried.is_error:
+                    self.no_effort.add(model_id)
+                return retried
             return response
 
     async def _openai_compatible(
@@ -580,9 +625,10 @@ class ProviderRegistry:
             if state["tools"]:
                 body["tools"] = [{"type": "function", "function": tool} for tool in state["tools"]]
             field = "max_completion_tokens" if provider == "openai" else "max_tokens"
+            body.update(stream=True, stream_options={"include_usage": True})
             response = await self._send(
                 provider, f"{provider}:{model}", url, body, lambda body, limit: body.update({field: limit}),
-                state, spend_ok, headers={"Authorization": f"Bearer {os.environ[env]}"},
+                state, spend_ok, headers={"Authorization": f"Bearer {os.environ[env]}"}, stream=streaming.openai,
             )
             if response.is_error:
                 raise ProviderError(f"{provider} returned {response.status_code}: {response.text[:300]}")
@@ -607,7 +653,8 @@ class ProviderRegistry:
 
         return await self._loop(provider, model, prompt, images, agent, spend_ok, step, conversation)
 
-    async def _anthropic(self, model: str, prompt: str, images: list[Attachment] = (), agent=None, spend_ok=None) -> ProviderResult:
+    async def _anthropic(self, model: str, prompt: str, images: list[Attachment] = (), agent=None, spend_ok=None,
+                         effort: Optional[str] = None) -> ProviderResult:
         async def step(state):
             if state["history"] is None:
                 state["history"] = [{"role": "user", "content": [
@@ -621,18 +668,21 @@ class ProviderRegistry:
                     {"type": "tool_result", "tool_use_id": call_id, "content": output}
                     for call_id, _name, output in state["results"]
                 ]})
-            body = {"model": model, "messages": state["history"]}
+            body = {"model": model, "messages": _cache_point(state["history"]), **self._reasoning("anthropic", model, effort)}
             if state.get("system"):
-                body["system"] = state["system"]
+                # The tools come before the system prompt in Anthropic's cache, so this caches both.
+                body["system"] = [{"type": "text", "text": state["system"], "cache_control": CACHE_POINT}]
             if state["tools"]:
                 body["tools"] = [
                     {"name": tool["name"], "description": tool["description"], "input_schema": tool["parameters"]}
                     for tool in state["tools"]
                 ]
+            body["stream"] = True
             response = await self._send(
                 "anthropic", f"anthropic:{model}", "https://api.anthropic.com/v1/messages", body,
                 lambda body, limit: body.update(max_tokens=limit), state, spend_ok,
                 headers={"x-api-key": os.environ[PROVIDER_ENV["anthropic"]], "anthropic-version": "2023-06-01"},
+                stream=streaming.anthropic,
             )
             if response.is_error:
                 raise ProviderError(f"anthropic returned {response.status_code}: {response.text[:300]}")
@@ -654,7 +704,8 @@ class ProviderRegistry:
 
         return await self._loop("anthropic", model, prompt, images, agent, spend_ok, step)
 
-    async def _gemini(self, model: str, prompt: str, images: list[Attachment] = (), agent=None, spend_ok=None) -> ProviderResult:
+    async def _gemini(self, model: str, prompt: str, images: list[Attachment] = (), agent=None, spend_ok=None,
+                      effort: Optional[str] = None) -> ProviderResult:
         async def step(state):
             if state["history"] is None:
                 state["history"] = [{"role": "user", "parts": [
@@ -666,16 +717,16 @@ class ProviderRegistry:
                     {"functionResponse": {"name": name, "response": {"result": output}}}
                     for _call_id, name, output in state["results"]
                 ]})
-            body = {"contents": state["history"]}
+            body = {"contents": state["history"], **self._reasoning("google", model, effort)}
             if state.get("system"):
                 body["systemInstruction"] = {"parts": [{"text": state["system"]}]}
             if state["tools"]:
                 body["tools"] = [{"functionDeclarations": state["tools"]}]
             response = await self._send(
                 "google", f"google:{model}",
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", body,
-                lambda body, limit: body.update(generationConfig={"maxOutputTokens": limit}), state, spend_ok,
-                params={"key": os.environ[PROVIDER_ENV["google"]]},
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent", body,
+                lambda body, limit: body.setdefault("generationConfig", {}).update(maxOutputTokens=limit), state, spend_ok,
+                params={"key": os.environ[PROVIDER_ENV["google"]], "alt": "sse"}, stream=streaming.gemini,
             )
             if response.is_error:
                 raise ProviderError(f"google returned {response.status_code}: {response.text[:300]}")
@@ -696,6 +747,66 @@ class ProviderRegistry:
             )
 
         return await self._loop("google", model, prompt, images, agent, spend_ok, step)
+
+
+# A 400 about the reasoning effort fields, as providers word it ("Unsupported parameter:
+# 'reasoning_effort'", "reasoning_effort 参数值非法", "Unknown name \"thinkingConfig\"").
+EFFORT_REJECTED = re.compile(r"reasoning|effort|thinking|output_config|思考|推理", re.IGNORECASE)
+# Reasoning effort, from least to most, as settings give it (reasoning_by_difficulty).
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def reasoning_fields(provider: str, effort: str) -> dict:
+    """Request fields asking ``provider``'s model for ``effort``: Anthropic's output_config,
+    Gemini's thinking level, and reasoning_effort for OpenAI and the providers compatible with it
+    (DeepSeek and others take the whole scale; GLM only low, high and max; OpenAI tops out at
+    xhigh)."""
+    level = effort if effort in EFFORTS else ("max" if effort == "ultra" else "medium")
+    if provider == "anthropic":
+        return {"output_config": {"effort": {"none": "low", "minimal": "low"}.get(level, level)}}
+    if provider == "google":
+        thinking = "low" if EFFORTS.index(level) <= EFFORTS.index("low") else "high"
+        return {"generationConfig": {"thinkingConfig": {"thinkingLevel": thinking}}}
+    if provider == "deepseek":
+        return {"reasoning_effort": effort}
+    if provider == "glm":
+        # GLM 5.x always thinks and takes only low, high or max (2026-10-21: "medium" is a 400).
+        return {"reasoning_effort": "low" if EFFORTS.index(level) <= EFFORTS.index("low")
+                else "high" if EFFORTS.index(level) <= EFFORTS.index("high") else "max"}
+    if provider == "openai" and level == "max":
+        level = "xhigh"
+    return {"reasoning_effort": level}
+
+
+def _drop_reasoning(body: dict) -> bool:
+    """Take the reasoning effort out of a request body; whether it had one."""
+    found = body.pop("reasoning_effort", None) is not None
+    found = body.pop("output_config", None) is not None or found
+    config = body.get("generationConfig") or {}
+    return config.pop("thinkingConfig", None) is not None or found
+
+
+class StreamSilent(asyncio.TimeoutError):
+    """A streamed reply that started, then sent nothing for the whole deadline."""
+
+
+# Anthropic caches a request only up to a block marked like this (at most four per request).
+CACHE_POINT = {"type": "ephemeral"}
+
+
+def _cache_point(history: list[dict]) -> list[dict]:
+    """The conversation to send with its newest message marked for the prompt cache: the next
+    turn then reads everything up to it from the cache. The history itself stays unmarked, so
+    older turns do not keep their marks."""
+    if not history:
+        return history
+    last = dict(history[-1])
+    content = last["content"]
+    blocks = [{"type": "text", "text": content}] if isinstance(content, str) else [dict(block) for block in content]
+    if blocks:
+        blocks[-1]["cache_control"] = CACHE_POINT
+    last["content"] = blocks
+    return [*history[:-1], last]
 
 
 def _arguments(raw) -> dict:

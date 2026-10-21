@@ -487,6 +487,64 @@ async def test_tools_from_environment_repairs_reach_the_sandbox(tmp_path, monkey
         shutil.rmtree(root, ignore_errors=True)
 
 
+@pytest.fixture
+def outside_tmp():
+    """A scratch folder outside /tmp, which every sandbox replaces with its own."""
+    import shutil
+    import tempfile
+    folder = Path(tempfile.mkdtemp(prefix=".sandbox-test-", dir=Path(__file__).parent))
+    yield folder
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+@needs_bwrap
+async def test_a_step_cannot_read_other_tasks_or_the_platform_data(outside_tmp, monkeypatch):
+    """Only this task's folder and the shared tools: not the other tasks' folders, the platform's
+    database (every task's requests, plans and lead conversations) or the rest of its data."""
+    tmp_path = outside_tmp
+    monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
+    monkeypatch.setattr(settings, "workspace_root", tmp_path / "workspaces")
+    elsewhere = tmp_path / "db" / "elsewhere.db"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text("other database")
+    monkeypatch.setattr(settings, "database_path", elsewhere)
+    tools = environment.prepare()
+    (tools / "bin" / "mytool").write_text("#!/bin/sh\necho tool-ran\n")
+    (tools / "bin" / "mytool").chmod(0o755)
+    (settings.data_dir / "super-partner.db").write_text("all tasks")
+    (settings.data_dir / "supervisors").mkdir()
+    mine, other = settings.workspace_root / "task-a", settings.workspace_root / "task-b"
+    mine.mkdir(parents=True)
+    other.mkdir()
+    (other / "secret.txt").write_text("task b")
+    output = await agent.Workspace(mine).call("Bash", {"command": (
+        f"ls {settings.workspace_root}; cat {other}/secret.txt {settings.data_dir}/super-partner.db {elsewhere} "
+        f"2>/dev/null; ls {settings.data_dir}; mytool; echo ok > {mine}/mine.txt && cat {mine}/mine.txt"
+    )})
+    assert "task b" not in output and "all tasks" not in output and "other database" not in output
+    assert "task-b" not in output and "supervisors" not in output
+    assert "task-a" in output and "tool-ran" in output and output.rstrip().endswith("ok")
+
+
+@needs_bwrap
+async def test_a_task_in_the_platforms_own_folder_still_cannot_read_its_data(outside_tmp, monkeypatch):
+    project = outside_tmp / "project"
+    monkeypatch.setattr(settings, "data_dir", project / ".super-partner")
+    monkeypatch.setattr(settings, "workspace_root", project / "workspaces")
+    monkeypatch.setattr(settings, "database_path", None)
+    tools = environment.prepare()
+    (tools / "bin" / "mytool").write_text("#!/bin/sh\necho tool-ran\n")
+    (tools / "bin" / "mytool").chmod(0o755)
+    (settings.data_dir / "super-partner.db").write_text("all tasks")
+    (project / "workspaces" / "task-b").mkdir(parents=True)
+    (project / "main.py").write_text("print('project')\n")
+    output = await agent.Workspace(project).call("Bash", {"command": (
+        "cat main.py; cat .super-partner/super-partner.db 2>/dev/null; ls workspaces; mytool"
+    )})
+    assert "print('project')" in output and "tool-ran" in output
+    assert "all tasks" not in output and "task-b" not in output
+
+
 @needs_bwrap
 async def test_host_mode_commands_leave_the_sandbox_but_cannot_use_sudo(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
@@ -557,7 +615,8 @@ async def test_anthropic_and_gemini_models_call_tools_until_done(tmp_path, monke
     finally:
         await registry.client.aclose()
     assert claude.text == "It says remember this" and (claude.input_tokens, claude.output_tokens) == (12, 6)
-    assert sent[1]["messages"][-1]["content"][0] == {"type": "tool_result", "tool_use_id": "t1", "content": "     1\tremember this"}
+    assert sent[1]["messages"][-1]["content"][0] == {"type": "tool_result", "tool_use_id": "t1", "content": "     1\tremember this",
+                                                     "cache_control": {"type": "ephemeral"}}
     assert sent[0]["tools"][0]["input_schema"]["type"] == "object"
     assert gemini.text == "Found notes.md"
     assert sent[3]["contents"][-1]["parts"][0]["functionResponse"]["name"] == "LS"

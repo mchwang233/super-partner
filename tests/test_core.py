@@ -176,6 +176,29 @@ def test_planner_difficulty_sets_the_threshold_and_old_plans_derive_it():
     assert (saved.difficulty, saved.quality_threshold) == ("hard", 92)
 
 
+def test_a_result_is_checked_by_a_model_no_weaker_than_the_one_that_made_it():
+    """A cheap model scoring high on reliability alone (MiniMax M3 against DeepSeek Flash) is
+    not a fit judge of a generally stronger model's work."""
+    from super_partner.models import CapabilityScore, ModelProfile
+    from super_partner.routing import pick_reviewer
+
+    def api(model_id, overall, reliability, price):
+        scores = CapabilityScore(**{name: overall for name in ("coding", "planning", "research", "chinese",
+                                                              "tool_use", "structured_output")}, reliability=reliability)
+        return ModelProfile(id=model_id, provider=model_id.split(":")[0], display_name=model_id, context_window=1_000_000,
+                            input_per_million=price, output_per_million=price * 4, cached_input_per_million=price / 10,
+                            scores=scores)
+    flash, weak, strong, strongest = (api("deepseek:flash", 92, 87.5, 0.15), api("minimax:m3", 88, 93.5, 0.3),
+                                      api("glm:glm", 93, 92.4, 1.2), api("kimi:k3", 95, 89, 3.0))
+    models = [flash, weak, strong, strongest]
+    ids = {model.id for model in models}
+    # The cheapest one at least as capable as the model checked, not the most reliable.
+    assert pick_reviewer(models, ids, exclude="deepseek:flash", tokens=1000).id == "glm:glm"
+    # Checking the strongest: none is as capable, so the most capable of the rest.
+    assert pick_reviewer(models, ids, exclude="kimi:k3", tokens=1000).id == "glm:glm"
+    assert pick_reviewer(models, ids - {"glm:glm", "kimi:k3"}, exclude="deepseek:flash", tokens=1000).id == "minimax:m3"
+
+
 def test_reviews_also_go_to_api_models_first():
     from super_partner.routing import pick_reviewer
     models = scored_models()

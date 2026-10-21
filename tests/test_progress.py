@@ -132,7 +132,7 @@ async def test_the_executor_asks_another_model_and_records_the_check(tmp_path, m
     monkeypatch.setattr(settings, "workspace_root", tmp_path / "workspaces")
     database = Database(tmp_path / "test.db")
     one_node_run(database)
-    asked = []
+    asked, efforts = [], []
 
     class Checker:
         def configured_models(self, ids):
@@ -140,6 +140,7 @@ async def test_the_executor_asks_another_model_and_records_the_check(tmp_path, m
 
         async def complete(self, model_id, prompt, workspace=None, **kwargs):
             asked.append((model_id, prompt))
+            efforts.append(kwargs.get("effort"))
             return ProviderResult("同一条命令失败了 9 次\nVERDICT: STOP: 反复运行同一条失败的命令", 0, 0, model_id)
 
     executor = Executor(database, Checker(), MODELS)
@@ -150,6 +151,7 @@ async def test_the_executor_asks_another_model_and_records_the_check(tmp_path, m
     # Not the model at work, and it saw the step and the evidence.
     [(checker, prompt)] = asked
     assert checker == "cli:claude" and "run node --check" in prompt and "turn 9" in prompt
+    assert efforts == ["low"]  # a quick yes or no, not the step's effort
     event = [e for e in database.events("r") if e.kind == "node.progress_check"][-1]
     assert event.data["stop"] is True and event.data["reason"] == reason
 

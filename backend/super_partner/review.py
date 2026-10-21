@@ -17,6 +17,8 @@ from .routing import can_act, pick_reviewer
 
 # Reviewers tried in turn when one is out of quota.
 MAX_BACKUPS = 3
+# Reasoning effort for the check on a long attempt (a short yes or no).
+PROGRESS_EFFORT = "low"
 
 
 class Reviewing:
@@ -64,6 +66,8 @@ class Reviewing:
                 reply = await self._complete(
                     run, node, reviewer.id, prompt, folder, cli_timeout=300, allow_api_fallback=False,
                     review_workspace=workspace if can_act(reviewer) else None, review_files=references,
+                    # A harder step's result deserves a harder look.
+                    effort=settings.reasoning_by_difficulty.get(node.difficulty),
                 )
                 review_cost += reply.accounted_cost_usd
                 payload = quality.parse_review(reply.text)
@@ -112,8 +116,9 @@ class Reviewing:
                 folder = settings.workspace_root / run.folder_id / ".review"
                 folder.mkdir(parents=True, exist_ok=True)
                 try:
+                    # Whether an attempt is stuck is a quick call: little thinking needed.
                     reply = await self._complete(run, node, checker.id, prompt, folder, cli_timeout=300,
-                                                 allow_api_fallback=False)
+                                                 allow_api_fallback=False, effort=PROGRESS_EFFORT)
                     reason = progress.parse(reply.text)
                 except (asyncio.CancelledError, BudgetExceeded):
                     raise
