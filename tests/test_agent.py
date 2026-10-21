@@ -120,7 +120,7 @@ async def test_bash_keeps_tmp_and_its_directory_through_the_attempt(command_work
     assert not Path(tmp).exists()
     instructions = ws.instructions()
     assert "/tmp for this whole attempt" in instructions and "working directory between calls" in instructions
-    assert "Files outside it are read-only" in instructions
+    assert "in /tmp (the same /tmp Bash sees)" in instructions
 
 
 @needs_bwrap

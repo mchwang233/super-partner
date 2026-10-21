@@ -26,7 +26,7 @@ import shutil
 import signal
 import tempfile
 import weakref
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 from . import environment
@@ -60,6 +60,10 @@ SANDBOX_PORTS_DIR = "/tmp/.sp-ports"
 # Proxy settings a networked sandbox keeps, so commands reach the internet the way the user does.
 PROXY_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy")
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+def _within(path: Path, folder: Path) -> bool:
+    return path == folder or folder in path.parents
 
 
 class ToolError(Exception):
@@ -188,7 +192,8 @@ READ_ONLY_TOOLS = {"Read", "Glob", "Grep", "LS"}
 AGENT_INSTRUCTIONS = (
     "You are working in {root} with the tools Bash, Read, Write, Edit, MultiEdit, Glob, Grep and LS. "
     "Do the work with them rather than describing it, and check it (build, run the tests) when useful.\n"
-    "- File paths may be absolute or relative to the working directory. Files outside it are read-only.\n"
+    "- File paths may be absolute or relative to the working directory. The file tools work in the "
+    "working directory and in /tmp (the same /tmp Bash sees); look at other files, read-only, with Bash.\n"
     "- Bash keeps its working directory between calls and /tmp for this whole attempt; its output "
     "comes back to you in full. Commands have no network access{ports}.{profiles}\n"
     "- Search with Grep and Glob, read with Read, and change files with Edit or MultiEdit (Write for new "
@@ -404,9 +409,14 @@ class Workspace:
             raise ToolError("file_path is required")
         try:
             path = (self.root / raw).resolve()
+            scratch = self._scratch()
+            if (scratch and not _within(path, self.root) and not _within(path, scratch)
+                    and PurePosixPath(raw).parts[:2] == ("/", "tmp")):
+                # Bash's /tmp is this attempt's own folder: the file tools see the same one.
+                path = scratch.joinpath(*PurePosixPath(raw).parts[2:]).resolve()
         except (OSError, ValueError, RuntimeError) as exc:
             raise ToolError("invalid path") from exc
-        if path != self.root and self.root not in path.parents:
+        if not _within(path, self.root) and not (scratch and _within(path, scratch)):
             raise ToolError(f"{raw} is outside the working directory")
         if self.read_only and review_path(
             self.root, self._relative(path), allow_hidden_log=path in self.readable_files,
@@ -428,7 +438,14 @@ class Workspace:
         if self.read_only:
             raise ToolError("review workspace is read-only; writes and commands are unavailable")
 
+    def _scratch(self) -> Path | None:
+        """This attempt's /tmp as the file tools reach it; a review or a host repair has none."""
+        return None if self.read_only or self.host else Path(self.tmp()).resolve()
+
     def _relative(self, path: Path) -> str:
+        scratch = self._scratch()
+        if scratch and _within(path, scratch):
+            return PurePosixPath("/tmp", path.relative_to(scratch).as_posix()).as_posix()
         return path.relative_to(self.root).as_posix() or "."
 
     def _files(self, base: Path):

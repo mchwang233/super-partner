@@ -51,6 +51,17 @@ def cached_tokens(usage: dict) -> int:
     return int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
 
 
+# Thinking some models (MiniMax) write into the content rather than a field of its own.
+THINKING = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+
+def _answer(content):
+    """A reply's content without written-out thinking: kept in the history, not in the answer."""
+    if not isinstance(content, str) or "<think>" not in content:
+        return content
+    return THINKING.sub("", content).strip()
+
+
 @dataclass
 class Conversation:
     """An acting API model's conversation for one step, kept so that the step's next attempt
@@ -588,7 +599,7 @@ class ProviderRegistry:
                     reply["reasoning_content"] = message["reasoning_content"]
                 state["history"].append(reply)
             return (
-                message.get("content"),
+                _answer(message.get("content")),
                 [(call["id"], call["function"]["name"], _arguments(call["function"].get("arguments"))) for call in calls],
                 usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
                 choice.get("finish_reason") == "length",

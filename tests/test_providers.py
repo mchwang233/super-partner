@@ -81,6 +81,25 @@ async def test_a_length_cut_turn_without_tool_calls_is_an_error_not_an_empty_suc
     assert caught.value.usage.output_tokens == 4096
 
 
+async def test_thinking_written_into_the_answer_is_kept_for_the_model_but_not_returned(tmp_path, monkeypatch):
+    """MiniMax puts its thinking in the content as <think>...</think>: the tool loop sends it back,
+    as MiniMax asks, but the answer the platform reads (a summary, a JSON plan) leaves it out."""
+    monkeypatch.setenv("MINIMAX_API_KEY", "test")
+    sent = []
+    registry = registry_with([
+        deepseek({"content": "<think>\nwrite it\n</think>\n", "tool_calls": [WRITE_CALL]}, "tool_calls"),
+        deepseek({"content": "<think>\ndone?\n</think>\n\nWrote mail.py"}, "stop"),
+        deepseek({"content": '<think>plan</think>{"steps": []}'}, "stop"),
+    ], sent)
+    try:
+        acted = await registry.complete("minimax:MiniMax-M3", "work", tmp_path, act=True)
+        plain = await registry.complete("minimax:MiniMax-M3", "plan")
+    finally:
+        await registry.client.aclose()
+    assert acted.text == "Wrote mail.py" and plain.text == '{"steps": []}'
+    assert sent[1]["messages"][2]["content"] == "<think>\nwrite it\n</think>\n"
+
+
 async def test_tool_calls_continue_and_reasoning_goes_back_to_deepseek(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
     sent = []

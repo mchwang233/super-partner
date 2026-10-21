@@ -220,3 +220,26 @@ async def test_how_to_use_the_tools_is_a_system_prompt_for_every_provider(tmp_pa
     assert "Bash, Read, Write" in anthropic["system"] and anthropic["messages"][0]["content"] == "写一个待办工具"
     assert "Bash, Read, Write" in gemini["systemInstruction"]["parts"][0]["text"]
     assert "batch them" in deepseek["messages"][0]["content"]
+
+
+async def test_file_tools_reach_the_same_tmp_as_bash(ws):
+    """A model writes a scratch script to /tmp with Write and runs it with Bash, as in Claude Code."""
+    assert await ws.call("Write", {"file_path": "/tmp/check.py", "content": "print('hi')\n"}) == "Created /tmp/check.py (1 lines)"
+    assert (await ws.call("Read", {"file_path": "/tmp/check.py"})).startswith("     1\tprint('hi')")
+    assert (await ws.call("Edit", {"file_path": "/tmp/check.py", "old_string": "hi", "new_string": "ok"})).startswith(
+        "Edited /tmp/check.py (1 replacement)")
+    assert await ws.call("Glob", {"pattern": "*.py", "path": "/tmp"}) == "/tmp/check.py"
+    assert (agent.Path(ws.tmp()) / "check.py").read_text() == "print('ok')\n"
+    assert "outside the working directory" in await ws.call("Write", {"file_path": "/tmp/../etc/x", "content": ""})
+    assert "outside the working directory" in await ws.call("Read", {"file_path": "/etc/hostname"})
+
+
+async def test_a_review_and_a_host_repair_keep_tmp_out_of_reach(tmp_path):
+    (tmp_path / "w").mkdir()
+    for workspace in (Workspace(tmp_path / "w", read_only=True), Workspace(tmp_path / "w", host=True)):
+        assert (await workspace.call("Read", {"file_path": "/tmp/x"})).startswith("Error:")
+
+
+def test_the_instructions_say_where_the_file_tools_work():
+    text = agent.agent_instructions(root="/w")
+    assert "Files outside it are read-only" not in text and "and in /tmp" in text
