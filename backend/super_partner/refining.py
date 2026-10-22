@@ -9,14 +9,19 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from . import contracts, outline, supervisor
+from . import outline, supervisor
 from .config import settings
-from .models import RunStatus
+from .models import FINISHED, RunStatus
 from .routing import NoEligibleModelError, fit_and_route, reestimate
 
 logger = logging.getLogger(__name__)
 # What the executor's run loop calls a split at work, beside its nodes.
 PREFIX = "part:"
+
+
+def _pending_part(run, part_id):
+    if run and run.status not in FINISHED:
+        return next((part for part in run.plan.parts if part.id == part_id and part.status != "ready"), None)
 
 
 class Refining:
@@ -32,7 +37,8 @@ class Refining:
     async def _split_part(self, run_id: str, part_id: str) -> None:
         async with self.locks.setdefault(run_id, asyncio.Lock()):
             run = self.db.get_run(run_id)
-            part = next(item for item in run.plan.parts if item.id == part_id)
+            if not (part := _pending_part(run, part_id)):
+                return
             part.status, part.error = "refining", None
             effort = settings.lead_reasoning_effort
             if settings.adaptive_refinement:
@@ -52,57 +58,66 @@ class Refining:
         # The task's own lead first: it made the outline.
         lead = run.supervisor.model_id if run.supervisor else None
         leads.sort(key=lambda model: model.id != lead)
-        error, split, used = "没有可用的负责人模型", None, None
+        error, conflict = "没有可用的负责人模型", None
         for model in leads[:supervisor.MAX_LEADS]:
             session = supervisor.new_session(model)
             if settings.adaptive_refinement:
                 session.reasoning_effort = effort
             self.emit(run_id, "part.refine_attempt", part_id=part_id, model_id=model.id, effort=effort)
 
-            async def say(text: str, session=session, model=model) -> str:
+            async def say(text: str, session=session, model=model, run=run) -> str:
                 result = await self._charged(run, None, model.id, lambda budget: self.providers.converse(
                     session, text, spend_ok=budget))
                 return result.text
 
             try:
-                split = await outline.refine(say, run.plan, part, outline.part_opening(run.plan, part, run.allow_network))
-                used = model.id
-                break
+                for correction in range(outline.ROUNDS + 1):
+                    async with self.locks.setdefault(run_id, asyncio.Lock()):
+                        run = self.db.get_run(run_id)
+                        if not (part := _pending_part(run, part_id)):
+                            return
+                    opening = outline.part_opening(run.plan, part, run.allow_network)
+                    if conflict:
+                        opening += outline.correction_message(run.plan, conflict)
+                    try:
+                        parts, nodes = await outline.refine(say, run.plan, part, opening)
+                        # A parallel part can finish while the model answers. Validate the actual
+                        # latest plan under the lock, but never hold that lock during a model call.
+                        async with self.locks.setdefault(run_id, asyncio.Lock()):
+                            run = self.db.get_run(run_id)
+                            if not (part := _pending_part(run, part_id)):
+                                return
+                            vision = any(item.kind == "image" for item in run.attachments)
+                            for node in nodes:
+                                node.needs_workspace = bool(run.parent_run_id) or (run.plan.in_project and node.needs_workspace)
+                                try:
+                                    fit_and_route(node, models, self._configured(run), vision)
+                                except NoEligibleModelError as exc:
+                                    raise NoEligibleModelError(f"没有模型能做「{node.title}」：{exc}") from exc
+                            run.plan = outline.combine_split(run.plan, part_id, parts, nodes)
+                            reestimate(run)
+                            self._save(run)
+                            self.emit(run_id, "part.refined", part_id=part_id, title=part.title, tasks=len(nodes),
+                                      parts=len(parts), model_id=model.id)
+                            return
+                    except outline.SplitConflict as exc:
+                        conflict, error = exc, str(exc)
+                        if correction == outline.ROUNDS:
+                            raise
+                        self.emit(run_id, "part.refine_correcting", part_id=part_id, model_id=model.id,
+                                  attempt=correction + 1, limit=outline.ROUNDS, error=error)
             except asyncio.CancelledError:
                 raise
+            except NoEligibleModelError as exc:
+                error = str(exc)
+                break
             except Exception as exc:
                 logger.warning("%s could not split part %s: %s", model.id, part.title, exc)
                 error = str(exc)[:500]
         async with self.locks.setdefault(run_id, asyncio.Lock()):
             run = self.db.get_run(run_id)
-            part = next(item for item in run.plan.parts if item.id == part_id)
-            if split:
-                parts, nodes = split
-                vision = any(item.kind == "image" for item in run.attachments)
-                try:
-                    for node in nodes:
-                        node.needs_workspace = bool(run.parent_run_id) or (run.plan.in_project and node.needs_workspace)
-                        fit_and_route(node, models, self._configured(run), vision)
-                except NoEligibleModelError as exc:
-                    split, error = None, f"没有模型能做「{node.title}」：{exc}"
-            if split:
-                previous = run.plan.model_copy(deep=True)
-                run.plan.parts += parts
-                run.plan.nodes += nodes
-                part.status = "ready"
-                outline.link(run.plan)
-                try:
-                    contracts.validate(run.plan, partial=True)
-                except contracts.ContractError as exc:
-                    run.plan = previous
-                    part = next(item for item in run.plan.parts if item.id == part_id)
-                    error = str(exc)
-                else:
-                    reestimate(run)
-                    self._save(run)
-                    self.emit(run_id, "part.refined", part_id=part_id, title=part.title, tasks=len(nodes),
-                              parts=len(parts), model_id=used)
-                    return
+            if not (part := _pending_part(run, part_id)):
+                return
             part.status, part.error = "failed", error
             if run.status == RunStatus.RUNNING:
                 run.status = RunStatus.PAUSED

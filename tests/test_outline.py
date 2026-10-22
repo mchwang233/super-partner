@@ -424,3 +424,92 @@ async def test_artifact_producer_part_can_finish_splitting_after_its_consumer():
     _, nodes = await outline.refine(say, plan, first)
     assert len(nodes) == 1 and nodes[0].artifact_contract.stage == "coverage_vdb"
 
+
+async def test_whole_plan_contract_error_returns_to_the_same_refining_conversation(database):
+    from artifact_helpers import contract_node, raw
+
+    vdb = contract_node()
+    review = contract_node("review", None, [{"path": "coverage.vdb", "kind": "directory", "source": "dependency"}],
+                           "review.json", dependencies=["vdb"], verifies=["vdb"])
+    invalid = raw(review)
+    invalid.pop("artifact_contract")
+    replies = [split({**raw(vdb), "kind": "task"}, {**invalid, "kind": "task"}),
+               split({**raw(vdb), "kind": "task"}, {**raw(review), "kind": "task"})]
+    database.save_run(ExecutionRun(id="contract-split", prompt="Collect coverage", status=RunStatus.RUNNING,
+                                  budget_usd=5, supervisor=SupervisorSession(model_id="cli:claude"),
+                                  plan=TaskPlan(summary="coverage", nodes=[], parts=[
+                                      PlanPart(id="p", title="Collect", status="planned")])))
+
+    class Correcting(Splitters):
+        async def converse(self, session, prompt, spend_ok=None, timeout=600):
+            self.lead.append((session, prompt))
+            return ProviderResult(replies[len(self.lead) - 1], 0, 0, session.model_id)
+
+    team = Correcting({})
+    await Executor(database, team, RUN_MODELS)._split_part("contract-split", "p")
+    run = database.get_run("contract-split")
+    assert run.plan.parts[0].status == "ready", run.plan.parts[0].error
+    assert len(team.lead) == 2 and team.lead[0][0] is team.lead[1][0]
+    assert "audit of artifact work requires artifact_contract" in team.lead[1][1]
+    assert "coverage.vdb" in team.lead[1][1] and "review.json" in team.lead[1][1]
+    assert len(run.plan.nodes) == 2 and all(node.artifact_contract for node in run.plan.nodes)
+    assert any(event.kind == "part.refine_correcting" for event in database.events(run.id))
+
+
+@pytest.mark.parametrize("corrected", [True, False])
+async def test_concurrent_artifact_merge_is_corrected_before_fallback_or_pause(database, monkeypatch, corrected):
+    from artifact_helpers import contract_node, raw
+
+    producer = PlanPart(id="producer", title="Reports", status="refining")
+    consumer = PlanPart(id="consumer", title="Audit", status="planned", dependencies=[producer.id])
+    database.save_run(ExecutionRun(id="merge", prompt="Audit accepted reports", status=RunStatus.RUNNING,
+                                  budget_usd=5, supervisor=SupervisorSession(model_id="cli:claude"),
+                                  plan=TaskPlan(summary="coverage", nodes=[], parts=[producer, consumer])))
+    report = contract_node("report", "urg_report", [{"path": "input.vdb", "kind": "directory", "source": "external"}],
+                           "reports/accepted.txt", part_id=producer.id)
+    monkeypatch.setattr(supervisor, "candidates", lambda *_: [RUN_MODELS["cli:claude"]])
+
+    class Concurrent(Splitters):
+        async def converse(self, session, prompt, spend_ok=None, timeout=600):
+            self.lead.append((session, prompt))
+            if len(self.lead) == 1:
+                latest = database.get_run("merge")
+                latest.plan.parts[0].status = "ready"
+                latest.plan.nodes.append(report)
+                database.save_run(latest)
+            path = "reports/accepted.txt" if corrected and len(self.lead) > 1 else "reports/missing.txt"
+            audit = contract_node("audit", "delivery_audit", [{"path": path, "kind": "file", "source": "dependency"}],
+                                  "audit.json", after_parts=[producer.title])
+            return ProviderResult(split({**raw(audit), "kind": "task"}), 0, 0, session.model_id)
+
+    team = Concurrent({})
+    await Executor(database, team, RUN_MODELS)._split_part("merge", consumer.id)
+    run = database.get_run("merge")
+    assert len(team.lead) == (2 if corrected else 1 + outline.ROUNDS)
+    assert all(session is team.lead[0][0] for session, _ in team.lead)
+    assert "audit must consume accepted report from report" in team.lead[1][1]
+    assert "reports/accepted.txt" in team.lead[1][1] and "reports/missing.txt" in team.lead[1][1]
+    assert run.plan.nodes[0] == report
+    if corrected:
+        assert run.status == RunStatus.RUNNING and run.plan.parts[1].status == "ready"
+        assert len(run.plan.nodes) == 2
+        assert run.plan.nodes[1].dependencies == [report.id]
+    else:
+        assert run.status == RunStatus.PAUSED and run.plan.parts[1].status == "failed"
+        assert run.plan.nodes == [report]
+
+
+async def test_cancelled_refinement_does_not_publish_a_late_split(database):
+    outlined_run(database)
+
+    class Cancelling(Splitters):
+        async def converse(self, session, prompt, spend_ok=None, timeout=600):
+            current = database.get_run("o")
+            current.status = RunStatus.CANCELLED
+            database.save_run(current)
+            return ProviderResult(split(task("t", "接口")), 0, 0, session.model_id)
+
+    await Executor(database, Cancelling({}), RUN_MODELS)._split_part("o", "api")
+    run = database.get_run("o")
+    assert run.status == RunStatus.CANCELLED and not run.plan.nodes
+

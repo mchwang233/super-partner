@@ -37,6 +37,11 @@ declare that dependency (after_parts across major parts). External evidence need
 Declare VDBs as directory artifacts, text reports and audit records as file artifacts. List outputs
 in files and inputs in reads. Audit consumes accepted reports, never an unfinished report or a
 worker's verbal completion claim. New output files are expected to be absent at startup.
+Writing a generator/parser script, its unit tests or documentation is preparation, not report
+production: do not label it urg_report or make real VDBs prerequisites for fixture-based tests.
+Only the step that actually produces reports uses urg_report. Helper code/docs or intermediate
+verification can use stage: null when they need bounded artifact contracts. A verification step
+of contracted artifact work must also declare its inputs, output evidence and limits.
 Limits accumulate across automatic retries/model switches; at a limit stop with diagnosis and
 logs, without scope expansion or automatic continuation. Missing upstream evidence returns
 BLOCKED: <reason>. CLI channels without reliable turn accounting cannot execute these limits.
@@ -75,7 +80,15 @@ def stages(node: TaskNode) -> set[str]:
         "vdb" in text and re.search(r"采集|生成|收集|collect|generat|capture|simulat", text)
     ):
         found.add("coverage_vdb")
-    if "urg" in text and re.search(r"报告|文本|report|text", text):
+    # Tool names in helper/document titles do not make those tasks artifact production.
+    # Explicit contracts still apply, and any real report output keeps the normal check.
+    suffixes = {PurePosixPath(path).suffix.lower() for path in node.files}
+    preparation = bool(suffixes) and (
+        (suffixes <= {".py", ".sh", ".js", ".ts", ".tcl", ".pl"}
+         and re.search(r"脚本|解析|验收器|验证器|生成器|parser|script|validator|generator", text))
+        or (suffixes <= {".md", ".rst"} and re.search(r"说明|文档|documentation|guide|instructions", text))
+    )
+    if "urg" in text and re.search(r"报告|文本|report|text", text) and not preparation:
         found.add("urg_report")
     if re.search(r"交付审计|delivery audit|independent audit|独立审计", text):
         found.add("delivery_audit")

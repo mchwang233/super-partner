@@ -10,6 +10,7 @@ executor sees an ordinary DAG of tasks."""
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Awaitable
 from typing import Callable, Optional
@@ -113,6 +114,56 @@ TASK_SHAPE = (
 )
 
 Say = Callable[[str], Awaitable[str]]
+
+
+class SplitConflict(contracts.ContractError):
+    """A complete split that needs correction against the other parts, not a fresh planner."""
+
+    def __init__(self, reason: str, parts: list[PlanPart], nodes: list[TaskNode]):
+        super().__init__(reason)
+        self.parts, self.nodes = parts, nodes
+
+
+def combine_split(plan: TaskPlan, part_id: str, parts: list[PlanPart], nodes: list[TaskNode]) -> TaskPlan:
+    """Validate a prospective merge without mutating either the saved plan or the proposal."""
+    combined = plan.model_copy(deep=True)
+    combined.parts += [item.model_copy(deep=True) for item in parts]
+    combined.nodes += [item.model_copy(deep=True) for item in nodes]
+    for item in combined.parts:
+        if item.id == part_id:
+            item.status, item.error = "ready", None
+    link(combined)
+    try:
+        if len(combined.nodes) > MAX_TASKS:
+            raise contracts.ContractError(f"The combined plan exceeds {MAX_TASKS} tasks; merge tasks in your part.")
+        contracts.validate(combined, partial=True)
+    except contracts.ContractError as exc:
+        raise SplitConflict(str(exc), parts, nodes) from exc
+    return combined
+
+
+def correction_message(plan: TaskPlan, conflict: SplitConflict) -> str:
+    """Give the same planner its rejected work, precise errors and the latest declared handoffs."""
+    available = [{"id": node.id, "title": node.title,
+                  "part": [item.title for item in plan.part_path(node.part_id)],
+                  "files": node.files, "artifact_contract": (
+                      node.artifact_contract.model_dump() if node.artifact_contract else None)}
+                 for node in plan.nodes]
+    previous = {"parts": [item.model_dump() for item in conflict.parts],
+                "tasks": [item.model_dump(exclude={"attempts"}) for item in conflict.nodes]}
+    return (
+        "Your previous split was rejected by validation of the combined plan:\n" + str(conflict)
+        + "\nOther parts may have finished splitting during your conversation. Correct only your part; "
+        "retain valid work and the original acceptance requirements and limits. Use exact declared "
+        "artifact paths AND kinds: a parent directory is not a declared file producer. References to "
+        "ordinary code/configuration belong in reads; dependency evidence needs a declared artifact "
+        "producer. For cross-part waits use after_parts from your outline, not invented task IDs. "
+        "Do not edit other parts or relabel their outputs as external to bypass the checks.\n"
+        "Latest tasks and declared handoffs (context, not work to reproduce):\n"
+        + json.dumps(available, ensure_ascii=False)
+        + "\nYour rejected split (context; reply using the children schema below):\n"
+        + json.dumps(previous, ensure_ascii=False) + "\n\n"
+    )
 
 
 def refine_message(part: PlanPart, path: list[str], depth: int, room: int, waited: list[PlanPart] = ()) -> str:
@@ -416,15 +467,9 @@ async def refine(say: Say, plan: TaskPlan, part: PlanPart, opening: str = "") ->
     names = {name: item.id for item in waited for name in (item.title, item.id)}
     for node in split.nodes:
         node.after_parts = list(dict.fromkeys(names[name] for name in node.after_parts if name in names))
-    combined = plan.model_copy(deep=True)
-    combined.nodes += split.nodes
-    combined.parts += [item for item in split.parts if item.id != part.id]
-    for item in combined.parts:
-        if item.id == part.id:
-            item.status = "ready"
-    link(combined)
-    contracts.validate(combined, partial=True)
-    return [item for item in split.parts if item.id != part.id], split.nodes
+    parts = [item for item in split.parts if item.id != part.id]
+    combine_split(plan, part.id, parts, split.nodes)
+    return parts, split.nodes
 
 
 def _top(plan: TaskPlan, part_id: Optional[str]) -> Optional[PlanPart]:

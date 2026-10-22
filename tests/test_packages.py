@@ -201,6 +201,33 @@ def test_artifact_explicit_collection_and_report_require_contracts():
         ]})
 
 
+@pytest.mark.parametrize("title,files", [
+    ("实现 URG 文本解析及内容验收器", ["scripts/parse_report.py", "tests/test_parse_report.py"]),
+    ("编写 URG 复现和报告追溯说明", ["docs/reproduce.md"]),
+])
+def test_report_preparation_is_not_report_production(title, files):
+    from super_partner import contracts
+
+    node = TaskNode(id="helper", title=title, instructions="Prepare the helper and test it with fixtures.",
+                    capability="coding", files=files, acceptance_criteria="Unit tests pass.")
+    assert contracts.stages(node) == set()
+    assert contracts.node_problems(node, coverage=True) == []
+
+
+def test_report_preparation_does_not_erase_explicit_contract_or_real_report_outputs():
+    from artifact_helpers import contract_node
+    from super_partner import contracts
+
+    node = contract_node("helper", "urg_report", [], "parse_report.py")
+    node.title = "实现 URG 文本解析器"
+    assert contracts.stages(node) == {"urg_report"}
+    assert any("must consume a VDB" in problem for problem in contracts.node_problems(node))
+    node.artifact_contract = None
+    node.files.append("reports/result.txt")
+    assert contracts.stages(node) == {"urg_report"}
+    assert contracts.node_problems(node) == [f"{node.title}: artifact_contract is required"]
+
+
 async def test_artifact_no_planner_does_not_invent_an_unbounded_fallback():
     with pytest.raises(ValueError, match="Artifact planning blocked"):
         await autonomous_plan("Generate URG text report", [], set(), object())
