@@ -20,7 +20,8 @@ from .routing import loop_turns
 logger = logging.getLogger(__name__)
 
 FINISHED = {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.INCOMPLETE}
-END_EVENTS = {"run.succeeded", "run.failed", "run.incomplete", "run.cancelled"}
+AUTOMATIC = FINISHED - {RunStatus.CANCELLED}
+END_EVENTS = {f"run.{status.value}" for status in AUTOMATIC}
 # A step's cost or turns this many times its estimate is a problem worth counting.
 OVER = 2.0
 # Below this a step's cost says nothing about the estimate.
@@ -169,10 +170,10 @@ def record(db, run_id: str) -> Optional[dict]:
 
 
 def all_reviews(db) -> list[dict]:
-    """Every finished task's look back, oldest first; finished tasks without one get one now."""
+    """Existing reviews and natural completions; never backfill user-cancelled tasks."""
     kept = {item["run_id"]: item for item in db.retrospectives()}
     for run in db.list_runs():
-        if run.status in FINISHED and run.id not in kept and (body := record(db, run.id)):
+        if run.status in AUTOMATIC and run.id not in kept and (body := record(db, run.id)):
             kept[run.id] = body
     return sorted(kept.values(), key=lambda item: item["started_at"])
 

@@ -18,13 +18,17 @@ from pathlib import Path
 from . import agent, quality, retrospect, skills
 from .budget import BudgetExceeded, RequestBudget
 from .config import settings
-from .models import Improvement, LearningReview, LearningSettings, NodeStatus, utcnow
+from .models import Improvement, LearningReview, LearningSettings, NodeStatus, RunStatus, utcnow
 from .routing import diagnosers
 
 MAX_ITEMS = 3
 MAX_APPLIED = 5
 WORKING = {"queued", "analyzing", "validating"}
 logger = logging.getLogger(__name__)
+
+
+class SkippedLearning(Exception):
+    """A user cancellation excludes this automatic review, including late model replies."""
 
 
 def strongest_model(choices, tokens: int, previous=None):
@@ -221,11 +225,38 @@ async def check_skill(item: Improvement) -> dict:
 
 
 class Learning:
+    def skip_cancelled_learning(self, run_id: str) -> None:
+        run, review = self.db.get_run(run_id), self.db.learning_review(run_id)
+        if not run or run.status != RunStatus.CANCELLED or not review or not review.automatic:
+            return
+        task = self.learning_tasks.get(run_id)
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        # Retain finished conclusions, published lessons and separately scheduled platform jobs.
+        if review.status == "done":
+            return
+        review.status, review.error = "skipped", None
+        self.db.save_learning_review(review)
+        for item in self.db.improvements(run_id):
+            if item.revision == review.revision and item.status in {"proposed", "validating"}:
+                item.status = "disabled"
+                item.validation = {"passed": False, "reason": "任务已手动取消，已停止自动复盘与验证。"}
+                self.db.save_improvement(item)
+
+    def _learning_source(self, review):
+        run = self.db.get_run(review.run_id)
+        if run and run.status == RunStatus.CANCELLED and review.automatic:
+            raise SkippedLearning()
+        return run
+
     def finish_learning(self, run_id: str):
         """An optional post-task operation cannot turn a delivered task into a failed task."""
         try:
-            if run := self.db.get_run(run_id):
-                observe(self.db, run)
+            run = self.db.get_run(run_id)
+            if not run or run.status not in retrospect.AUTOMATIC:
+                self.skip_cancelled_learning(run_id)
+                return
+            observe(self.db, run)
             if not self.closing:
                 self.start_learning(run_id)
         except Exception:
@@ -235,6 +266,9 @@ class Learning:
         run = self.db.get_run(run_id)
         if not run or run.status not in retrospect.FINISHED:
             raise ValueError("只能复盘已结束的任务。")
+        if not manual and run.status not in retrospect.AUTOMATIC:
+            self.skip_cancelled_learning(run_id)
+            return None
         options = preferences(self.db)
         if not manual and not options.enabled:
             return None
@@ -247,9 +281,10 @@ class Learning:
                 return review
             if manual:
                 review.budget_usd, review.auto_platform = options.budget_usd, options.auto_platform
+                review.automatic = False
         else:
             review = LearningReview(run_id=run_id, revision=revision(run), budget_usd=options.budget_usd,
-                                    auto_platform=options.auto_platform)
+                                    auto_platform=options.auto_platform, automatic=not manual)
         review.status, review.error = "queued", None
         self.db.save_learning_review(review)
         try:
@@ -263,8 +298,11 @@ class Learning:
         self.sync_improvements()
         for review in self.db.learning_reviews():
             run = self.db.get_run(review.run_id)
+            if run and run.status == RunStatus.CANCELLED and review.automatic:
+                self.skip_cancelled_learning(run.id)
+                continue
             if review.status in WORKING and run and run.status in retrospect.FINISHED:
-                self.start_learning(run.id, manual=True)
+                self.start_learning(run.id, manual=not review.automatic)
 
     def sync_improvements(self):
         for item in self.db.improvements():
@@ -288,7 +326,7 @@ class Learning:
             task = self.tasks.get(run_id)
             if task and task is not asyncio.current_task() and not task.done():
                 await asyncio.gather(asyncio.shield(task), return_exceptions=True)
-            run = self.db.get_run(run_id)
+            run = self._learning_source(review)
             if not run or run.status not in retrospect.FINISHED:
                 raise ValueError("任务已重新开始，未生成复盘。")
             review.revision = revision(run)
@@ -307,7 +345,7 @@ class Learning:
                 review.status, review.model_id = "analyzing", producer.id
                 self.db.save_learning_review(review)
                 text = await self._learning_call(review, producer.id, prompt)
-                latest = self.db.get_run(run_id)
+                latest = self._learning_source(review)
                 if not latest or latest.status not in retrospect.FINISHED or revision(latest) != review.revision:
                     raise ValueError("任务在复盘期间发生变化，请结束后重新复盘。")
                 conclusion, items = parse_analysis(text, run, self.db.retrospective(run_id))
@@ -338,6 +376,8 @@ class Learning:
             for item in platform:
                 self._learning_engineer(review, item, allowance)
             review.status = "done"
+        except SkippedLearning:
+            review.status, review.error = "skipped", None
         except asyncio.CancelledError:
             review.status, review.error = "queued", "复盘被中断，服务启动后继续。"
             raise
@@ -348,10 +388,14 @@ class Learning:
         except Exception as exc:
             review.status, review.error = "failed", str(exc)[:2000] or type(exc).__name__
         finally:
-            if self.db.get_run(run_id):
+            if current := self.db.get_run(run_id):
+                if current.status == RunStatus.CANCELLED and review.automatic:
+                    review.status, review.error = "skipped", None
                 self.db.save_learning_review(review)
+                self.skip_cancelled_learning(run_id)
 
     async def _learning_call(self, review, model_id, prompt):
+        self._learning_source(review)
         if review.cost_usd + review.allocated_usd > review.budget_usd:
             raise BudgetExceeded("复盘预算已经用尽。")
         async def charge(cost):
@@ -368,6 +412,7 @@ class Learning:
                                                        allow_api_fallback=False, act=False, network=False,
                                                        effort=settings.diagnosis_reasoning_effort, cli_timeout=300)
             await charge(max(0, self._actual_cost(result, None, model_id) - budget.spent))
+            self._learning_source(review)
             return result.text
         except (Exception, asyncio.CancelledError) as exc:
             if usage := getattr(exc, "usage", None):
@@ -411,6 +456,7 @@ class Learning:
         self.db.save_improvement(item)
 
     def _learning_engineer(self, review, item, allowance):
+        self._learning_source(review)
         # Recover the link if a process stopped after saving the job but before saving the item.
         job = next((j for j in self.db.engineer_jobs(1000) if j.improvement_id == item.id), None)
         if not job:

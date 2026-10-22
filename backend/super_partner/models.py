@@ -567,7 +567,9 @@ class LearningSettings(BaseModel):
 class LearningReview(BaseModel):
     run_id: str
     revision: str
-    status: str = "queued"  # queued | analyzing | validating | done | blocked | failed
+    status: str = "queued"  # queued | analyzing | validating | done | blocked | failed | skipped
+    # Old unfinished reviews must not become explicit manual requests merely on restart.
+    automatic: bool = True
     conclusion: str = ""
     model_id: Optional[str] = None
     budget_usd: float = 0.5

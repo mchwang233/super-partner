@@ -116,6 +116,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             self.tasks[run_id] = asyncio.create_task(self.execute(run_id))
 
     def cancel(self, run_id: str) -> None:
+        self.skip_cancelled_learning(run_id)
         for task in {self.tasks.get(run_id), self.diagnosing.get(run_id)} - {None}:
             if not task.done():
                 task.cancel()
@@ -223,9 +224,6 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                     if node.status == NodeStatus.RUNNING:
                         node.status = NodeStatus.CANCELLED
                 self._save(run)
-                # With the cancelled steps' attempts recorded, the task can be looked back on.
-                retrospect.record(self.db, run_id)
-                self.finish_learning(run_id)
             raise
         except Exception as exc:
             await self._stop_nodes(running)

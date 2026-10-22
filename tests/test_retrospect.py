@@ -73,6 +73,15 @@ def test_a_repair_names_the_area_it_touched():
         ("platform", "agent"), ("environment", "ssh"), ("environment", "sandbox")]
 
 
+def test_recurring_problems_does_not_generate_retrospectives_for_cancelled_tasks(tmp_path):
+    db = Database(tmp_path / "t.db")
+    db.save_run(finished("cancelled", [vcs_step()], status=RunStatus.CANCELLED))
+    db.save_run(finished("natural", [vcs_step()]))
+    retrospect.recurring(db)
+    assert db.retrospective("cancelled") is None
+    assert db.retrospective("natural") is not None
+
+
 def test_a_problem_that_comes_back_after_a_repair_is_marked(tmp_path):
     db = Database(tmp_path / "t.db")
     for run_id, days in (("first", 3), ("second", 1), ("third", 0)):

@@ -1,4 +1,5 @@
 """Evidence -> validated lesson -> later application -> comparable observations."""
+import asyncio
 import json
 from pathlib import Path
 
@@ -364,3 +365,145 @@ def test_delete_removes_learning_records_and_observations(setup_learning):
     db.delete_run(run.id)
     assert db.improvement(item.id) is None and db.learning_review(run.id) is None
     assert db.improvement_effects(item.id) == []
+
+
+@pytest.mark.parametrize("status", [RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.INCOMPLETE])
+async def test_natural_end_still_automatically_learns(setup_learning, status):
+    db, models, executor = setup_learning
+    run = finished(db)
+    run.status = status
+    db.save_run(run)
+    executor.emit(run.id, f"run.{status.value}")
+    await executor.learning_tasks[run.id]
+    assert db.learning_review(run.id).status == "done"
+    assert db.learning_review(run.id).automatic is True
+    assert len(models.prompts) == 2
+
+
+@pytest.mark.parametrize("active", [False, True])
+async def test_user_cancel_never_starts_automatic_retrospective(task_api, monkeypatch, active):
+    api, client = task_api
+    started = asyncio.Event()
+
+    class Waiting(Models):
+        async def complete(self, model_id, prompt, workspace=None, **kwargs):
+            if "learning:" in prompt:
+                return await super().complete(model_id, prompt, workspace, **kwargs)
+            started.set()
+            await asyncio.Event().wait()
+
+    models = Waiting()
+    executor = Executor(api.db, models, {m.id: m for m in [model("x:writer", 90), model("y:reviewer", 92)]})
+    monkeypatch.setattr(api, "executor", executor)
+    api.db.save_learning_settings({"enabled": True})
+    api.db.save_run(ExecutionRun(id="stop", prompt="p", status=RunStatus.QUEUED, budget_usd=1,
+                                 plan=TaskPlan(summary="s", nodes=[TaskNode(
+                                     id="n", title="work", instructions="work", capability="coding", model_id="x:writer")])))
+    try:
+        if active:
+            executor.start("stop")
+            await asyncio.wait_for(started.wait(), timeout=2)
+        assert (await client.post("/api/tasks/stop/cancel")).status_code == 200
+        if active:
+            await asyncio.gather(executor.tasks["stop"], return_exceptions=True)
+        executor.emit("stop", "run.cancelled")
+        executor.finish_learning("stop")
+        await asyncio.sleep(0)
+        assert "stop" not in executor.learning_tasks
+        assert api.db.learning_review("stop") is None and api.db.retrospective("stop") is None
+        assert api.db.improvements("stop") == [] and not models.prompts
+        body = (await client.get("/api/tasks/stop/learning")).json()
+        assert body["automatic_eligible"] is False and body["retrospective"] is None
+        assert body["automatic_skip_reason"] == "任务已手动取消，不自动复盘。"
+        assert api.db.get_run("stop").status == RunStatus.CANCELLED
+    finally:
+        await executor.shutdown()
+
+
+@pytest.mark.parametrize("status", ["queued", "analyzing", "validating", "blocked"])
+async def test_restart_skips_old_cancelled_automatic_reviews(setup_learning, status):
+    db, models, executor = setup_learning
+    run = finished(db)
+    run.status = RunStatus.CANCELLED
+    db.save_run(run)
+    # An old record has no automatic field. It must not become a manual request on restart.
+    review = LearningReview.model_validate({"run_id": run.id, "revision": learning.revision(run),
+                                           "status": status, "error": "old failure"})
+    db.save_learning_review(review)
+    item = Improvement(run_id=run.id, revision=review.revision, status="validating", **proposal())
+    db.save_improvement(item)
+    executor.restore_learning()
+    assert run.id not in executor.learning_tasks and not models.prompts
+    assert db.learning_review(run.id).status == "skipped"
+    assert db.learning_review(run.id).error is None
+    assert db.improvement(item.id).status == "disabled"
+
+
+async def test_manual_review_of_cancelled_task_is_explicit_and_survives_restart(setup_learning):
+    db, models, executor = setup_learning
+    run = finished(db)
+    run.status = RunStatus.CANCELLED
+    db.save_run(run)
+    assert executor.start_learning(run.id) is None
+    assert not models.prompts and db.learning_review(run.id) is None
+    executor.start_learning(run.id, manual=True)
+    await executor.learning_tasks[run.id]
+    review = db.learning_review(run.id)
+    assert review.status == "done" and review.automatic is False
+    [item] = db.improvements(run.id)
+    item.status, review.status = "validating", "validating"
+    db.save_improvement(item)
+    db.save_learning_review(review)
+    models.prompts.clear()
+    db.save_learning_settings({"enabled": False})
+    executor.restore_learning()
+    await executor.learning_tasks[run.id]
+    assert db.learning_review(run.id).status == "done"
+    assert len(models.prompts) == 1 and "learning:validate" in models.prompts[0][1]
+
+
+@pytest.mark.parametrize("phase", ["analyzing", "validating"])
+async def test_cancellation_stops_learning_and_late_reply_cannot_publish(setup_learning, monkeypatch, phase):
+    db, models, executor = setup_learning
+    run = finished(db)
+    if phase == "validating":
+        review = LearningReview(run_id=run.id, revision=learning.revision(run), conclusion="existing conclusion")
+        db.save_learning_review(review)
+        db.save_improvement(Improvement(run_id=run.id, revision=review.revision, **proposal()))
+    started, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    complete = models.complete
+
+    async def late(*args, **kwargs):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+        # A channel may return a last reply during cancellation cleanup.
+        return await complete(*args, **kwargs)
+
+    monkeypatch.setattr(models, "complete", late)
+    executor.start_learning(run.id)
+    await asyncio.wait_for(started.wait(), timeout=2)
+    run.status = RunStatus.CANCELLED
+    db.save_run(run)
+    executor.cancel(run.id)
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(executor.learning_tasks[run.id], return_exceptions=True)
+    assert cancelled.is_set()
+    assert db.learning_review(run.id).status == "skipped"
+    assert all(item.status == "disabled" for item in db.improvements(run.id))
+    assert len(models.prompts) == 1
+
+
+async def test_skipping_cancelled_work_preserves_completed_reviews(setup_learning):
+    db, _, executor = setup_learning
+    run = finished(db)
+    review, [item] = await learn(db, executor)
+    run.status = RunStatus.CANCELLED
+    db.save_run(run)
+    executor.restore_learning()
+    assert db.learning_review(run.id).conclusion == review.conclusion
+    assert db.learning_review(run.id).status == "done"
+    assert db.improvement(item.id).status == "active"

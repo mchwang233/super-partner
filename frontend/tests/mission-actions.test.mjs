@@ -1151,6 +1151,20 @@ test("service failures are distinguished from quota exhaustion", async t => {
   assert.doesNotMatch(banner.textContent, /额度用完/);
 });
 
+test("cancelled work explains the automatic-review exclusion and manual review stays explicit", async t => {
+  const { state, document, button, click } = await setup(t, [mission("cancelled-task", "cancelled")], [], { openComposer: false });
+  state.learning = { review: { status: "skipped", conclusion: "", budget_usd: 0.5, cost_usd: 0, allocated_usd: 0 },
+    automatic_eligible: false, automatic_skip_reason: "任务已手动取消，不自动复盘。", retrospective: null, improvements: [], applied: [] };
+  await click(button("结果"));
+  await click(button("复盘与改进"));
+  const panel = document.querySelector(".learning-panel");
+  assert.match(panel.textContent, /手动取消.*不自动复盘/);
+  assert.match(panel.textContent, /已跳过自动复盘/);
+  assert.equal(state.learningStarts ?? 0, 0);
+  await click(button("手动生成复盘与改进项"));
+  assert.equal(state.learningStarts, 1);
+});
+
 test("a failed task with a running repair can be cancelled but cannot be resumed concurrently", async t => {
   const run = mission("repair-task", "failed");
   run.diagnoses = [{ id: "d1", trigger: "manual", node_id: "a", status: "running", created_at: "2026-10-15T03:00:00Z" }];

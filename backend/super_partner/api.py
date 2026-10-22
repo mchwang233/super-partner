@@ -657,7 +657,10 @@ def task_learning(run_id: str):
     run = get_task(run_id)
     executor.sync_improvements()
     return {"review": db.learning_review(run_id),
-            "retrospective": db.retrospective(run_id) or retrospect.record(db, run_id),
+            "automatic_eligible": run.status in retrospect.AUTOMATIC,
+            "automatic_skip_reason": "任务已手动取消，不自动复盘。" if run.status == RunStatus.CANCELLED else None,
+            "retrospective": db.retrospective(run_id) or (
+                retrospect.record(db, run_id) if run.status in retrospect.AUTOMATIC else None),
             "improvements": [improvement_view(item) for item in db.improvements(run_id)],
             "applied": [{"id": use["id"], "title": use["title"], "node_ids": use.get("node_ids", []),
                          "planning": use.get("planning", False), "source_run_id": use["run_id"]}
@@ -966,10 +969,6 @@ async def cancel_task(run_id: str):
     db.save_run(run)
     db.add_event(Event(run_id=run.id, kind="run.cancelled"))
     executor.cancel(run.id)
-    if not (task := executor.tasks.get(run.id)) or task.done():
-        # Nothing was running to stop: look back on the task now (otherwise the executor does).
-        retrospect.record(db, run.id)
-        executor.finish_learning(run.id)
     return run
 
 

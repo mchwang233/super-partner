@@ -11,6 +11,7 @@ type Improvement = {
   validation: { passed?: boolean; reason?: string; output?: string; command?: string; checks?: string[] };
 };
 type LearningData = {
+  automatic_skip_reason?: string | null;
   review?: { status: string; conclusion: string; budget_usd: number; cost_usd: number; allocated_usd: number; error?: string } | null;
   retrospective?: { estimated_usd: number; actual_usd: number; problems: { label: string; kind: string; key: string }[] } | null;
   improvements: Improvement[];
@@ -18,7 +19,7 @@ type LearningData = {
 };
 const STATUS: Record<string, string> = {
   queued: "等待复盘", analyzing: "生成结论中", validating: "验证中", done: "复盘完成", blocked: "等待处理",
-  failed: "未通过", proposed: "待验证", active: "已生效", engineering: "平台工程师处理中", disabled: "已停用",
+  failed: "未通过", proposed: "待验证", active: "已生效", engineering: "平台工程师处理中", disabled: "已停用", skipped: "已跳过自动复盘",
 };
 const KIND = { skill: "Skill", rule: "执行规则", platform: "平台改进" };
 const money = (n: number) => `$${n.toFixed(4)}`;
@@ -89,7 +90,7 @@ export function RetrospectivePanel({ apiBase, runId }: { apiBase: string; runId:
   return <section className="learning-panel" aria-label="复盘与改进">
     <p>复盘结论 → 改进项 → 验证与应用 → 后续任务使用 → 效果对比</p>
     {options && <details className="learning-settings"><summary>自动改进设置 · {options.enabled ? "已开启" : "未开启"}</summary>
-      <label><input type="checkbox" checked={options.enabled} onChange={e => setOptions({ ...options, enabled: e.target.checked })} />任务结束后自动复盘并验证改进</label>
+      <label><input type="checkbox" checked={options.enabled} onChange={e => setOptions({ ...options, enabled: e.target.checked })} />任务自然成功或失败后自动复盘并验证改进（手动取消不触发）</label>
       <label>每次复盘与改进的额外预算上限（美元）<input type="number" min="0" max="100" step="0.1" value={options.budget_usd}
         onChange={e => setOptions({ ...options, budget_usd: Number(e.target.value) })} /></label>
       <label><input type="checkbox" checked={options.auto_platform} onChange={e => setOptions({ ...options, auto_platform: e.target.checked })} />平台改进通过独立测试后自动应用</label>
@@ -99,10 +100,11 @@ export function RetrospectivePanel({ apiBase, runId }: { apiBase: string; runId:
     {error && <p className="error" role="alert">{error}</p>}
     {notice && <p role="status">{notice}</p>}
     {!data ? <p className="empty">{error ? "无法读取复盘记录。" : "正在读取复盘…"}</p> : <>
+      {data.automatic_skip_reason && <p className="muted">{data.automatic_skip_reason}</p>}
       <div className="learning-head">
         <span>{data.review ? STATUS[data.review.status] ?? data.review.status : "尚未生成复盘结论"}</span>
         <button className="primary" disabled={busy || working || data.review?.status === "done"} onClick={() => act(base)}>
-          {working ? "复盘进行中…" : data.review ? "继续复盘" : "生成复盘与改进项"}</button>
+          {working ? "复盘进行中…" : data.automatic_skip_reason ? "手动生成复盘与改进项" : data.review ? "继续复盘" : "生成复盘与改进项"}</button>
       </div>
       {data.retrospective && <p className="muted">任务估算 {money(data.retrospective.estimated_usd)} · 实际 {money(data.retrospective.actual_usd)} · 记录问题 {data.retrospective.problems.length} 项</p>}
       {data.review && <>
