@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from super_partner.config import settings
 from super_partner.db import Database
@@ -179,3 +181,115 @@ async def test_artifact_quota_error_at_declared_limit_stops_before_switching_mod
     assert run.status == RunStatus.INCOMPLETE
     assert providers.calls == ["vdb"] and run.plan.nodes[0].attempts[-1].outcome == "stopped"
     assert run.plan.nodes[0].attempts[-1].cost_usd == pytest.approx(0.002)
+
+
+async def test_tool_allowance_survives_retry_switch_rework_and_restore(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.quota import ModelUnavailable
+
+    extra_calls = []
+
+    async def work(node, workspace, kwargs):
+        await kwargs["spend_ok"].begin_tool()
+        extra_calls.append(node.id)
+        (workspace / "partial.txt").write_text("keep partial work")
+        providers.authorized.remove("test:worker")
+        error = ModelUnavailable("test:worker", datetime.now(timezone.utc), "quota exhausted")
+        error.usage = ProviderResult("", 1000, 1000, "test:worker", turns=1)
+        raise error
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch,
+                                           [contract_node(contract={"max_turns": 3})], work)
+    backup = executor.model_lookup["test:worker"].model_copy(update={"id": "test:backup"})
+    executor.model_lookup[backup.id] = backup
+    providers.authorized.add(backup.id)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    node = run.plan.nodes[0]
+    assert run.status == RunStatus.INCOMPLETE
+    assert [a.model_id for a in node.attempts] == ["test:worker", "test:backup"]
+    assert node.attempts[-1].outcome == "stopped"
+    assert node.contract_tool_calls == 3 and node.contract_turns == 2
+    assert len(providers.actual_calls) + len(extra_calls) == 3
+    assert "工具调用上限" in node.review
+    assert run.actual_cost_usd == pytest.approx(0.004)
+    assert (settings.workspace_root / run.folder_id / "partial.txt").read_text() == "keep partial work"
+    # A manual resume, rework generation and a newly constructed executor retain both counters.
+    run.status, node.status, node.failed_attempts = RunStatus.QUEUED, NodeStatus.PENDING, 0
+    node.generation += 1
+    db.save_run(run)
+    await Executor(db, providers, executor.model_lookup).execute(run.id)
+    restored = db.get_run(run.id).plan.nodes[0]
+    assert restored.contract_tool_calls == 3 and restored.contract_turns == 2
+    assert len(restored.attempts) == 2 and len(providers.actual_calls) + len(extra_calls) == 3
+    blocked = [e.data for e in db.events(run.id) if e.kind == "node.blocked"][-1]
+    assert blocked["started"] is False
+    assert blocked["actual_counts"]["vdb"]["tool_calls"] == 3
+    assert blocked["actual_counts"]["vdb"]["requests"] == 2
+
+
+async def test_parallel_delegated_tool_calls_share_atomic_ancestor_allowance(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.budget import StepLimitExceeded
+
+    parent = contract_node("parent", contract={"max_turns": 3})
+    children = [TaskNode(id=f"child-{i}", title="child", instructions="work", capability="coding",
+                         model_id="test:worker", delegation_parent_id=parent.id) for i in range(6)]
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [parent, *children])
+    run = db.get_run("artifacts")
+    started = []
+    # Queue the requests on the same lock to exercise the check/debit race explicitly.
+    lock = executor.locks.setdefault(run.id, asyncio.Lock())
+    await lock.acquire()
+
+    async def invoke(child, budget):
+        await budget.begin_tool()
+        started.append(child.id)
+        await asyncio.sleep(0)
+        return ProviderResult("done", 0, 0, "test:worker")
+
+    pending = [asyncio.create_task(executor._charged(
+        run, child, child.model_id, lambda budget, child=child: invoke(child, budget), work=True)) for child in children]
+    await asyncio.sleep(0)
+    lock.release()
+    results = await asyncio.gather(*pending, return_exceptions=True)
+    assert len(started) == 3 and sum(isinstance(item, StepLimitExceeded) for item in results) == 3
+    assert db.get_run(run.id).plan.nodes[0].contract_tool_calls == 3
+    assert db.get_run(run.id).plan.nodes[0].contract_turns == 0
+    restored = Executor(db, executor.providers, executor.model_lookup)
+    with pytest.raises(StepLimitExceeded, match="工具调用上限"):
+        await restored._charged(run, children[-1], "test:worker", lambda budget: invoke(children[-1], budget), work=True)
+    assert len(started) == 3
+
+
+async def test_request_hard_cap_still_applies_when_no_tools_are_called(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.budget import StepLimitExceeded
+
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [contract_node(contract={"max_turns": 2})])
+    run = db.get_run("artifacts")
+    node = run.plan.nodes[0]
+    requests = []
+
+    async def request(budget):
+        await budget.begin_turn()
+        requests.append(True)
+        return ProviderResult("no tools", 0, 0, "test:worker")
+
+    for _ in range(2):
+        await executor._charged(run, node, node.model_id, request, work=True)
+    with pytest.raises(StepLimitExceeded, match="轮次上限"):
+        await executor._charged(run, node, node.model_id, request, work=True)
+    saved = db.get_run(run.id).plan.nodes[0]
+    assert len(requests) == saved.contract_turns == 2 and saved.contract_tool_calls == 0
+
+
+def test_legacy_task_records_load_with_separate_tool_counter():
+    from artifact_helpers import contract_node
+
+    legacy = contract_node().model_dump(exclude={"contract_tool_calls"})
+    legacy["contract_turns"] = 2
+    loaded = TaskNode.model_validate(legacy)
+    assert loaded.contract_turns == 2 and loaded.contract_tool_calls == 0

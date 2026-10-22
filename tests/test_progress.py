@@ -206,11 +206,11 @@ def test_helper_only_models_never_run_or_lead_a_task():
     assert [m.id for m in eligible_for_node(step, [helper, worker], {helper.id, worker.id})] == ["x:api"]
     assert [m.id for m in supervisor.candidates([helper, worker], {helper.id, worker.id})] == ["x:api"]
 async def test_artifact_hard_turn_limit_makes_no_extra_summary_request_and_keeps_trace(tmp_path, monkeypatch):
-    from super_partner.budget import RequestBudget
+    from super_partner.budget import RequestBudget, StepLimitExceeded
     from super_partner.models import ModelProfile
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
-    calls, turns = [], []
+    calls, turns, tools = [], [], []
     model_id = "deepseek:deepseek-flash"
     model = ModelProfile(id=model_id, provider="deepseek", display_name="test", input_per_million=1, output_per_million=1)
 
@@ -224,8 +224,15 @@ async def test_artifact_hard_turn_limit_makes_no_extra_summary_request_and_keeps
     async def charge(cost):
         pass
 
+    async def begin_tool():
+        if len(tools) >= 2:
+            raise StepLimitExceeded("达到声明工具调用上限")
+        tools.append(1)
+
     budget = RequestBudget({model_id: model}, lambda: 1, {}, charge, asyncio.Event(),
                            turn_remaining=lambda: 2 - len(turns), use_turn=turn)
+    budget.begin_tool = begin_tool
+    budget.tool_remaining = lambda: 2 - len(tools)
     registry = ProviderRegistry(models={model_id: model})
     registry.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
     log, trace = [], tmp_path / "trace.jsonl"
@@ -237,6 +244,7 @@ async def test_artifact_hard_turn_limit_makes_no_extra_summary_request_and_keeps
     assert len(calls) == len(turns) == result.turns == 2
     assert result.turn_limit and len(log) == 2 and len(trace.read_text().splitlines()) == 2
     assert result.input_tokens == result.output_tokens == 2
+    assert len(tools) == 2
 
 
 async def test_artifact_limit_survives_provider_failure_after_a_plain_response(tmp_path, monkeypatch):

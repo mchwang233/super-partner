@@ -1,5 +1,6 @@
 """Output caps and truncation for API models: a reasoning model that spends a small cap on
 thinking must not look like one that finished without doing anything."""
+import asyncio
 import json
 
 import httpx
@@ -30,6 +31,107 @@ def deepseek(message: dict, finish_reason: str) -> dict:
 
 WRITE_CALL = {"id": "c1", "type": "function", "function": {
     "name": "Write", "arguments": json.dumps({"file_path": "mail.py", "content": "ok"})}}
+
+
+@pytest.mark.parametrize("provider", ["deepseek", "anthropic", "google"])
+@pytest.mark.parametrize("tool", ["Write", "Read"])
+@pytest.mark.parametrize("requested", [3, 4])
+async def test_hard_tool_cap_counts_each_batch_item_before_side_effects(tmp_path, monkeypatch, provider, tool, requested):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.agent import Workspace
+    from super_partner.budget import StepLimitExceeded
+    from super_partner.providers import Conversation
+    from super_partner.secrets import PROVIDER_ENV
+
+    monkeypatch.setenv(PROVIDER_ENV[provider], "local-test")
+    node = contract_node(contract={"max_turns": 3})
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [node])
+    calls = [(str(i), tool, {"file_path": f"tool-{i}.txt", "content": f"written {i}"}) for i in range(requested)]
+    if tool == "Read":
+        for _, _, args in calls[1:]:  # a failed first read still consumes one invocation
+            (tmp_path / args["file_path"]).write_text("input")
+    if provider == "anthropic":
+        response = anthropic_reply([{"type": "tool_use", "id": key, "name": name, "input": args}
+                                    for key, name, args in calls], "tool_use")
+        done = anthropic_reply([{"type": "text", "text": "done"}])
+    elif provider == "google":
+        response = {"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": name, "args": args}} for _, name, args in calls]}}],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}}
+        done = {"candidates": [{"content": {"parts": [{"text": "done"}]}}]}
+    else:
+        response = deepseek({"tool_calls": [
+            {"id": key, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+            for key, name, args in calls]}, "tool_calls")
+        done = deepseek({"content": "done"}, "stop")
+    sent, invoked, finished = [], [], []
+    registry = registry_with([response, done], sent)
+    api = executor.model_lookup["test:worker"].model_copy(update={"id": f"{provider}:worker", "provider": provider})
+    registry.models = executor.model_lookup = {api.id: api}
+    executor.providers = registry
+    run = db.get_run("artifacts")
+    node = run.plan.nodes[0]
+    node.model_id = api.id
+    db.save_run(run)
+    original_run = Workspace.run
+
+    async def observed_tool(self, name, args):
+        invoked.append(args["file_path"])
+        await asyncio.sleep(0.01)  # admitted read siblings must settle before a rejection returns
+        result = await original_run(self, name, args)
+        finished.append(args["file_path"])
+        return result
+
+    monkeypatch.setattr(Workspace, "run", observed_tool)
+    conversation, log = Conversation(), []
+    try:
+        call = executor._complete(run, node, api.id, "work", tmp_path, act=True, tool_log=log,
+                                  tool_trace=tmp_path / "trace.jsonl", conversation=conversation)
+        if requested > 3:
+            with pytest.raises(StepLimitExceeded, match="工具调用上限"):
+                await call
+            assert any("工具未执行" in output for _, _, output in conversation.state["results"])
+        else:
+            assert (await call).turn_limit
+    finally:
+        await registry.client.aclose()
+    assert len(invoked) == len(finished) == len(log) == 3
+    assert "tool-3.txt" not in invoked
+    if tool == "Read":
+        assert any(not item["ok"] for item in log)
+    if tool == "Write":
+        assert all((tmp_path / f"tool-{i}.txt").read_text() == f"written {i}" for i in range(3))
+        assert not (tmp_path / "tool-3.txt").exists()
+    saved = db.get_run(run.id).plan.nodes[0]
+    assert saved.contract_tool_calls == 3 and saved.contract_turns == 1
+    assert len(sent) == 1  # no extra paid summary at either cap
+
+
+@pytest.mark.parametrize("model_id,act", [("cli:codex", True), ("mock:local", True), ("deepseek:worker", False)])
+async def test_direct_constrained_provider_call_cannot_bypass_channel_admission(tmp_path, monkeypatch, model_id, act):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.contracts import ArtifactBlocked
+
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [contract_node()])
+    registry = ProviderRegistry()
+    executor.providers = registry
+    run = db.get_run("artifacts")
+    started = []
+
+    async def cli(*args, **kwargs):
+        started.append(True)
+        pytest.fail("CLI should not start")
+
+    monkeypatch.setattr(registry.cli, "complete", cli)
+    try:
+        with pytest.raises(ArtifactBlocked, match="通道"):
+            await executor._complete(run, run.plan.nodes[0], model_id, "work", tmp_path, act=act,
+                                     tool_trace=tmp_path / "trace.jsonl")
+    finally:
+        await registry.client.aclose()
+    assert started == []
+    node = db.get_run(run.id).plan.nodes[0]
+    assert node.contract_turns == node.contract_tool_calls == 0
 
 
 class Reserving:

@@ -37,7 +37,7 @@ from .models import Diagnosis, Event, ExecutionRun, NodeAttempt, NodeStatus, Out
 from .platform_repair import PlatformRepairs
 from .preflight import Preflighting
 from .projects import git_snapshot
-from .providers import Conversation, ProviderRegistry
+from .providers import TOOL_LIMIT_REQUIREMENTS, Conversation, ProviderRegistry
 from .quota import ModelUnavailable, failure_kind
 from .recovery import retry_model, turns_for
 from .refining import PREFIX, Refining
@@ -283,6 +283,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         provider_load = Counter(self.model_lookup[n.model_id].provider for n in run.plan.nodes
                                 if n.id in in_flight and n.model_id in self.model_lookup)
         for node in ready:
+            if node.status != NodeStatus.PENDING or not self._admit_tool_channel(run, node, reserved):
+                continue
             model = self.model_lookup.get(node.model_id)
             if run.plan.employees:
                 provider_cap = settings.provider_limits.get(model.provider, {}).get("concurrency", 0) if model else 0
@@ -301,6 +303,75 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 provider_load[model.provider] += 1
             running[asyncio.create_task(self._execute_node(run.id, node.id))] = node.id
         return held_back
+
+    @staticmethod
+    def _contract_limit_reason(node):
+        reason = progress.limit_reason(node)
+        if not reason and node.artifact_contract and node.contract_tool_calls >= node.artifact_contract.max_turns:
+            reason = f"达到声明工具调用上限 {node.artifact_contract.max_turns}，停止工作包；保留产物与日志供诊断。"
+        return reason
+
+    def _admit_tool_channel(self, run, node, reserved=None, previous_model_id=None) -> bool:
+        """Fail closed before starting work; replacements use ordinary routing and permissions."""
+        limits = team.governors(run.plan, node)
+        try:
+            for upstream in run.plan.nodes:
+                if upstream.id in node.dependencies:
+                    contracts.accepted(run, upstream)
+        except contracts.ArtifactBlocked as exc:
+            self._stop_contract(run, node, str(exc), started=False, code="upstream_not_accepted",
+                                affected_dependencies=sorted(quality.descendants(run, {node.id})))
+            self._save(run)
+            return False
+        if not limits:
+            return True
+        configured = self._configured(run)
+        eligible = {model.id for model in eligible_for_node(
+            node, list(self.model_lookup.values()), configured,
+            any(item.kind == "image" for item in run.attachments))
+            if model.scores.score_for(node.capability) >= node.quality_threshold}
+        if run.plan.employees:
+            employee = team.member(run.plan, node.employee_id)
+            if not employee or node.capability not in employee.capabilities:
+                eligible.clear()
+        if reserved is None:
+            reserved = run.actual_cost_usd + sum(item.estimated_cost_usd for item in run.plan.nodes
+                                                if item.status == NodeStatus.RUNNING and item.id != node.id)
+        step_left = min(n.artifact_contract.max_cost_usd - n.contract_cost_usd for n in limits)
+        declare = getattr(self.providers, "tool_limit_capabilities", None)
+        channels, candidates = [], []
+        for model in self.model_lookup.values():
+            declared = declare(model.id) if callable(declare) else {}
+            compatible = (can_act(model) and all(declared.get(k) == v for k, v in TOOL_LIMIT_REQUIREMENTS.items()))
+            cost = node_cost(node, model) if model.id in eligible else None
+            affordable = cost is not None and reserved + cost <= run.budget_usd and cost <= step_left
+            channels.append({"model_id": model.id, "declared_capabilities": declared,
+                             "authorized": model.id in configured, "eligible": model.id in eligible,
+                             "compatible": compatible, "affordable": affordable})
+            retained = model.id == node.model_id and previous_model_id in {None, model.id}
+            if compatible and model.id in eligible and (retained or affordable):
+                candidates.append(model)
+        reason = next((why for n in limits if (why := self._contract_limit_reason(n))), None)
+        if candidates and not reason:
+            if node.model_id not in {model.id for model in candidates}:
+                previous = node.model_id
+                route_node(node, candidates, configured, any(item.kind == "image" for item in run.attachments))
+                self._save(run)
+                self.emit(run.id, "node.model_switched", node_id=node.id, model_id=previous,
+                          next_model_id=node.model_id, reason="tool_limit_compatibility")
+            return True
+        self._stop_contract(
+            run, node, reason or "没有已授权且满足能力、预算及工具调用硬上限要求的执行通道。",
+            Outcome.STOPPED if reason else Outcome.BLOCKED, started=False,
+            code="contract_limit_exhausted" if reason else "tool_limit_incompatible",
+            required_capabilities=dict(TOOL_LIMIT_REQUIREMENTS), channels=channels,
+            actual_counts={n.id: {"requests": n.contract_turns, "tool_calls": n.contract_tool_calls,
+                                  "cost_usd": n.contract_cost_usd, "limit": n.artifact_contract.max_turns}
+                           for n in limits},
+            affected_dependencies=sorted(quality.descendants(run, {node.id})),
+        )
+        self._save(run)
+        return False
 
     def _pause_for_budget(self, run: ExecutionRun) -> None:
         run.status = RunStatus.PAUSED
@@ -325,21 +396,33 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             node = next(node for node in run.plan.nodes if node.id == node_id)
             if node.status != NodeStatus.PENDING or run.status != RunStatus.RUNNING:
                 return
+            if (any(n.status != NodeStatus.SUCCEEDED for n in run.plan.nodes if n.id in node.dependencies)
+                    or outline.waits_on_unsplit(run.plan, node)):
+                return
             if self.platform_pending:
                 self._hold_for_platform(run)
                 return
+            admitted_model_id = node.model_id
             if not self._out_of_quota(node.model_id):
                 try:
                     self.refresh_model(run, node)
                 except NoEligibleModelError as exc:
-                    run.status, run.error = RunStatus.PAUSED, str(exc)
-                    self._save(run)
-                    self.emit(run_id, "approval.required", reason="model_unavailable", node_id=node.id)
-                    return
+                    if team.governors(run.plan, node):
+                        if not self._admit_tool_channel(run, node):
+                            return
+                    else:
+                        run.status, run.error = RunStatus.PAUSED, str(exc)
+                        self._save(run)
+                        self.emit(run_id, "approval.required", reason="model_unavailable", node_id=node.id)
+                        return
                 self._spread(run, node)
-                if node.estimated_cost_usd and run.actual_cost_usd + node.estimated_cost_usd > run.budget_usd:
-                    self._pause_for_budget(run)
-                    return
+            # Refresh/spreading and concurrent work may have changed the final channel or limits.
+            if not self._admit_tool_channel(run, node, previous_model_id=admitted_model_id):
+                return
+            if (not self._out_of_quota(node.model_id) and node.estimated_cost_usd
+                    and run.actual_cost_usd + node.estimated_cost_usd > run.budget_usd):
+                self._pause_for_budget(run)
+                return
             node.status = NodeStatus.RUNNING
             node.started_at = datetime.now(timezone.utc)
             self._save(run)
@@ -423,7 +506,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             children = []
             if not stale and not stopped:
                 for governor in team.governors(run.plan, node):
-                    if reason := progress.limit_reason(governor):
+                    if reason := self._contract_limit_reason(governor):
                         raise StepLimitExceeded(reason)
                 existing = [n for n in run.plan.nodes if n.delegation_parent_id == node.id
                             and n.delegation_request_id == payload.get("request_id")]
@@ -605,7 +688,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             if node.artifact_contract:
                 node.contract_turns = max(node.contract_turns, sum(a.turns for a in node.attempts))
                 node.contract_cost_usd = max(node.contract_cost_usd, sum(a.cost_usd for a in node.attempts))
-            if reason := progress.limit_reason(node):
+            if reason := self._contract_limit_reason(node):
                 node.attempts[-1].outcome = Outcome.STOPPED
                 node.attempts[-1].reason = reason + "\n" + str(exc)
                 self._stop_contract(run, node, node.attempts[-1].reason, Outcome.STOPPED)
@@ -692,10 +775,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             log = self.tool_logs[run.id, node.id] = []
             trace = self.tool_traces[run.id, node.id] = trace_path(run.id, node.id, len(node.attempts) + 1)
             for governor in team.governors(run.plan, node):
-                if reason := progress.limit_reason(governor):
+                if reason := self._contract_limit_reason(governor):
                     raise StepLimitExceeded(reason)
-                if model_id.startswith("cli:") or not act:
-                    raise contracts.ArtifactBlocked("此通道不能可靠执行声明的工具轮次上限；需要可计数的 API 工具通道。")
             if node.artifact_contract:
                 await asyncio.to_thread(contracts.prepare, run, node)
                 async with self.locks.setdefault(run.id, asyncio.Lock()):
@@ -743,7 +824,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                         contracts.accepted(run, node)
                     except contracts.ArtifactBlocked as exc:
                         verdict.passed, verdict.reason = False, str(exc)
-                if not verdict.passed and (reason := progress.limit_reason(node)):
+                if not verdict.passed and (reason := self._contract_limit_reason(node)):
                     outcome, verdict.reason = Outcome.STOPPED, reason + "\n" + verdict.reason
             # A verification that ran out of turns has not finished, which says nothing against
             # the work it verifies: it is retried itself rather than sending that work back.
@@ -812,7 +893,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             await self._repair(run_id, node_id, verdict, outcome)
 
 
-    def _stop_contract(self, run, node, reason: str, outcome: str = Outcome.BLOCKED) -> None:
+    def _stop_contract(self, run, node, reason: str, outcome: str = Outcome.BLOCKED, **details) -> None:
         """Record a deterministic diagnosis, without another model call or automatic recovery."""
         node.status, node.review_passed = NodeStatus.BLOCKED, False
         node.review = node.unable_reason = reason
@@ -820,7 +901,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             node.artifact_evidence.accepted = False
         if not node.result:
             node.result = f"BLOCKED: {reason}"
-        report = (f"{reason}\n累计轮次：{node.contract_turns}；累计费用：${node.contract_cost_usd:.6f}。\n"
+        report = (f"{reason}\n累计请求轮次：{node.contract_turns}；工具调用：{node.contract_tool_calls}；累计费用：${node.contract_cost_usd:.6f}。\n"
                   + contracts.prompt(node))
         if node.attempts and node.attempts[-1].trace:
             report += f"\n日志：{node.attempts[-1].trace}"
@@ -831,7 +912,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             if downstream.id in quality.descendants(run, {node.id}) and downstream.status == NodeStatus.PENDING:
                 downstream.status = NodeStatus.BLOCKED
                 downstream.review = downstream.unable_reason = f"上游「{node.title}」没有已验收的交付：{reason}"
-        self.emit(run.id, "node.blocked", node_id=node.id, reason=reason, outcome=outcome)
+        self.emit(run.id, "node.blocked", node_id=node.id, reason=reason, outcome=outcome, **details)
 
 
 
@@ -974,8 +1055,26 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             async with self.locks.setdefault(run.id, asyncio.Lock()):
                 latest = self.db.get_run(run.id)
                 step = next(item for item in latest.plan.nodes if item.id == node.id)
-                for governor in team.governors(latest.plan, step):
+                governors = team.governors(latest.plan, step)
+                for governor in governors:
+                    if reason := self._contract_limit_reason(governor):
+                        raise StepLimitExceeded(reason)
+                for governor in governors:
                     governor.contract_turns += 1
+                self._save(latest)
+
+        async def begin_tool():
+            # The check and debit share the run lock, including delegated siblings. Never
+            # refund an interrupted/failed invocation: its side effects may already exist.
+            async with self.locks.setdefault(run.id, asyncio.Lock()):
+                latest = self.db.get_run(run.id)
+                step = next(item for item in latest.plan.nodes if item.id == node.id)
+                governors = team.governors(latest.plan, step)
+                for governor in governors:
+                    if governor.contract_tool_calls >= governor.artifact_contract.max_turns:
+                        raise StepLimitExceeded("达到声明工具调用上限，额外调用未执行。")
+                for governor in governors:
+                    governor.contract_tool_calls += 1
                 self._save(latest)
 
         limits = team.governors(run.plan, node) if node else []
@@ -985,6 +1084,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                                turn_remaining=(lambda: min(n.artifact_contract.max_turns - n.contract_turns for n in current_limits())) if limits and work else None,
                                use_turn=use_turn if limits and work else None,
                                scope=(run.id, limits[-1].id) if limits else None, wait_for_step=work)
+        budget.begin_tool = begin_tool if limits and work else None
+        budget.tool_remaining = (lambda: min(n.artifact_contract.max_turns - n.contract_tool_calls
+                                             for n in current_limits())) if limits and work else None
         budget.context = {"run_id": run.id, "node_id": node.id if node else None,
                           "purpose": "work" if work else "review_or_control"}
         result = None

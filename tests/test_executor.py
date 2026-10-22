@@ -60,7 +60,114 @@ async def test_artifact_cli_cannot_silently_ignore_declared_limits(tmp_path, mon
     await executor.execute("artifacts")
     node = db.get_run("artifacts").plan.nodes[0]
     assert providers.calls == [] and node.status == NodeStatus.BLOCKED
-    assert "通道" in node.review and node.attempts[0].outcome == "blocked"
+    assert "通道" in node.review and node.attempts == [] and node.started_at is None
+    assert not [e for e in db.events("artifacts") if e.kind == "node.started"]
+
+
+@pytest.mark.parametrize("declaration", [{}, {"counting_unit": "request", "hard_limit": True},
+                                         {"counting_unit": "tool_call", "hard_limit": False}])
+async def test_tool_limit_admission_blocks_before_dispatch_with_structured_evidence(tmp_path, monkeypatch, declaration):
+    from artifact_helpers import setup_executor
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch)
+    providers.capabilities["test:worker"] = declaration
+
+    async def must_not_start(*args):
+        pytest.fail("incompatible work was dispatched")
+
+    monkeypatch.setattr(executor, "_execute_node", must_not_start)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.INCOMPLETE
+    assert providers.calls == providers.actual_calls == []
+    assert all(n.status == NodeStatus.BLOCKED and not n.attempts and n.started_at is None for n in run.plan.nodes)
+    events = db.events(run.id)
+    assert not any(e.kind == "node.started" for e in events)
+    data = next(e.data for e in events if e.kind == "node.blocked")
+    assert data["started"] is False and data["code"] == "tool_limit_incompatible"
+    assert data["required_capabilities"] == {"counting_unit": "tool_call", "hard_limit": True}
+    assert data["channels"][0]["declared_capabilities"] == declaration
+    assert data["actual_counts"]["vdb"] == {"requests": 0, "tool_calls": 0, "cost_usd": 0, "limit": 3}
+    assert data["affected_dependencies"] == ["audit", "report"]
+    assert run.actual_cost_usd == 0
+
+
+@pytest.mark.parametrize("denial", [None, "unauthorized", "disabled", "budget", "step_budget", "quality", "context"])
+async def test_tool_limit_replacement_preserves_authorization_capability_and_budgets(tmp_path, monkeypatch, denial):
+    from artifact_helpers import contract_node, mock_acceptance, setup_executor
+
+    node = contract_node()
+    node.model_id = "cli:codex"
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [node])
+    api = executor.model_lookup["test:worker"]
+    executor.model_lookup[node.model_id] = api.model_copy(update={"id": node.model_id, "provider": "cli", "channel": "cli"})
+    if denial != "unauthorized":
+        providers.authorized.add(api.id)
+    if denial == "disabled":
+        api.enabled = False
+    if denial == "quality":
+        api.scores.coding = node.quality_threshold - 1
+    if denial == "context":
+        api.context_window = 1
+    run = db.get_run("artifacts")
+    run.use_cli = True
+    if denial == "budget":
+        run.budget_usd = 0.0001
+    if denial == "step_budget":
+        run.plan.nodes[0].artifact_contract.max_cost_usd = 0.0001
+    before = run.model_copy(deep=True)
+    db.save_run(run)
+    checks = []
+    mock_acceptance(monkeypatch, checks)
+    await executor.execute(run.id)
+    saved = db.get_run(run.id)
+    node = saved.plan.nodes[0]
+    assert saved.budget_usd == before.budget_usd and saved.allow_network == before.allow_network
+    assert saved.use_cli == before.use_cli and node.artifact_contract == before.plan.nodes[0].artifact_contract
+    assert node.acceptance_criteria == before.plan.nodes[0].acceptance_criteria
+    if denial:
+        assert node.status == NodeStatus.BLOCKED and node.attempts == []
+        assert providers.calls == providers.actual_calls == [] and not checks
+    else:
+        assert saved.status == RunStatus.SUCCEEDED
+        assert node.model_id == "test:worker" and [a.model_id for a in node.attempts] == ["test:worker"]
+        assert providers.actual_calls == [("vdb", "test:worker")]
+        assert node.contract_tool_calls == node.contract_turns == 1
+        assert node.artifact_evidence.accepted and checks == [("validate coverage.vdb", False, False)]
+        assert any(e.kind == "node.model_switched" and e.data.get("reason") == "tool_limit_compatibility"
+                   for e in db.events(run.id))
+
+
+async def test_tool_limit_admission_rechecks_after_final_channel_changes(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [contract_node()])
+
+    def incompatible_after_spreading(run, node):
+        providers.capabilities[node.model_id] = {"counting_unit": "request", "hard_limit": False}
+
+    monkeypatch.setattr(executor, "_spread", incompatible_after_spreading)
+    await executor.execute("artifacts")
+    node = db.get_run("artifacts").plan.nodes[0]
+    assert node.status == NodeStatus.BLOCKED and node.attempts == [] and node.started_at is None
+    assert providers.calls == providers.actual_calls == []
+    assert not any(e.kind == "node.started" for e in db.events("artifacts"))
+
+
+async def test_compatible_consumer_does_not_start_without_upstream_acceptance(tmp_path, monkeypatch):
+    from artifact_helpers import setup_executor
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch)
+    run = db.get_run("artifacts")
+    run.plan.nodes[0].status = NodeStatus.SUCCEEDED  # a status alone is not accepted evidence
+    db.save_run(run)
+    await executor.execute(run.id)
+    saved = db.get_run(run.id)
+    assert saved.status == RunStatus.INCOMPLETE and providers.calls == []
+    assert saved.plan.nodes[0].status == NodeStatus.SUCCEEDED
+    assert all(n.status == NodeStatus.BLOCKED and n.attempts == [] and n.started_at is None
+               for n in saved.plan.nodes[1:])
+    assert not any(e.kind == "node.started" for e in db.events(run.id))
 
 
 async def test_artifact_worker_blocked_result_preserves_cost_and_log_without_automatic_recovery(tmp_path, monkeypatch):

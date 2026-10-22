@@ -22,12 +22,15 @@ from .budget import BudgetExceeded, ProviderError, StepLimitExceeded
 from .call_control import ProviderGate, input_bound, retry_after
 from .cli_channels import CLI_SPECS, CliChannelRegistry, SessionLost
 from .config import settings
+from .contracts import ArtifactBlocked
 from .conversation import Conversation
 from .db import Database
 from .models import Attachment, SupervisorSession
 from .quality import REVIEW_MARKER
 from .quota import ModelUnavailable, QuotaTracker
 from .secrets import PROVIDER_ENV
+
+TOOL_LIMIT_REQUIREMENTS = {"counting_unit": "tool_call", "hard_limit": True}
 
 
 @dataclass
@@ -201,6 +204,16 @@ class ProviderRegistry:
                 configured.add(model_id)
         return {model_id for model_id in configured if not self.quota.exhausted(model_id)}
 
+    def tool_limit_capabilities(self, model_id: str) -> dict:
+        """Only the platform-owned API tool loop can count and intercept every invocation."""
+        if model_id.startswith("cli:"):
+            return self.cli.tool_limit_capabilities(model_id)
+        model = self.models.get(model_id)
+        if (model_id.split(":", 1)[0] not in PROVIDER_ENV or not settings.api_agent
+                or (model and (model.channel == "cli" or model.supports_tools is False))):
+            return {"counting_unit": None, "hard_limit": False}
+        return dict(TOOL_LIMIT_REQUIREMENTS)
+
     @call_records.observed
     async def complete(self, model_id: str, prompt: str, *args, **kwargs) -> ProviderResult:
         """A limit or exhausted upstream retry raises ModelUnavailable and excludes this
@@ -273,6 +286,11 @@ class ProviderRegistry:
         ``overrun`` is (expected turns, check): an acting model past progress.OVERRUN_FACTOR times
         those turns is checked, and stopped if the check says so."""
         provider, model = model_id.split(":", 1)
+        if (getattr(spend_ok, "turn_remaining", None) is not None
+                and (not act or not all(self.tool_limit_capabilities(model_id).get(k) == v
+                                       for k, v in TOOL_LIMIT_REQUIREMENTS.items())
+                     or not callable(getattr(spend_ok, "begin_tool", None)))):
+            raise ArtifactBlocked("此通道不能可靠执行声明的工具调用上限。")
         attachments = list(attachments)
         if provider == "cli":
             if conversation and conversation.handoff:
@@ -489,6 +507,9 @@ class ProviderRegistry:
         watch = getattr(agent, "watch", None)
         limit = (agent.max_turns or settings.api_agent_max_turns or (None if watch else UNWATCHED_TURNS)) if agent else 1
         hard_limit = getattr(spend_ok, "turn_remaining", None)
+        tool_remaining = getattr(spend_ok, "tool_remaining", None)
+        if tool_remaining is not None and tool_remaining() <= 0:
+            raise StepLimitExceeded("达到声明工具调用上限，停止工作包。")
         if hard_limit is not None:
             remaining = hard_limit()
             if remaining <= 0:
@@ -582,6 +603,14 @@ class ProviderRegistry:
                 # A turn's calls together: its reads and searches run at the same time.
                 async def execute_tool(call, results=results, turn=turn):
                     call_id, name, args = call
+                    if begin_tool := getattr(spend_ok, "begin_tool", None):
+                        try:
+                            await begin_tool()  # reserve durably, before any tool side effects
+                        except StepLimitExceeded as exc:
+                            results.append((call_id, name, f"BLOCKED: 工具未执行：{exc}"))
+                            if conversation:
+                                conversation.save()
+                            raise
                     output, ok = (memory.recall(conversation, args) if name == "RecallHistory" and conversation
                                   else await agent.run(name, args))
                     results.append((call_id, name, output))
@@ -595,7 +624,12 @@ class ProviderRegistry:
                         _trace(agent.trace, {**seen[-1], "output": output[:TRACE_OUTPUT]})
                 if (not settings.api_tool_hooks and
                         all(name in agent_tools.READ_ONLY_TOOLS or name == "RecallHistory" for _id, name, _args in calls)):
-                    await asyncio.gather(*(execute_tool(call) for call in calls))
+                    # Settle admitted siblings before propagating a rejection; no tools may
+                    # outlive the attempt or lose their completion checkpoint/accounting.
+                    completed = await asyncio.gather(*(execute_tool(call) for call in calls), return_exceptions=True)
+                    for result in completed:
+                        if isinstance(result, BaseException):
+                            raise result
                 else:
                     for call in calls:
                         await execute_tool(call)
@@ -609,7 +643,8 @@ class ProviderRegistry:
                 if conversation:
                     conversation.save()
                 if hard_limit is not None and (
-                    hard_limit() <= 0 or (spend_ok.step_remaining is not None and spend_ok.step_remaining() <= 0)
+                    hard_limit() <= 0 or (tool_remaining is not None and tool_remaining() <= 0)
+                    or (spend_ok.step_remaining is not None and spend_ok.step_remaining() <= 0)
                 ):
                     return ProviderResult(text or "声明限额已用尽，保留工具日志供诊断。", total_in, total_out,
                                           model_id, turns=turn, turn_limit=True, cached_input_tokens=total_cached)

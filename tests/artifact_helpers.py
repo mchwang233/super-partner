@@ -1,11 +1,19 @@
 """Temporary artifacts and fake models for contract regressions; never invokes URG."""
 from pathlib import Path
 
+from super_partner.cli_channels import CliChannelRegistry
 from super_partner.config import settings
 from super_partner.db import Database
 from super_partner.executor import Executor
-from super_partner.models import ExecutionRun, ModelProfile, RunStatus, TaskNode, TaskPlan
-from super_partner.providers import ProviderResult
+from super_partner.models import (
+    CapabilityScore,
+    ExecutionRun,
+    ModelProfile,
+    RunStatus,
+    TaskNode,
+    TaskPlan,
+)
+from super_partner.providers import TOOL_LIMIT_REQUIREMENTS, ProviderResult
 
 
 def contract_node(key="vdb", stage="coverage_vdb", inputs=(), output="coverage.vdb", **overrides):
@@ -36,6 +44,16 @@ class ArtifactProviders:
     def __init__(self, nodes, work=None):
         self.nodes = {node.id: node for node in nodes}
         self.work, self.calls = work, []
+        self.authorized = {node.model_id for node in nodes}
+        self.capabilities = {}
+        self.actual_calls = []
+
+    def configured_models(self, ids):
+        return set(ids) & self.authorized
+
+    def tool_limit_capabilities(self, model_id):
+        return self.capabilities.get(model_id, CliChannelRegistry.tool_limit_capabilities(model_id)
+                                     if model_id.startswith("cli:") else dict(TOOL_LIMIT_REQUIREMENTS))
 
     async def complete(self, model_id, prompt, workspace=None, **kwargs):
         trace = kwargs.get("tool_trace")
@@ -46,6 +64,8 @@ class ArtifactProviders:
         budget = kwargs["spend_ok"]
         await budget.begin_turn()
         await budget.record(model_id, 1000, 1000)
+        await budget.begin_tool()
+        self.actual_calls.append((node.id, model_id))
         if self.work:
             result = await self.work(node, Path(workspace), kwargs)
             if result is not None:
@@ -69,7 +89,8 @@ def setup_executor(tmp_path, monkeypatch, nodes=None, work=None):
     database.save_run(ExecutionRun(id="artifacts", prompt="Produce coverage evidence", status=RunStatus.QUEUED,
                                    budget_usd=5, plan=TaskPlan(summary="coverage", nodes=nodes)))
     model = ModelProfile(id="test:worker", provider="test", display_name="test", supports_tools=True,
-                         input_per_million=1, output_per_million=1)
+                         input_per_million=1, output_per_million=1, context_window=64000,
+                         scores=CapabilityScore(coding=90))
     providers = ArtifactProviders(nodes, work)
     return Executor(database, providers, {model.id: model}), database, providers
 

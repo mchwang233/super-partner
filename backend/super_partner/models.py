@@ -265,6 +265,8 @@ class TaskNode(BaseModel):
     artifact_evidence: Optional[ArtifactEvidence] = None
     # Persisted at each request, never reset by automatic retry, rework or a model switch.
     contract_turns: int = 0
+    # Individual worker tool invocations, reserved before side effects (including failures).
+    contract_tool_calls: int = 0
     contract_cost_usd: float = 0.0
     contract_generation: Optional[int] = None
     artifact_baseline: dict[str, str] = Field(default_factory=dict)

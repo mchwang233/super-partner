@@ -66,7 +66,7 @@ history, active lessons and already submitted independent platform jobs remain i
 |---|---|---|
 | HTTP API, task lifecycle endpoints | `api.py` | `create_task`, `follow_up_task`, `resume_task`, `reopen_node`, `reply_to_diagnosis`, `set_network_access` |
 | Records and statuses | `models.py` | `RunStatus`, `NodeStatus`, `Outcome` (attempt outcomes), `DiagnosisStatus`, `FINISHED`, `TaskNode`, `NodeAttempt`, `Diagnosis`, `ExecutionRun` |
-| Declared artifact handoffs and stop limits | `contracts.py`, `models.py` | Optional `TaskNode.artifact_contract` (`ArtifactContract`: stage, external/dependency inputs, file/directory outputs, acceptance commands, blocking conditions, total turns/cost); `plan_problems`, `prepare`, `delivery_snapshot`, `accepted`; `ArtifactEvidence`, persistent `contract_turns/contract_cost_usd` |
+| Declared artifact handoffs and stop limits | `contracts.py`, `models.py` | Optional `TaskNode.artifact_contract` (`ArtifactContract`: stage, external/dependency inputs, file/directory outputs, acceptance commands, blocking conditions, total turns/cost); `plan_problems`, `prepare`, `delivery_snapshot`, `accepted`; `ArtifactEvidence`, persistent `contract_turns/contract_tool_calls/contract_cost_usd` |
 | Storage (SQLite, JSON bodies) | `db.py` | `Database.save_run`, `get_run`, events, `save_retrospective`; `conversations`, `conversation_archives`, `model_calls` (task deletion removes all three) |
 | Skills for the steps: SKILL.md files with the `tools` they cover, general in `skills/steps/`, this machine's in `<data_dir>/skills/` (first), public references in `<data_dir>/skills-discovered/`; a step is given those whose tools it names. Public references retain origin, immutable blob revision and content hash, and never claim local verification | `skills.py` | `library`, `for_step` (`quality.node_prompt`), `section`, `save_machine`, `save_discovered` |
 | Optional reuse-first skill preparation: local/general/cache → bounded public GitHub repository/tree/blob search (only when the task permits network) → bounded sandbox generation. No remote install scripts run. Discovery is at most 30 seconds and 12 requests; generation uses `skill_preparation_timeout` and `skill_generation_max_turns`. Failures remain advisory | `skill_discovery.py`, `preflight.py` | `discover`, `Discovery`, `_prepare_skills`; `skill_reuse_first` (off by default); events `run.skill_searching`, `run.skill_selected`, `run.skill_generating` |
@@ -117,6 +117,9 @@ history, active lessons and already submitted independent platform jobs remain i
 (`diagnosing.py`), `SelfRepair` (`self_repair.py`), `Engineering` (`engineer.py`) and `Refining` (`refining.py`); they share its state (`db`, `locks`, `_complete`, `_save`, `emit`).
 
 - `execute` / `_dispatch`: the run loop; starts every ready node, or up to `max_parallel_nodes` when that is set (0, the default: no limit).
+- `_admit_tool_channel`: before dispatch and again after final model selection, checks declared
+  tool-limit enforcement, authorization, routing eligibility and cumulative limits. A compatible
+  replacement must also fit the remaining run/step budgets and other dispatched work's reservations.
 - `_execute_node`: one attempt; exceptions map to outcomes (`budget`, `error`, quota → `_switch_model`).
 - `_check` (review.py): review or verification verdict; `quality.Verdict(passed, reason, fix, unable, ...)`.
 - `_finish`: appends the `NodeAttempt` with an `Outcome`.
@@ -151,10 +154,26 @@ VDB invalidates its old report. Evidence paths reject traversal, symlinks and pr
 audit output does not send already accepted upstream work back for rework.
 
 `RequestBudget` preserves run-wide reservations and additionally caps a contracted step's calls,
-including its reviews/progress checks. Calls for that step share reservations. Worker turns and all
-associated API charges are persisted at each request and survive retry, model switch, rework and
-restart. A hard turn cap makes no extra paid summary request. CLI or tool-less channels that cannot
-enforce it return `blocked`. Missing prerequisites or an explicit `BLOCKED` result also block; a
+including its reviews/progress checks. Calls for that step share reservations. Worker request turns
+and all associated API charges are persisted at each request and survive retry, model switch,
+rework and restart. In addition to the unchanged request cap, `max_turns` limits individual worker
+tool invocations: each batch item, failed tool and history recall counts once. `contract_tool_calls`
+is debited under the run lock before execution, against the step and every delegated ancestor;
+parallel siblings share that allowance. Interrupted invocations remain counted because their side
+effects may exist. Acceptance commands and reviewer/control calls retain their existing policy.
+The tool loop refuses excess items before side effects and waits for admitted parallel reads to
+settle before returning a rejection. Neither cap permits an extra paid summary request.
+
+`ProviderRegistry.tool_limit_capabilities` declares the platform-owned API loop's `tool_call`
+counting unit and hard interception; CLI adapters declare these unsupported, regardless of their
+reported provider turns. Missing declarations also fail closed. Admission can choose an authorized,
+eligible compatible model without altering the contract, task permissions, sandbox, or acceptance
+criteria. When no such channel fits, `node.blocked` records `started=false`, required and declared
+capabilities, authorization/eligibility/budget checks, cumulative request/tool/cost counts and
+affected dependency IDs. No `node.started` event or `NodeAttempt` is created for this rejection.
+Stored counts have defaults for old records; existing request/cost totals are retained. Upstream
+artifact acceptance is rechecked before a consumer starts and again in the ordinary input gate.
+Missing prerequisites or an explicit `BLOCKED` result also block; a
 limit without accepted delivery records `Outcome.STOPPED`. `_stop_contract` preserves the attempt,
 logs, charges and a deterministic task diagnosis, blocks consumers and ends incomplete without
 automatic diagnosis/retry. Lead acceptance and replanning cannot erase these gates or limits.

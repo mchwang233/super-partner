@@ -279,6 +279,11 @@ class CliChannelRegistry:
     def __init__(self) -> None:
         self._statuses: dict[str, CliStatus] = {}
 
+    @staticmethod
+    def tool_limit_capabilities(model_id: str) -> dict:
+        # CLI-reported turns are not individual tool calls; we cannot intercept their tools.
+        return {"counting_unit": None, "hard_limit": False}
+
     def refresh(self) -> dict[str, CliStatus]:
         self._statuses = {model_id: self._probe(spec) for model_id, spec in CLI_SPECS.items()}
         return self._statuses
