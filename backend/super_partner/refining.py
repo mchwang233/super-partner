@@ -10,6 +10,7 @@ import asyncio
 import logging
 
 from . import contracts, outline, supervisor
+from .config import settings
 from .models import RunStatus
 from .routing import NoEligibleModelError, fit_and_route, reestimate
 
@@ -33,8 +34,18 @@ class Refining:
             run = self.db.get_run(run_id)
             part = next(item for item in run.plan.parts if item.id == part_id)
             part.status, part.error = "refining", None
+            effort = settings.lead_reasoning_effort
+            if settings.adaptive_refinement:
+                effort = part.refinement_effort or outline.REFINEMENT_EFFORT[part.difficulty]
+                part.refinement_effort = effort
+                if not part.refinement_reason:
+                    part.refinement_reason = "旧计划未单独指定推理档，按大项难度选择。"
+            else:
+                part.refinement_effort = effort if effort in {"low", "medium", "high", "max"} else ""
+                part.refinement_reason = "平台未启用按难度细化，使用统一的负责人推理档。"
             self._save(run)
-        self.emit(run_id, "part.refining", part_id=part_id, title=part.title)
+        self.emit(run_id, "part.refining", part_id=part_id, title=part.title,
+                  effort=effort, difficulty=part.difficulty, reason=part.refinement_reason)
         models = list(self.model_lookup.values())
         configured = self._configured(run)
         leads = supervisor.candidates(models, configured)
@@ -44,6 +55,9 @@ class Refining:
         error, split, used = "没有可用的负责人模型", None, None
         for model in leads[:supervisor.MAX_LEADS]:
             session = supervisor.new_session(model)
+            if settings.adaptive_refinement:
+                session.reasoning_effort = effort
+            self.emit(run_id, "part.refine_attempt", part_id=part_id, model_id=model.id, effort=effort)
 
             async def say(text: str, session=session, model=model) -> str:
                 result = await self._charged(run, None, model.id, lambda budget: self.providers.converse(

@@ -194,9 +194,10 @@ def test_a_result_is_checked_by_a_model_no_weaker_than_the_one_that_made_it():
     ids = {model.id for model in models}
     # The cheapest one at least as capable as the model checked, not the most reliable.
     assert pick_reviewer(models, ids, exclude="deepseek:flash", tokens=1000).id == "glm:glm"
-    # Checking the strongest: none is as capable, so the most capable of the rest.
-    assert pick_reviewer(models, ids, exclude="kimi:k3", tokens=1000).id == "glm:glm"
-    assert pick_reviewer(models, ids - {"glm:glm", "kimi:k3"}, exclude="deepseek:flash", tokens=1000).id == "minimax:m3"
+    # With no equally capable independent judge, use a fresh conversation with the producer.
+    assert pick_reviewer(models, ids, exclude="kimi:k3", tokens=1000).id == "kimi:k3"
+    assert pick_reviewer(models, ids - {"glm:glm", "kimi:k3"}, exclude="deepseek:flash", tokens=1000).id == "deepseek:flash"
+    assert pick_reviewer(models, {"minimax:m3"}, exclude="deepseek:flash", tokens=1000) is None
 
 
 def test_reviews_also_go_to_api_models_first():

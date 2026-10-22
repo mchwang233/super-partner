@@ -175,6 +175,9 @@ class DiagnosisStatus:
 
 class NodeAttempt(BaseModel):
     """One run of a node: what model did it, and whether its result was accepted."""
+    # Older records have no trustworthy wall-clock duration.
+    duration_seconds: Optional[float] = None
+    interrupted: bool = False
     model_id: Optional[str] = None
     # One of Outcome.
     outcome: str
@@ -336,6 +339,9 @@ class PlanPart(BaseModel):
     # The lead's guess of its tasks and their main capability, for the estimate before it is split.
     size: int = 0
     capability: str = "coding"
+    difficulty: Literal["easy", "normal", "hard"] = "normal"
+    refinement_effort: Literal["", "low", "medium", "high", "max"] = ""
+    refinement_reason: str = ""
     estimated_cost_usd: float = 0.0
     # A major part: planned (not split yet), refining, ready (split into tasks) or failed.
     status: str = "ready"
@@ -486,6 +492,8 @@ class SupervisorSession(BaseModel):
     """The task's lead: the strong model that planned it keeps one conversation until the task
     ends (supervisor.py, docs/design/supervisor.md)."""
     model_id: Optional[str] = None
+    # A dedicated refinement conversation may override the main lead's effort independently.
+    reasoning_effort: Optional[str] = None
     # A membership CLI's own conversation id, continued on every call.
     session_id: Optional[str] = None
     # The folder the CLI conversation lives in; it must stay the same for it to be continued.

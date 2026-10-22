@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import agent as agent_tools
-from . import environment, retrospect, skills
+from . import environment, retrospect, skill_discovery, skills
 from .config import settings
 from .diagnosis import parse as parse_diagnosis
 from .models import ExecutionRun, NodeStatus, Preflight, PreflightCheck, RunStatus, TaskNode
@@ -150,6 +150,9 @@ def skill_prompt(run: ExecutionRun, name: str, tools: list[str], general, checks
          "task's working directory, in the same sandbox as the steps (only the working directory and /tmp "
          "writable, the environment set up as for every step). Do not do the task itself."),
         f"The task: {run.plan.summary or run.prompt[:600]}",
+        *([(f"Preparation is limited to {settings.skill_generation_max_turns} model/tool rounds. "
+           "Use installed help and a minimal smoke check; avoid an exhaustive test matrix. Return a "
+           "valid SKILL.md within that budget and say what remains unverified.")] if settings.skill_reuse_first else []),
         "",
         ("Try, on a tiny example of your own, each thing the task's steps will do with these tools (for "
          "a simulator: compile, run with a seed, collect and report coverage, check assertions). Keep "
@@ -256,10 +259,40 @@ class Preflighting:
         ready, prepared, failed = [], [], []
         for group in tool_groups(wanted, library):
             name, tools, general = group
-            if mine := [skill for skill in skills.for_tools(tools, library) if skill.machine]:
+            if settings.skill_reuse_first:
+                existing = [s for s in skills.for_tools(tools, library) if s.body
+                            and set(tools) <= set(s.tools)]
+                if existing:
+                    chosen = existing[0]
+                    ready.append(chosen.name)
+                    self.emit(run_id, "run.skill_selected", name=chosen.name,
+                              origin="machine" if chosen.machine else "public" if chosen.source_url else "general",
+                              source_url=chosen.source_url, revision=chosen.source_revision)
+                    continue
+                # Read again: the user may have enabled networking during the startup checks.
+                latest = self.db.get_run(run_id)
+                if latest and latest.allow_network:
+                    self.emit(run_id, "run.skill_searching", name=name, tools=tools)
+                    discovered = await skill_discovery.discover(tools)
+                    if discovered.skill:
+                        chosen = discovered.skill
+                        try:
+                            skills.save_discovered(chosen)
+                        except OSError as exc:
+                            discovered.reason = f"Cannot cache public skill: {type(exc).__name__}"
+                        else:
+                            library.append(chosen)
+                            ready.append(chosen.name)
+                            self.emit(run_id, "run.skill_selected", name=chosen.name, origin="public",
+                                      source_url=chosen.source_url, revision=chosen.source_revision)
+                            continue
+                    self.emit(run_id, "run.skill_search_finished", name=name, found=False, reason=discovered.reason)
+            if not settings.skill_reuse_first and (mine := [skill for skill in skills.for_tools(tools, library) if skill.machine]):
                 ready += [skill.name for skill in mine]
                 continue
             try:
+                self.emit(run_id, "run.skill_generating", name=name, timeout=settings.skill_preparation_timeout,
+                          max_turns=settings.skill_generation_max_turns if settings.skill_reuse_first else None)
                 text = await asyncio.wait_for(self._write_skill(run, workspace, name, tools, general, checks),
                                               settings.skill_preparation_timeout)
                 skill = skills.parse(text)
@@ -298,7 +331,9 @@ class Preflighting:
         scratch.mkdir(parents=True, exist_ok=True)
         try:
             result = await self._complete(run, None, node.model_id, skill_prompt(run, name, tools, general, checks),
-                                          scratch, act=True, effort="medium")
+                                          scratch, act=True, effort="medium",
+                                          **({"max_turns": settings.skill_generation_max_turns}
+                                             if settings.skill_reuse_first else {}))
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
         return result.text

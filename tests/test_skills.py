@@ -74,6 +74,114 @@ class Machine:
         return ProviderResult("done", 1, 1, model_id)
 
 
+async def test_reuse_first_uses_existing_general_skill_without_generating(library, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "skill_reuse_first", True)
+    database = Database(tmp_path / "t.db")
+    task(database, "reuse")
+    machine = Machine()
+    executor = Executor(database, machine, {m.id: m for m in [model("x:flash", 90)]})
+
+    async def available(*args):
+        return ["fakesim"]
+
+    monkeypatch.setattr(executor, "_available", available)
+    assert await executor._prepare_skills("reuse", tmp_path, []) == ["fake-sim"]
+    assert machine.skill_prompts == []
+    assert not skills.machine_dir().exists()
+    selected = [e for e in database.events("reuse") if e.kind == "run.skill_selected"]
+    assert selected[0].data["origin"] == "general"
+
+
+@pytest.mark.parametrize("network", [False, True])
+async def test_search_precedes_bounded_generation_only_when_network_allowed(library, tmp_path, monkeypatch, network):
+    from super_partner import skill_discovery
+    monkeypatch.setattr(settings, "skill_reuse_first", True)
+    monkeypatch.setattr(settings, "skill_generation_max_turns", 4)
+    monkeypatch.setattr(skills, "SOURCE", tmp_path / "empty")
+    database = Database(tmp_path / "t.db")
+    task(database, "missing")
+    run = database.get_run("missing")
+    run.allow_network = network
+    database.save_run(run)
+    executor = Executor(database, Machine(), {m.id: m for m in [model("x:flash", 90)]})
+    actions = []
+
+    async def available(*args):
+        return ["fakesim"]
+
+    async def discover(tools):
+        actions.append("search")
+        return skill_discovery.Discovery(reason="No match")
+
+    async def complete(*args, **kwargs):
+        actions.append("generate")
+        assert kwargs["max_turns"] == 4
+        return ProviderResult(GENERAL, 1, 1, "x:flash")
+
+    monkeypatch.setattr(executor, "_available", available)
+    monkeypatch.setattr(skill_discovery, "discover", discover)
+    monkeypatch.setattr(executor, "_complete", complete)
+    assert await executor._prepare_skills("missing", tmp_path, []) == ["fakesim"]
+    assert actions == (["search", "generate"] if network else ["generate"])
+
+
+async def test_online_skill_is_cached_and_reused_without_generation(library, tmp_path, monkeypatch):
+    from super_partner import skill_discovery
+    monkeypatch.setattr(settings, "skill_reuse_first", True)
+    monkeypatch.setattr(skills, "SOURCE", tmp_path / "empty")
+    database = Database(tmp_path / "t.db")
+    task(database, "online")
+    run = database.get_run("online")
+    run.allow_network = True
+    database.save_run(run)
+    machine = Machine()
+    executor = Executor(database, machine, {m.id: m for m in [model("x:flash", 90)]})
+    searched = []
+
+    async def available(*args):
+        return ["fakesim"]
+
+    async def discover(tools):
+        searched.append(tools)
+        skill = skills.parse(GENERAL)
+        skill.source_url = "https://github.com/example/skills/blob/main/SKILL.md"
+        skill.source_revision = "b" * 40
+        return skill_discovery.Discovery(skill=skill)
+
+    monkeypatch.setattr(executor, "_available", available)
+    monkeypatch.setattr(skill_discovery, "discover", discover)
+    assert await executor._prepare_skills("online", tmp_path, []) == ["fake-sim"]
+    assert await executor._prepare_skills("online", tmp_path, []) == ["fake-sim"]
+    assert len(searched) == 1 and machine.skill_prompts == []
+
+
+async def test_generation_deadline_does_not_block_task_start(library, tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(settings, "skill_reuse_first", True)
+    monkeypatch.setattr(settings, "skill_preparation_timeout", 0.01)
+    monkeypatch.setattr(skills, "SOURCE", tmp_path / "empty")
+    database = Database(tmp_path / "t.db")
+    task(database, "timeout")
+    executor = Executor(database, Machine(), {m.id: m for m in [model("x:flash", 90)]})
+    cancelled = []
+
+    async def available(*args):
+        return ["fakesim"]
+
+    async def write(*args):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    monkeypatch.setattr(executor, "_available", available)
+    monkeypatch.setattr(executor, "_write_skill", write)
+    assert await executor._prepare_skills("timeout", tmp_path, []) == []
+    assert cancelled == [True]
+    event = [e for e in database.events("timeout") if e.kind == "run.skills_prepared"][-1]
+    assert event.data["failed"]
+
+
 def task(database, run_id):
     node = TaskNode(id="n", title="仿真", instructions="用 fakesim 编译并运行测试", capability="coding", model_id="x:flash")
     database.save_run(ExecutionRun(id=run_id, prompt="用 fakesim 验证", status=RunStatus.QUEUED, budget_usd=1,

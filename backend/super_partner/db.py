@@ -71,6 +71,19 @@ class Database:
                 CREATE TABLE IF NOT EXISTS learning_settings (
                     id INTEGER PRIMARY KEY CHECK (id = 1), body TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS conversations (
+                    run_id TEXT NOT NULL, node_id TEXT NOT NULL, body TEXT NOT NULL,
+                    PRIMARY KEY(run_id, node_id)
+                );
+                CREATE TABLE IF NOT EXISTS conversation_archives (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL, body TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_archives_scope ON conversation_archives(run_id, node_id, id);
+                CREATE TABLE IF NOT EXISTS model_calls (
+                    id TEXT PRIMARY KEY, run_id TEXT, node_id TEXT, started_at TEXT NOT NULL, body TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_calls_run ON model_calls(run_id, started_at);
                 """
             )
 
@@ -274,12 +287,75 @@ class Database:
                     raise ValueError("只能删除已完成、失败或已取消的任务记录。")
                 return False
             self.connection.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
+            for table in ("conversations", "conversation_archives", "model_calls"):
+                self.connection.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
             self.connection.execute("DELETE FROM retrospectives WHERE run_id = ?", (run_id,))
             self.connection.execute("DELETE FROM learning_reviews WHERE run_id = ?", (run_id,))
             self.connection.execute("DELETE FROM improvement_effects WHERE run_id = ? OR improvement_id IN "
                                     "(SELECT id FROM improvements WHERE run_id = ?)", (run_id, run_id))
             self.connection.execute("DELETE FROM improvements WHERE run_id = ?", (run_id,))
         return True
+
+    def save_conversation(self, run_id: str, node_id: str, body: dict) -> None:
+        with self.lock, self.connection:
+            # A late checkpoint must not resurrect a deleted task's private history.
+            self.connection.execute(
+                "INSERT OR REPLACE INTO conversations(run_id, node_id, body) "
+                "SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?)",
+                (run_id, node_id, json.dumps(body, ensure_ascii=False), run_id),
+            )
+
+    def conversation(self, run_id: str, node_id: str) -> Optional[dict]:
+        with self.lock:
+            row = self.connection.execute("SELECT body FROM conversations WHERE run_id = ? AND node_id = ?",
+                                          (run_id, node_id)).fetchone()
+        return json.loads(row["body"]) if row else None
+
+    def archive_conversation(self, run_id: str, node_id: str, body: dict) -> int:
+        with self.lock, self.connection:
+            cursor = self.connection.execute(
+                "INSERT INTO conversation_archives(run_id, node_id, body) "
+                "SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?)",
+                (run_id, node_id, json.dumps(body, ensure_ascii=False), run_id),
+            )
+            return cursor.lastrowid if cursor.rowcount else 0
+
+    def conversation_archive(self, run_id: str, node_id: str, archive_id: int) -> Optional[dict]:
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT body FROM conversation_archives WHERE run_id = ? AND node_id = ? AND id = ?",
+                (run_id, node_id, archive_id),
+            ).fetchone()
+        return json.loads(row["body"]) if row else None
+
+    def save_model_call(self, body: dict) -> None:
+        with self.lock, self.connection:
+            if body.get("run_id") and not self.connection.execute("SELECT 1 FROM runs WHERE id = ?",
+                                                                 (body["run_id"],)).fetchone():
+                return
+            self.connection.execute("INSERT OR REPLACE INTO model_calls VALUES (?, ?, ?, ?, ?)",
+                                    (body["id"], body.get("run_id"), body.get("node_id"), body["started_at"],
+                                     json.dumps(body, ensure_ascii=False)))
+
+    def model_calls(self, run_id: Optional[str] = None, limit: int = 1000) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT body FROM model_calls " + ("WHERE run_id = ? " if run_id else "") +
+                "ORDER BY started_at DESC LIMIT ?", ((run_id,) if run_id else ()) + (max(1, min(limit, 10000)),),
+            ).fetchall()
+        return [json.loads(row["body"]) for row in rows]
+
+    def interrupt_model_calls(self):
+        """Called once at service startup, before admitting new work."""
+        with self.lock, self.connection:
+            rows = self.connection.execute("SELECT id, body FROM model_calls").fetchall()
+            for row in rows:
+                body = json.loads(row["body"])
+                if body.get("status") == "running":
+                    body.update(status="interrupted", usage_known=False)
+                    body.setdefault("warnings", []).append("服务中断，可能存在未收到的用量；请勿按零消耗处理。")
+                    self.connection.execute("UPDATE model_calls SET body = ? WHERE id = ?",
+                                            (json.dumps(body, ensure_ascii=False), row["id"]))
 
     def add_event(self, event: Event) -> Event:
         with self.lock, self.connection:

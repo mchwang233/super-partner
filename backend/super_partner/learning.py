@@ -360,6 +360,7 @@ class Learning:
 
         budget = RequestBudget(self.model_lookup, lambda: review.budget_usd - review.cost_usd - review.allocated_usd,
                                {}, charge, asyncio.Event())
+        budget.context = {"run_id": review.run_id, "purpose": "retrospective"}
         # CLI calls are also isolated from the finished project's files.
         try:
             with tempfile.TemporaryDirectory(prefix="sp-retrospective-") as folder:

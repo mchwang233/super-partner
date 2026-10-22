@@ -30,10 +30,10 @@ def often(monkeypatch):
     monkeypatch.setattr(settings, "progress_check_minutes", 0.2 / 60)
 
 
-def test_the_checker_must_say_stop_to_stop():
+def test_the_checker_must_explicitly_permit_continuation():
     assert progress.parse("还在写测试，进展正常。\nVERDICT: CONTINUE") is None
     assert progress.parse("VERDICT: STOP: 连续 12 次运行同一条失败的命令") == "连续 12 次运行同一条失败的命令"
-    assert progress.parse("看不出来") is None
+    assert "未给出唯一有效结论" in progress.parse("看不出来")
 
 
 def test_there_is_no_turn_limit_by_default():
@@ -148,9 +148,9 @@ async def test_the_executor_asks_another_model_and_records_the_check(tmp_path, m
     watch = executor._progress_watch(run, run.plan.nodes[0], "x:api")
     reason = await watch("- turn 9: run_command node --check app.js  (failed)")
     assert reason == "反复运行同一条失败的命令"
-    # Not the model at work, and it saw the step and the evidence.
+    # This fixture's CLI is weaker. A fresh call to the producer sees the step and evidence.
     [(checker, prompt)] = asked
-    assert checker == "cli:claude" and "run node --check" in prompt and "turn 9" in prompt
+    assert checker == "x:api" and "run node --check" in prompt and "turn 9" in prompt
     assert efforts == ["low"]  # a quick yes or no, not the step's effort
     event = [e for e in database.events("r") if e.kind == "node.progress_check"][-1]
     assert event.data["stop"] is True and event.data["reason"] == reason

@@ -84,6 +84,66 @@ async def test_before_it_runs_a_task_is_planned_as_major_parts_by_function():
     assert "各大项同时细化" in planned.planning_note
 
 
+async def test_lead_sets_refinement_effort_per_part_with_reason():
+    planned, _ = await outlined(
+        part("docs", "说明", difficulty="easy", refinement_effort="low", refinement_reason="现有接口明确，只需组织说明"),
+        part("core", "核心", difficulty="hard", refinement_effort="high", refinement_reason="跨模块协议和并发边界"),
+        part("proof", "证明", difficulty="hard", refinement_effort="max", refinement_reason="需要推导新的不变量"),
+    )
+    assert [(p.difficulty, p.refinement_effort) for p in planned.parts] == [("easy", "low"), ("hard", "high"), ("hard", "max")]
+    restored = TaskPlan.model_validate_json(planned.model_dump_json())
+    assert restored.parts[1].refinement_reason == "跨模块协议和并发边界"
+
+
+async def test_missing_or_invalid_effort_uses_difficulty_without_defaulting_to_max():
+    planned, _ = await outlined(part("a", "简单", difficulty="easy", refinement_effort="invalid"),
+                               part("b", "复杂", difficulty="hard", refinement_effort="max"),
+                               part("c", "旧格式"))
+    assert [p.refinement_effort for p in planned.parts] == ["low", "high", "medium"]
+
+
+async def test_refinement_uses_chosen_effort_without_changing_main_lead(database, monkeypatch):
+    from super_partner.config import settings
+    monkeypatch.setattr(settings, "adaptive_refinement", True)
+    outlined_run(database)
+    run = database.get_run("o")
+    run.plan.parts[0].difficulty = "easy"
+    run.plan.parts[0].refinement_effort = "low"
+    run.plan.parts[0].refinement_reason = "明确接口，常规拆分"
+    run.plan.parts[1].difficulty = "hard"
+    run.plan.parts[1].refinement_effort = "high"
+    run.plan.parts[1].refinement_reason = "交互依赖复杂"
+    database.save_run(run)
+    observed = []
+
+    class Efforts(Splitters):
+        async def converse(self, session, prompt, **kwargs):
+            observed.append(session.reasoning_effort)
+            return await super().converse(session, prompt, **kwargs)
+
+    team = Efforts({"后端": split(task("routes", "接口")), "前端": split(task("page", "页面"))})
+    executor = Executor(database, team, RUN_MODELS)
+    await executor._split_part("o", "api")
+    await executor._split_part("o", "ui")
+    assert observed == ["low", "high"]
+    assert database.get_run("o").supervisor.reasoning_effort is None
+    events = [e for e in database.events("o") if e.kind == "part.refining"]
+    assert [e.data["effort"] for e in events] == ["low", "high"]
+
+
+async def test_disabled_adaptive_policy_keeps_legacy_effort_and_reports_it(database, monkeypatch):
+    from super_partner.config import settings
+    monkeypatch.setattr(settings, "adaptive_refinement", False)
+    monkeypatch.setattr(settings, "lead_reasoning_effort", "max")
+    outlined_run(database)
+    run = database.get_run("o")
+    run.plan.parts[0].refinement_effort = "low"
+    database.save_run(run)
+    team = Splitters({"后端": split(task("routes", "接口"))})
+    await Executor(database, team, RUN_MODELS)._split_part("o", "api")
+    assert database.get_run("o").plan.parts[0].refinement_effort == "max"
+
+
 async def test_a_major_part_is_split_level_by_level_and_waits_become_task_waits():
     planned, _ = await outlined(BACKEND, FRONTEND)
     # The front end is split first. Its page builds against what the back end provides and can start

@@ -390,6 +390,7 @@ class Engineering:
                 self._engineer_save(job)
 
         budget = RequestBudget(self.model_lookup, lambda: job.budget_usd - job.cost_usd, {}, charge, asyncio.Event())
+        budget.context = {"run_id": job.run_id, "purpose": "platform_engineer"}
         try:
             result = await call(budget)
             await charge(max(0.0, self._actual_cost(result, None, model_id) - budget.spent))

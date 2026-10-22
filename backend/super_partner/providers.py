@@ -7,7 +7,7 @@ import os
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -15,10 +15,14 @@ import httpx
 
 from . import agent as agent_tools
 from . import attachments as files
+from . import calls as call_records
+from . import conversation as memory
 from . import progress, streaming
 from .budget import BudgetExceeded, ProviderError, StepLimitExceeded
+from .call_control import ProviderGate, input_bound, retry_after
 from .cli_channels import CLI_SPECS, CliChannelRegistry, SessionLost
 from .config import settings
+from .conversation import Conversation
 from .db import Database
 from .models import Attachment, SupervisorSession
 from .quality import REVIEW_MARKER
@@ -39,6 +43,9 @@ class ProviderResult:
     # is the progress summary it was asked for at the end rather than a finished answer.
     turns: int = 0
     turn_limit: bool = False
+    usage_known: bool = True
+    cache_write_tokens: int = 0
+    warnings: list[str] = field(default_factory=list)
 
 
 def cached_tokens(usage: dict) -> int:
@@ -62,36 +69,14 @@ def _answer(content):
     return THINKING.sub("", content).strip()
 
 
-@dataclass
-class Conversation:
-    """An acting API model's conversation for one step, kept so that the step's next attempt
-    with the same model continues it, with ``followup`` as the next message, instead of
-    starting over and reading the project again. Only OpenAI-compatible providers continue
-    one; with others, or another model, the attempt starts afresh."""
-    model_id: str | None = None
-    # Set by the caller before an attempt that should continue the conversation.
-    followup: str | None = None
-    # The tool loop's state (see _loop): its history, and the last turn's calls, their
-    # results or the final answer, whichever had not reached the history when it ended.
-    state: dict | None = None
-
-    def size(self) -> int:
-        """Characters of the conversation so far, to tell whether continuing it still fits."""
-        return len(json.dumps((self.state or {}).get("history") or [], ensure_ascii=False))
-
-
-# What a tool call that never ran returns when its conversation is continued.
-NOT_RUN = "Not run: the attempt was interrupted before this call ran."
+# A crash between a tool's side effects and checkpoint has an uncertain outcome.
+NOT_RUN = memory.UNKNOWN
 
 
 def _reopen(state: dict, followup: str) -> None:
     """Make an OpenAI-format conversation that ended (finished, interrupted, or cut off before
     its tool calls ran) ready to take ``followup`` as the next user message."""
-    if not state.get("results") and state.get("calls") and (state["history"] or [{}])[-1].get("tool_calls"):
-        state["results"] = [(call_id, name, NOT_RUN) for call_id, name, _args in state["calls"]]
-    if final := state.pop("final", None):
-        state["history"].append({"role": "assistant", "content": final})
-    state["calls"], state["followup"] = None, followup
+    memory.reopen(state, followup)
 
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504, 529}
@@ -193,6 +178,7 @@ def _turn_note(left: int) -> str:
 
 class ProviderRegistry:
     def __init__(self, db: Optional[Database] = None, models: Optional[dict] = None) -> None:
+        self.db = db
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(settings.api_request_timeout, connect=30))
         self.cli = CliChannelRegistry()
         self.quota = QuotaTracker(db)
@@ -203,6 +189,7 @@ class ProviderRegistry:
         self.no_effort: set[str] = set()
         self.retry_base_delay = 1.0
         self.retry_max_delay = 30.0
+        self.gates: dict[str, ProviderGate] = {}
 
     def configured_models(self, model_ids: list[str]) -> set[str]:
         """Models that can take work now: set up, and not out of quota."""
@@ -214,6 +201,7 @@ class ProviderRegistry:
                 configured.add(model_id)
         return {model_id for model_id in configured if not self.quota.exhausted(model_id)}
 
+    @call_records.observed
     async def complete(self, model_id: str, prompt: str, *args, **kwargs) -> ProviderResult:
         """A limit or exhausted upstream retry raises ModelUnavailable and excludes this
         model until its cooldown ends, so callers can switch to another."""
@@ -231,19 +219,24 @@ class ProviderRegistry:
                 raise unavailable from exc
             raise
 
+    @call_records.observed
     async def converse(self, session: SupervisorSession, prompt: str, timeout: float = 600,
                        spend_ok=None) -> ProviderResult:
         """One message in a conversation that lasts (the task's lead, supervisor.py): a membership
         CLI continues its own conversation; an API model is sent the whole history again, which
         its prompt cache makes cheap. ``session`` is updated in place."""
         model_id = session.model_id
+        effort = session.reasoning_effort or settings.lead_reasoning_effort
+        if record := call_records.row():
+            record["requested_effort"] = effort
         if self.quota.exhausted(model_id):
             raise self.quota.error(model_id)
         if model_id.startswith("cli:"):
             Path(session.cwd).mkdir(parents=True, exist_ok=True)
             try:
                 text, session.session_id = await self.cli.converse(
-                    model_id, prompt, Path(session.cwd), session.session_id, timeout)
+                    model_id, prompt, Path(session.cwd), session.session_id, timeout,
+                    **({"effort": session.reasoning_effort} if session.reasoning_effort else {}))
             except SessionLost:
                 raise
             except RuntimeError as exc:
@@ -251,10 +244,10 @@ class ProviderRegistry:
                 if kind:
                     raise self.quota.mark(model_id, str(exc), kind) from exc
                 raise ProviderError(str(exc)) from exc
-            result = ProviderResult(text=text, input_tokens=0, output_tokens=0, used_model_id=model_id)
+            result = _cli_result(text, model_id)
         else:
             result = await self.complete(model_id, _transcript(session.history, prompt), spend_ok=spend_ok,
-                                         effort=settings.lead_reasoning_effort)
+                                         effort=effort)
             session.history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": result.text}]
         session.calls += 1
         return result
@@ -282,6 +275,8 @@ class ProviderRegistry:
         provider, model = model_id.split(":", 1)
         attachments = list(attachments)
         if provider == "cli":
+            if conversation and conversation.handoff:
+                prompt += conversation.handoff
             try:
                 text = await self.cli.complete(
                     model_id, prompt + files.describe(attachments, with_paths=True),
@@ -289,9 +284,7 @@ class ProviderRegistry:
                     attachments=attachments, repair=repair, **({"network": True} if network else {}),
                     **({"watch": watch} if watch else {}), **({"effort": effort} if effort else {}),
                 )
-                return ProviderResult(
-                    text=text, input_tokens=0, output_tokens=0, used_model_id=model_id,
-                )
+                return _cli_result(text, model_id)
             except progress.Stopped as exc:
                 # Stuck, not unavailable: the attempt fails rather than falling back to an API model.
                 raise ProviderError(str(exc)) from exc
@@ -337,9 +330,9 @@ class ProviderRegistry:
             agent.watch, agent.overrun = watch, overrun
         try:
             if provider == "anthropic":
-                return await self._anthropic(model, prompt, images, agent, spend_ok, effort)
+                return await self._anthropic(model, prompt, images, agent, spend_ok, effort, conversation)
             if provider == "google":
-                return await self._gemini(model, prompt, images, agent, spend_ok, effort)
+                return await self._gemini(model, prompt, images, agent, spend_ok, effort, conversation)
             return await self._openai_compatible(provider, model, prompt, images, agent, spend_ok,
                                                  conversation if agent else None, effort)
         finally:
@@ -387,11 +380,33 @@ class ProviderRegistry:
         when nothing at all arrives for ``api_reply_deadline``: a model may think for long, as
         long as it keeps sending."""
         deadline = settings.api_reply_deadline
+        gate = self.gates.setdefault(provider, ProviderGate())
+        limits = settings.provider_limits.get(provider, {})
         for attempt in range(1, self.max_attempts + 1):
             delay = self.retry_base_delay * 2 ** (attempt - 1)
+            body = kwargs.get("json") or {}
+            ceiling = body.get("max_tokens", body.get("max_completion_tokens",
+                       (body.get("generationConfig") or {}).get("maxOutputTokens", 0)))
+            requested = input_bound(body) + ceiling
+            record = call_records.row()
             try:
-                response = await (self._stream(url, stream, deadline, **kwargs) if stream
-                                  else asyncio.wait_for(self.client.post(url, **kwargs), deadline))
+                async with gate.hold(limits, requested) as (queued, reservation):
+                    if record is not None:
+                        record["requests"] += 1
+                        record["retries"] += int(attempt > 1)
+                        record["queue_seconds"] += queued
+                        call_records.save()
+                    started = time.monotonic()
+                    response = await (self._stream(url, stream, deadline, **kwargs) if stream
+                                      else asyncio.wait_for(self.client.post(url, **kwargs), deadline))
+                    if record is not None:
+                        record["exchanges"].append({"status": response.status_code,
+                            "duration_seconds": round(time.monotonic() - started, 3), "queue_seconds": round(queued, 3)})
+                    if response.is_success:
+                        measured = _response_usage(provider, response.json())
+                        if measured[4]:
+                            reservation[1] = measured[0] + measured[1]
+                        call_records.usage(self.models.get(record["model_id"]) if record else None, *measured)
             except asyncio.TimeoutError as exc:
                 # Sending it again would most likely hang again: fail now so another model takes over
                 # (quota.UNAVAILABLE matches "request failed"). A stream that stopped is StreamSilent.
@@ -401,16 +416,18 @@ class ProviderRegistry:
             except streaming.StreamError as exc:
                 raise ProviderError(f"{provider} returned an error in its stream: {exc}") from exc
             except httpx.TransportError as exc:
+                if record is not None:
+                    record["usage_known"] = False
+                call_records.warning("请求传输失败；重试前的请求可能已被计费，其用量尚未确认。")
                 if attempt == self.max_attempts:
                     raise ProviderError(f"{provider} request failed: {exc}") from exc
             else:
                 if response.status_code not in RETRYABLE_STATUS or attempt == self.max_attempts:
                     return response
-                try:
-                    delay = float(response.headers.get("retry-after", delay))
-                except ValueError:
-                    pass
-            await asyncio.sleep(min(delay, self.retry_max_delay))
+                delay = retry_after(response.headers.get("retry-after"), min(delay, self.retry_max_delay))
+                if response.status_code == 429:
+                    gate.cool_down(delay)
+            await asyncio.sleep(delay)
         raise AssertionError("unreachable")
 
     async def _stream(self, url: str, assemble: streaming.Assemble, deadline: float, **kwargs) -> httpx.Response:
@@ -446,18 +463,26 @@ class ProviderRegistry:
         """
         model_id = f"{provider}:{model}"
         tools = agent_tools.tools_for(agent_tools.sandbox_available(), read_only=agent.read_only) if agent else []
+        if agent:
+            from .extensions import definitions
+            tools = [*tools, *definitions(agent)]
+        if conversation and conversation.recall and agent:
+            tools = [*tools, memory.RECALL_TOOL]
+        if conversation and conversation.handoff:
+            prompt += conversation.handoff
         # How to work with the tools is a system prompt, as Claude Code gives it; the task is the user's.
         system = agent.instructions() if agent else None
         state = fresh = {"prompt": prompt, "system": system, "images": images, "tools": tools, "history": None,
-                         "results": None}
+                         "results": None, "provider": provider}
         resumed = bool(conversation and conversation.model_id == model_id and conversation.followup
                        and conversation.state and conversation.state.get("history"))
         if resumed:
             state = conversation.state
-            state["tools"] = tools
+            state.update(tools=tools, system=system, images=images, provider=provider)
             _reopen(state, conversation.followup)
         if conversation:
             conversation.model_id, conversation.state, conversation.followup = model_id, state, None
+            conversation.save()
         total_in = total_out = total_cached = turn = 0
         text = ""
         # Without a limit (the default) a long attempt is checked instead (progress.py).
@@ -502,7 +527,15 @@ class ProviderRegistry:
                                           cached_input_tokens=total_cached)
                 if spend_ok and not spend_ok(model_id, total_in, total_out):
                     raise BudgetExceeded("已达到任务可用的预算，模型调用被中止。")
-                compact(state.get("history"))
+                memory.flush(state)
+                if conversation:
+                    conversation.save()
+                compacted = await self._compact_context(model_id, state, step, spend_ok, conversation) if agent else None
+                if compacted:
+                    used_in, used_out, used_cached = compacted
+                    total_in += used_in
+                    total_out += used_out
+                    total_cached += used_cached
                 if begin := getattr(spend_ok, "begin_turn", None):
                     await begin()
                 try:
@@ -511,12 +544,16 @@ class ProviderRegistry:
                     if not (resumed and turn == 1 and " returned 400" in str(exc)):
                         raise
                     # The provider would not take the continued conversation: start afresh.
+                    # Preserve an explicit handoff and archive when native continuation is rejected.
+                    fresh["prompt"] += memory.handoff(conversation)
                     state = conversation.state = fresh
                     resumed = False
                     if begin:
                         await begin()
                     text, calls, used_in, used_out, truncated = await stepped(state)
                 state["calls"] = calls
+                state["last_input_tokens"] = used_in
+                state["last_history_size"] = len(json.dumps(state.get("history"), ensure_ascii=False).encode())
                 used_cached = state.pop("cached", 0) or 0
                 total_in, total_out, total_cached = total_in + used_in, total_out + used_out, total_cached + used_cached
                 if record := getattr(spend_ok, "record", None):
@@ -532,25 +569,45 @@ class ProviderRegistry:
                     )
                 if not calls or not agent:
                     state["final"] = text
+                    if conversation:
+                        conversation.save()
                     return ProviderResult(text or "", total_in, total_out, model_id, turns=_turns(turn, limit),
                                           turn_limit=final, cached_input_tokens=total_cached)
                 if final:
                     raise ProviderError(f"{model_id} {TURN_LIMIT_MARK.format(limit=limit)}，最后也没有交出进度总结。")
                 results = []
+                state["results"] = results
+                if conversation:
+                    conversation.save()  # durable intent before any tool side effects
                 # A turn's calls together: its reads and searches run at the same time.
-                outcomes = await agent.run_all([(name, args) for _call_id, name, args in calls])
-                for (call_id, name, args), (output, ok) in zip(calls, outcomes):
+                async def execute_tool(call, results=results, turn=turn):
+                    call_id, name, args = call
+                    output, ok = (memory.recall(conversation, args) if name == "RecallHistory" and conversation
+                                  else await agent.run(name, args))
                     results.append((call_id, name, output))
+                    if conversation:
+                        conversation.save()  # each completion survives a later interrupted sibling
                     seen.append({"turn": turn, "tool": name, "detail": agent_tools.describe_call(name, args),
                                  "ok": ok, "output": output[:LOGGED_OUTPUT]})
                     if agent.log is not None and len(agent.log) < MAX_LOGGED_CALLS:
                         agent.log.append(seen[-1])
                     if getattr(agent, "trace", None):
                         _trace(agent.trace, {**seen[-1], "output": output[:TRACE_OUTPUT]})
+                if (not settings.api_tool_hooks and
+                        all(name in agent_tools.READ_ONLY_TOOLS or name == "RecallHistory" for _id, name, _args in calls)):
+                    await asyncio.gather(*(execute_tool(call) for call in calls))
+                else:
+                    for call in calls:
+                        await execute_tool(call)
+                # Provider order is stable even if read-only tools finished out of order.
+                by_id = {item[0]: item for item in results}
+                results = [by_id[call_id] for call_id, _name, _args in calls]
                 if limit is not None and (note := _turn_note(limit - turn)):
                     call_id, name, output = results[-1]
                     results[-1] = (call_id, name, f"{output}\n\n{note}")
                 state["results"] = results
+                if conversation:
+                    conversation.save()
                 if hard_limit is not None and (
                     hard_limit() <= 0 or (spend_ok.step_remaining is not None and spend_ok.step_remaining() <= 0)
                 ):
@@ -568,9 +625,68 @@ class ProviderRegistry:
                     next_check = time.monotonic() + interval
             raise AssertionError("unreachable")
         except (Exception, asyncio.CancelledError) as exc:
+            if conversation:
+                conversation.save()
             exc.usage = ProviderResult("", total_in, total_out, model_id, turns=_turns(turn, limit),
                                        cached_input_tokens=total_cached)
             raise
+
+    async def _compact_context(self, model_id, state, step, spend_ok, conversation):
+        """Summarize before context exhaustion; replace only after schema validation and archive.
+        The summary uses the same model, budget reservation, effort and hard turn counter."""
+        history = state.get("history") or []
+        if not history:
+            return None
+        size = len(json.dumps(history, ensure_ascii=False).encode())
+        estimate = max(size // 3, state.get("last_input_tokens", 0) +
+                       max(0, size - state.get("last_history_size", 0)) // 3)
+        context = getattr(self.models.get(model_id), "context_window", None) or 64000
+        if estimate < context * 0.65:
+            return None
+        if not conversation or not conversation.archive:
+            raise ProviderError("上下文接近上限且无法归档，保留记录并停止，禁止静默截断。")
+        remaining = getattr(spend_ok, "turn_remaining", None)
+        if remaining and remaining() < 2:
+            raise StepLimitExceeded("剩余轮次不足以压缩上下文并继续，已保存会话。")
+        archive_id = conversation.remember()
+        if not archive_id:
+            raise ProviderError("无法保存上下文原文，停止压缩。")
+        summary_state = {"prompt": memory.SUMMARY_PROMPT + json.dumps(history, ensure_ascii=False),
+                         "system": "Return a concise, factual JSON memory. Do not use tools.", "images": [],
+                         "tools": [], "history": None, "results": None}
+        if begin := getattr(spend_ok, "begin_turn", None):
+            await begin()
+        text, calls, used_in, used_out, truncated = await step(summary_state)
+        cached = summary_state.pop("cached", 0) or 0
+        if record := getattr(spend_ok, "record", None):
+            await record(model_id, used_in, used_out, cached)
+        try:
+            if calls or truncated:
+                raise ValueError("unfinished summary")
+            summary = memory.parse_summary(text or "")
+        except (ValueError, TypeError) as exc:
+            raise ProviderError("上下文摘要未通过结构验证；原会话已保留，停止本次尝试。") from exc
+        # Keep ALL user instructions verbatim (tool results are not user instructions), plus
+        # structured observations. If immutable instructions alone do not fit, stop explicitly.
+        original = []
+        for message in history:
+            if message.get("role") == "system":
+                original.append(message)
+            elif message.get("role") == "user":
+                blocks = message.get("content", message.get("parts", ""))
+                if (message != state.get("memory_message") and (isinstance(blocks, str) or (isinstance(blocks, list) and
+                        not any("tool_result" == b.get("type") or "functionResponse" in b for b in blocks)))):
+                    original.append(message)
+        notice = memory.user_message(state["provider"], "Task memory (observations, verify before accepting):\n" +
+                                     json.dumps(summary, ensure_ascii=False) +
+                                     f"\nFull history: RecallHistory archive_id={archive_id}.")
+        # No private marker is sent to providers; archive references distinguish generated memory.
+        reduced = [*original, notice]
+        if len(json.dumps(reduced, ensure_ascii=False).encode()) // 3 > context * 0.5:
+            raise ProviderError("必须保留的任务约束超过上下文容量，已归档；需要拆分步骤。")
+        state.update(history=reduced, summary=summary, memory_message=notice, last_input_tokens=0, last_history_size=0)
+        conversation.save()
+        return used_in, used_out, cached
 
     def _reasoning(self, provider: str, model: str, effort: Optional[str] = None) -> dict:
         """How hard the model should think, in the request fields its API takes: ``effort``
@@ -579,9 +695,23 @@ class ProviderRegistry:
         model_id = f"{provider}:{model}"
         known = self.models.get(model_id)
         effort = effort or (settings.deepseek_reasoning_effort if provider == "deepseek" else None)
+        record = call_records.row()
+        if record is not None:
+            record["requested_effort"] = effort
         if not effort or getattr(known, "supports_reasoning", None) is False or model_id in self.no_effort:
+            if effort:
+                call_records.warning(f"{model_id} 未应用请求的推理强度 {effort}；使用供应商默认值。")
+                if settings.reasoning_fallback == "strict":
+                    raise ProviderError("无法保证请求的推理强度；strict 模式禁止降级。")
+            if record is not None:
+                record["effective_effort"] = "provider_default"
             return {}
-        return reasoning_fields(provider, effort)
+        fields = reasoning_fields(provider, effort)
+        if record is not None:
+            record["effective_effort"] = (fields.get("reasoning_effort") or
+                (fields.get("output_config") or {}).get("effort") or
+                ((fields.get("generationConfig") or {}).get("thinkingConfig") or {}).get("thinkingLevel"))
+        return fields
 
     def output_ceiling(self, model_id: str) -> int:
         model = self.models.get(model_id)
@@ -601,6 +731,11 @@ class ProviderRegistry:
         The budget reservation can only lower it.
         """
         maximum = state.get("maximum") or self.output_ceiling(model_id)
+        tpm = settings.provider_limits.get(provider, {}).get("tpm", 0)
+        if tpm:
+            maximum = min(maximum, tpm - input_bound(body) - 128)
+            if maximum < 1:
+                raise ProviderError("请求上下文已超过供应商 TPM 配额，不能排队后重试。")
         while True:
             state["limit"] = await self._limit_request(spend_ok, model_id, body, maximum)
             put(body, state["limit"])
@@ -610,10 +745,16 @@ class ProviderRegistry:
                 and OUTPUT_LIMIT_REJECTED.search(response.text)
             ):
                 maximum = state["maximum"] = max(PLAIN_OUTPUT_TOKENS, state["limit"] // 2)
+                if record := call_records.row():
+                    record["retries"] += 1
                 continue
             if response.status_code == 400 and EFFORT_REJECTED.search(response.text) and _drop_reasoning(body):
-                # A model that does not take the effort (or this value of it) answers without one,
-                # and is sent none from then on if that works.
+                if settings.reasoning_fallback == "strict":
+                    raise ProviderError(f"{model_id} 拒绝请求的推理参数；strict 模式禁止自动降级。")
+                call_records.warning(f"{model_id} 拒绝推理参数，已明确降级为供应商默认值。")
+                if record := call_records.row():
+                    record["effective_effort"] = "provider_default"
+                    record["retries"] += 1
                 retried = await self._post(provider, url, json=body, **kwargs)
                 if not retried.is_error:
                     self.no_effort.add(model_id)
@@ -681,7 +822,7 @@ class ProviderRegistry:
         return await self._loop(provider, model, prompt, images, agent, spend_ok, step, conversation)
 
     async def _anthropic(self, model: str, prompt: str, images: list[Attachment] = (), agent=None, spend_ok=None,
-                         effort: Optional[str] = None) -> ProviderResult:
+                         effort: Optional[str] = None, conversation: Optional[Conversation] = None) -> ProviderResult:
         async def step(state):
             if state["history"] is None:
                 state["history"] = [{"role": "user", "content": [
@@ -690,7 +831,7 @@ class ProviderRegistry:
                     }} for item in state["images"]),
                     {"type": "text", "text": state["prompt"]},
                 ] if state["images"] else state["prompt"]}]
-            if state["results"]:
+            if state.get("results"):
                 state["history"].append({"role": "user", "content": [
                     {"type": "tool_result", "tool_use_id": call_id, "content": output}
                     for call_id, _name, output in state["results"]
@@ -729,17 +870,17 @@ class ProviderRegistry:
                 data.get("stop_reason") == "max_tokens",
             )
 
-        return await self._loop("anthropic", model, prompt, images, agent, spend_ok, step)
+        return await self._loop("anthropic", model, prompt, images, agent, spend_ok, step, conversation)
 
     async def _gemini(self, model: str, prompt: str, images: list[Attachment] = (), agent=None, spend_ok=None,
-                      effort: Optional[str] = None) -> ProviderResult:
+                      effort: Optional[str] = None, conversation: Optional[Conversation] = None) -> ProviderResult:
         async def step(state):
             if state["history"] is None:
                 state["history"] = [{"role": "user", "parts": [
                     *({"inline_data": {"mime_type": item.media_type, "data": files.image_data(item)}} for item in state["images"]),
                     {"text": state["prompt"]},
                 ]}]
-            if state["results"]:
+            if state.get("results"):
                 state["history"].append({"role": "user", "parts": [
                     {"functionResponse": {"name": name, "response": {"result": output}}}
                     for _call_id, name, output in state["results"]
@@ -768,12 +909,32 @@ class ProviderRegistry:
                 state["history"].append({"role": "model", "parts": parts})
             text = "".join(part.get("text", "") for part in parts)
             return (
-                text, [(call["name"], call["name"], call.get("args") or {}) for call in calls],
-                usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0),
+                text, [(f"{call['name']}:{i}", call["name"], call.get("args") or {}) for i, call in enumerate(calls)],
+                usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0),
                 candidate.get("finishReason") == "MAX_TOKENS",
             )
 
-        return await self._loop("google", model, prompt, images, agent, spend_ok, step)
+        return await self._loop("google", model, prompt, images, agent, spend_ok, step, conversation)
+
+
+def _response_usage(provider, data):
+    usage = data.get("usageMetadata" if provider == "google" else "usage") or {}
+    if provider == "anthropic":
+        cached, written = usage.get("cache_read_input_tokens", 0), usage.get("cache_creation_input_tokens", 0)
+        return (usage.get("input_tokens", 0) + cached + written, usage.get("output_tokens", 0), cached, written,
+                "input_tokens" in usage and "output_tokens" in usage)
+    if provider == "google":
+        return (usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0),
+                usage.get("cachedContentTokenCount", 0), 0, "promptTokenCount" in usage and "candidatesTokenCount" in usage)
+    return (usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), cached_tokens(usage), 0,
+            "prompt_tokens" in usage and "completion_tokens" in usage)
+
+
+def _cli_result(text, model_id):
+    usage = getattr(text, "usage", {})
+    return ProviderResult(str(text), usage.get("input_tokens", 0), usage.get("output_tokens", 0), model_id,
+                          cached_input_tokens=usage.get("cached_input_tokens", 0),
+                          cache_write_tokens=usage.get("cache_write_tokens", 0), usage_known=bool(usage))
 
 
 # A 400 about the reasoning effort fields, as providers word it ("Unsupported parameter:

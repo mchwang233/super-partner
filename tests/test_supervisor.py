@@ -175,6 +175,49 @@ async def test_an_api_lead_is_sent_its_conversation_and_kept_within_bounds(tmp_p
     assert sum(len(item["content"]) for item in session.history) <= supervisor.MAX_HISTORY_CHARS + 200
 
 
+async def test_api_refinement_effort_is_sent_and_default_lead_remains_unchanged(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    sent = []
+
+    def respond(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                                         "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    registry = ProviderRegistry()
+    await registry.client.aclose()
+    registry.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        await registry.converse(SupervisorSession(model_id="deepseek:deepseek-flash", reasoning_effort="low"), "split")
+        await registry.converse(SupervisorSession(model_id="deepseek:deepseek-flash"), "lead")
+    finally:
+        await registry.client.aclose()
+    assert sent[0]["reasoning_effort"] == "low"
+    assert sent[1]["reasoning_effort"] == settings.lead_reasoning_effort
+
+
+@pytest.mark.parametrize("model_id", ["cli:codex", "cli:claude"])
+async def test_cli_refinement_effort_survives_new_and_resumed_session(tmp_path, monkeypatch, model_id):
+    log = tmp_path / "args.log"
+    name = model_id.split(":")[1]
+    answer = ('{"result": "ok", "session_id": "s-1"}' if name == "claude" else
+              '{"type":"thread.started","thread_id":"s-1"}\n'
+              '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}')
+    fake_cli(tmp_path, monkeypatch, name, f'#!/bin/sh\necho "$@" >> {log}\ncat > /dev/null\n'
+             f"cat <<'ANSWER'\n{answer}\nANSWER\n")
+    registry = ProviderRegistry()
+    session = SupervisorSession(model_id=model_id, cwd=str(tmp_path), reasoning_effort="low")
+    try:
+        await registry.converse(session, "split")
+        await registry.converse(session, "correct dependency")
+    finally:
+        await registry.client.aclose()
+    for args in log.read_text().splitlines():
+        assert ('model_reasoning_effort="low"' if name == "codex" else "--effort low") in args
+        assert 'model_reasoning_effort="max"' not in args
+    assert session.session_id == "s-1"
+
+
 def fake_cli(tmp_path, monkeypatch, name, script):
     path = tmp_path / "bin" / name
     path.parent.mkdir(exist_ok=True)

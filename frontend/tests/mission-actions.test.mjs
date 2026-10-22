@@ -98,6 +98,9 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
   state.poll = () => [...polls.values()][0]();
   window.fetch = async (url, options = {}) => {
     const path = new URL(url).pathname;
+    if (/^\/api\/tasks\/[^/]+\/calls$/.test(path)) {
+      return json(state.calls ?? { calls: [], limit: 1000, summary: { calls: 0 } });
+    }
     if (path === "/api/improvements/settings") {
       if (options.method === "PUT") state.learningSettings = JSON.parse(options.body);
       return json(state.learningSettings ?? { enabled: false, budget_usd: 0.5, auto_platform: true });
@@ -707,6 +710,17 @@ test("a task planned as major parts says they are split once it runs, and what e
   assert.match(cards[1].querySelector(".part-split.failed").textContent, /原因：回复不是计划/);
 });
 
+test("parts show the lead's chosen refinement effort and its reason", async t => {
+  const run = mission("adaptive", "running");
+  run.plan.parts = [{ id: "docs", title: "使用说明", status: "refining", size: 1,
+    difficulty: "easy", refinement_effort: "low", refinement_reason: "接口已明确，只需整理使用步骤" }];
+  const { document, click } = await setup(t, [run]);
+  const card = document.querySelector(".part-card");
+  assert.match(card.textContent, /细化推理：低/);
+  await click(card.querySelector(".part-card-head"));
+  assert.match(card.querySelector(".part-effort").textContent, /接口已明确，只需整理使用步骤/);
+});
+
 test("the budget accepts round amounts such as 2 and can be cleared while typing", async t => {
   const { window, document, act } = await setup(t);
   const input = document.querySelector(".composer .budget-field input");
@@ -856,6 +870,22 @@ test("retrospective settings persist and manual generation shows its progress", 
   await click(button("生成复盘与改进项"));
   assert.equal(state.learningStarts, 1);
   assert.equal(button("复盘进行中…").disabled, true);
+});
+
+test("model calls show unknown usage and explicit effort downgrade", async t => {
+  const { state, document, button, click } = await setup(t);
+  state.calls = { limit: 1000, summary: { calls: 1, requests: 2, retries: 1, unknown_usage: 1,
+    observed_cost_usd: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 },
+    calls: [{ id: "c", model_id: "api:test", node_id: "n", purpose: "work", status: "succeeded",
+      requested_effort: "max", effective_effort: "provider_default", warnings: ["推理参数被拒绝，使用默认值"],
+      input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_write_tokens: 0, usage_known: false,
+      cost_usd: 0, requests: 2, retries: 1, duration_seconds: 2, queue_seconds: 1 }] };
+  await click(button("模型调用"));
+  const panel = document.querySelector('[aria-label="模型调用记录"]');
+  assert.match(panel.textContent, /不能按零用量计算/);
+  assert.match(panel.textContent, /max → 供应商默认值/);
+  assert.match(panel.textContent, /推理参数被拒绝/);
+  assert.match(panel.textContent, /2 次 API 请求/);
 });
 
 test("retrospective shows evidence, effects and permits disabling future use", async t => {

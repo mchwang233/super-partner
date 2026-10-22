@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # Before the first step, write this machine's skill for each tool the task needs that has none
     # yet, by trying it in a step's sandbox (preflight.py, skills.py); at most this long each.
     preflight_skills: bool = True
+    # Opt in to reusing general/local skills, then public discovery (only for tasks allowing
+    # network), before bounded generation. Existing installations retain their old policy.
+    skill_reuse_first: bool = False
+    skill_generation_max_turns: int = Field(default=6, ge=1, le=30)
     # Optional post-task learning; the UI can persist overrides. Its budget is separate and shown.
     learning_enabled: bool = False
     learning_budget_usd: float = Field(default=0.5, ge=0, le=100)
@@ -54,6 +58,29 @@ class Settings(BaseSettings):
     # Turns of tool calls per attempt of an API model; 0 means no limit. Long attempts are not cut
     # off but checked (progress_check_minutes).
     api_agent_max_turns: int = Field(default=0, ge=0, le=1000)
+    # Per provider: concurrency, rpm, tpm. Zero/absent means unconfigured; never guess API quotas.
+    provider_limits: dict[str, dict[str, int]] = Field(default_factory=dict)
+    # Compatibility mode records an explicit warning; strict mode rejects effort downgrades.
+    reasoning_fallback: Literal["report", "strict"] = "report"
+    # Configured tools receive one JSON argv argument inside the ordinary task sandbox.
+    api_tool_extensions: dict[str, dict] = Field(default_factory=dict)
+    # before_tool / after_tool argv commands receive one JSON event. Empty: no hooks.
+    api_tool_hooks: dict[str, list[list[str]]] = Field(default_factory=dict)
+
+    @field_validator("provider_limits")
+    @classmethod
+    def valid_provider_limits(cls, value):
+        for limits in value.values():
+            if set(limits) - {"concurrency", "rpm", "tpm"} or any(v < 0 for v in limits.values()):
+                raise ValueError("provider limits accept only nonnegative concurrency, rpm and tpm")
+        return value
+
+    @field_validator("api_tool_hooks")
+    @classmethod
+    def valid_hook_events(cls, value):
+        if set(value) - {"before_tool", "after_tool"}:
+            raise ValueError("tool hooks accept before_tool and after_tool only")
+        return value
     # Minutes of an attempt after which, and then every so often, another model checks whether it
     # is still making progress; only a stuck attempt is stopped. CLIs are checked the same way
     # instead of being killed at a fixed timeout.
@@ -82,6 +109,8 @@ class Settings(BaseSettings):
     reasoning_by_difficulty: dict[str, str] = Field(default_factory=lambda: {"easy": "low", "normal": "medium", "hard": "max"})
     # The task's lead plans and decides for the whole task: it thinks hardest. Diagnoses a step below.
     lead_reasoning_effort: str = "max"
+    # Let the lead's per-part difficulty/effort assessment control refinement conversations.
+    adaptive_refinement: bool = False
     diagnosis_reasoning_effort: str = "high"
     # Codex's service tier for the lead ("fast", "flex", ...); empty keeps the user's Codex config.
     codex_lead_service_tier: str = ""

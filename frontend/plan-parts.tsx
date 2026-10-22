@@ -5,7 +5,10 @@ import { ModelCapabilityDialog, NodeProgress, PlanGraph, nodeLine, planStages, u
 
 /** A part of a plan made top-down (backend outline.py): 大项 at the top, then smaller parts, then tasks. */
 export type PlanPart = { id: string; title: string; goal?: string; acceptance?: string; parent_id?: string | null; dependencies?: string[];
-  provides?: string; size?: number; status?: string; error?: string | null };
+  provides?: string; size?: number; status?: string; error?: string | null; difficulty?: string;
+  refinement_effort?: string; refinement_reason?: string };
+
+const EFFORT: Record<string, string> = { low: "低", medium: "中", high: "高", max: "最高" };
 
 /** A major part's split into tasks happens once the task runs: these are the states before it is done. */
 const SPLIT_STATE: Record<string, { state: string; label: string; note: string }> = {
@@ -126,11 +129,13 @@ function PartBoard({ apiBase, runId, runStatus, parts, nodes, models, onOpenProf
               <button type="button" className="part-card-head" aria-expanded={open} onClick={() => toggle(part.id)} title={part.acceptance ? `完成标准：${part.acceptance}` : undefined}>
                 <span className="part-card-line"><span className="num">{numberOf(part)}</span><b>{part.title}</b><span className={`state ${state.state}`}>{state.label}</span></span>
                 {part.goal && <span className="part-goal">{part.goal}</span>}
+                {part.refinement_effort && <small className="part-goal">细化推理：{EFFORT[part.refinement_effort] ?? part.refinement_effort}</small>}
                 <span className="part-progress"><span className="part-bar" aria-hidden="true"><i style={{ width: `${tasks.length ? finished / tasks.length * 100 : 0}%` }} /></span>
                   <small>{split ? `预计 ${part.size || "若干"} 个任务` : `${finished} / ${tasks.length} 个任务完成${running ? ` · ${running} 个进行中` : ""}`}</small></span>
                 <span className="part-meta"><small>{sub ? `${sub} 个子项 · ` : ""}花费 {formatUsd(cost)}</small><span className="part-expand">{open ? "收起 ▴" : "展开 ▾"}</span></span>
               </button>
               {open && <div className="part-detail">
+                {part.refinement_reason && <p className="part-effort">负责人选择依据：{part.refinement_reason}</p>}
                 {part.provides && <details className="part-provides"><summary>对外提供（接口约定）</summary><p>{part.provides}</p></details>}
                 {split && <p className={`part-split ${split.state}`}>{part.status === "failed" && part.error ? `${split.note}原因：${part.error}` : split.note}</p>}
               </div>}

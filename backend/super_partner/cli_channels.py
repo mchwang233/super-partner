@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from . import environment, progress
+from . import calls, environment, progress
 from .attachments import path
 from .config import settings
 
@@ -110,6 +110,41 @@ SESSION_MISSING = re.compile(r"no (conversation|session|rollout)|not found|does 
 
 class SessionLost(RuntimeError):
     """A conversation to continue no longer exists (the CLI cleaned it up, say)."""
+
+
+class UsageText(str):
+    """Keep the existing text API while carrying usage reported by the CLI."""
+    def __new__(cls, text, usage=None):
+        value = super().__new__(cls, text)
+        value.usage = usage or {}
+        return value
+
+
+def cli_usage(payload, codex=False):
+    data = payload.get("usage") or {}
+    if not isinstance(data, dict) or "input_tokens" not in data or "output_tokens" not in data:
+        return {}
+    cached = data.get("cached_input_tokens", 0) if codex else data.get("cache_read_input_tokens", 0)
+    written = data.get("cache_creation_input_tokens", 0)
+    return {"input_tokens": data["input_tokens"] + (0 if codex else cached + written),
+            "output_tokens": data["output_tokens"], "cached_input_tokens": cached, "cache_write_tokens": written}
+
+
+def codex_output(output):
+    text, usage = "", {}
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message":
+            text = event["item"].get("text") or text
+        if event.get("type") == "turn.completed":
+            for key, value in cli_usage(event, codex=True).items():
+                usage[key] = usage.get(key, 0) + value
+    return UsageText(text or output.strip(), usage)
 
 
 CLI_SPECS = {
@@ -337,7 +372,7 @@ class CliChannelRegistry:
         return stdout.decode(errors="replace")
 
     async def converse(self, model_id: str, prompt: str, cwd: Path, session_id: Optional[str] = None,
-                       timeout: float = 600) -> tuple[str, str]:
+                       timeout: float = 600, effort: Optional[str] = None) -> tuple[str, str]:
         """Say ``prompt`` in the conversation ``session_id`` (a new one without it), in ``cwd``;
         returns the reply and the conversation's id. Only SESSION_CLIS keep conversations."""
         spec = CLI_SPECS[model_id]
@@ -347,13 +382,21 @@ class CliChannelRegistry:
         if model_id == "cli:claude":
             sid = session_id or str(uuid4())
             args = [*SESSION_ARGS[model_id], "--resume" if session_id else "--session-id", sid]
+            if effort:
+                args += ["--effort", effort]
+                if record := calls.row():
+                    record["effective_effort"] = effort
         else:
             sid = session_id
             args = (["exec", "resume", session_id, "--json", "--skip-git-repo-check",
                      "-c", 'sandbox_mode="read-only"', "-"] if session_id else [*SESSION_ARGS[model_id], "-"])
-            # The lead plans and decides for the whole task: it thinks hardest, in its own tier.
-            options = codex_settings(settings.lead_reasoning_effort, settings.codex_lead_service_tier)
+            # Refinement can use the lead's per-part choice; ordinary lead calls keep their default.
+            options = codex_settings(effort or settings.lead_reasoning_effort, settings.codex_lead_service_tier)
             args = [args[0], *options, *args[1:]]
+            if record := calls.row():
+                chosen = effort or settings.lead_reasoning_effort
+                record["effective_effort"] = CODEX_EFFORTS.get(chosen, chosen)
+        calls.save()
         try:
             output = await self._run(spec, [executable, *args], cwd, prompt.encode(), timeout)
         except RuntimeError as exc:
@@ -362,7 +405,7 @@ class CliChannelRegistry:
             raise
         if model_id == "cli:claude":
             payload = json.loads(output)
-            return str(payload.get("result") or ""), str(payload.get("session_id") or sid)
+            return UsageText(str(payload.get("result") or ""), cli_usage(payload)), str(payload.get("session_id") or sid)
         text = ""
         for line in output.splitlines():
             try:
@@ -375,7 +418,7 @@ class CliChannelRegistry:
                 text = event["item"].get("text") or text
         if not sid:
             raise RuntimeError("codex did not report its conversation id")
-        return text, sid
+        return codex_output(output), sid
 
     async def complete(
         self, model_id: str, prompt: str, cwd: Path, timeout: int = 900, attachments=(), repair: bool = False,
@@ -394,6 +437,8 @@ class CliChannelRegistry:
         args = _with_attachments(spec.id, args, list(attachments))
         if spec.id == "cli:codex":
             args = [args[0], *codex_settings(effort), *args[1:]]
+            if "--json" not in args:
+                args.insert(1, "--json")
         if spec.id in {"cli:gemini", "cli:qwen"}:
             args[1] = prompt
             stdin = None
@@ -403,10 +448,13 @@ class CliChannelRegistry:
         with codex_rules(cwd) if spec.id == "cli:codex" and not repair else contextlib.nullcontext():
             stdout = await self._run(spec, command, cwd, stdin, timeout, watch)
         text = stdout.strip()
+        if spec.id == "cli:codex":
+            return codex_output(stdout)
         if spec.id in {"cli:claude", "cli:gemini", "cli:qwen"}:
             try:
                 payload = json.loads(text)
                 text = payload.get("result") or payload.get("response") or payload.get("text") or text
+                return UsageText(text, cli_usage(payload))
             except json.JSONDecodeError:
                 pass
         return text

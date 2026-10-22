@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import agent, contracts, progress, quality, supervisor
-from .budget import BudgetExceeded, StepLimitExceeded
+from .budget import BudgetExceeded, StepLimitExceeded, StepReservationBusy
 from .config import settings
 from .models import ArtifactEvidence, ExecutionRun, NodeStatus
 from .quota import ModelUnavailable
@@ -33,6 +33,22 @@ class Reviewing:
             if problem:
                 # A missing audit deliverable says nothing against its already accepted inputs.
                 return quality.Verdict(False, problem, verified=False, artifact_evidence=evidence)
+        elif node.check and workspace:
+            # A declared runnable check is evidence, not a suggestion the worker may claim it ran.
+            latest = self.db.get_run(run.id)
+            ws = agent.Workspace(workspace, network=bool(latest and latest.allow_network))
+            try:
+                output, ok = await ws.run("Bash", {"command": node.check})
+            finally:
+                ws.close()
+            entry = {"turn": 0, "tool": "Acceptance", "detail": node.check, "ok": ok, "output": output}
+            self.tool_logs.setdefault((run.id, node.id), []).append(entry)
+            if trace := self.tool_traces.get((run.id, node.id)):
+                from .providers import _trace
+                _trace(trace, entry)
+            if not ok:
+                return quality.Verdict(False, f"声明的验收命令失败：{node.check}\n{output}", verified=False)
+            text += f"\n\nPlatform acceptance evidence: {node.check}\n{output}"
         verdict = await self._review_result(run, node, text, changed, workspace, evidence)
         if evidence:
             evidence.accepted = verdict.passed
@@ -155,6 +171,7 @@ class Reviewing:
         whether it is stuck. A check that cannot be made lets the attempt go on."""
         started = time.monotonic()
         asked = [0]  # how many times the lead was asked about this attempt's time
+        missed = [0]
 
         async def watch(evidence: str) -> Optional[str]:
             minutes = (time.monotonic() - started) / 60
@@ -170,10 +187,17 @@ class Reviewing:
                     reply = await self._complete(run, node, checker.id, prompt, folder, cli_timeout=300,
                                                  allow_api_fallback=False, effort=PROGRESS_EFFORT)
                     reason = progress.parse(reply.text)
+                    missed[0] = 0
                 except (asyncio.CancelledError, BudgetExceeded, StepLimitExceeded):
                     raise
+                except StepReservationBusy:
+                    pass  # never deadlock a worker waiting for this progress check
                 except Exception:
-                    reason = None
+                    missed[0] += 1
+                    if missed[0] >= 2:
+                        reason = "连续两次无法完成进度检查，停止本次尝试并保留记录。"
+            else:
+                reason = "没有能力不低于执行者的可用进度检查模型，停止本次尝试。"
             self.emit(run.id, "node.progress_check", node_id=node.id, model_id=model_id,
                       checker_model_id=checker.id if checker else None, minutes=round(minutes),
                       stop=bool(reason), reason=reason)

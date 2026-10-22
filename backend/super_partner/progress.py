@@ -74,9 +74,11 @@ def check_prompt(node: TaskNode, minutes: float, evidence: str) -> str:
 
 
 def parse(text: str) -> Optional[str]:
-    """Why to stop, or None to continue (also when the answer has no verdict)."""
+    """Only an explicit, unambiguous CONTINUE permits another interval of paid work."""
     matches = VERDICT.findall(text or "")
-    if not matches or matches[-1][0].upper() != "STOP":
+    if len(matches) != 1:
+        return "进度检查未给出唯一有效结论，停止本次尝试并交由负责人判断。"
+    if matches[-1][0].upper() != "STOP":
         return None
     return matches[-1][1].strip() or "进度检查判断这次尝试已经卡住。"
 
@@ -86,6 +88,7 @@ def api_evidence(turns: int, calls: list[dict]) -> str:
     failed = sum(1 for call in calls if not call.get("ok", True))
     lines = [f"{turns} turns, {len(calls)} tool calls so far, {failed} of them failed. Latest calls:"]
     lines += [f"- turn {call['turn']}: {call['tool']} {call['detail']}{'' if call.get('ok', True) else '  (failed)'}"
+              + (f"\n  Evidence: {call['output'][-500:]}" if call.get("output") else "")
               for call in calls[-RECENT_CALLS:]]
     return "\n".join(lines)
 

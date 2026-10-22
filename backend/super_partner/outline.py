@@ -43,6 +43,7 @@ TASK_RULES = """A task is what one model does in one go. Every task must be:
 """
 
 CAPABILITY_CHOICES = "coding | planning | research | chinese | tool_use | structured_output"
+REFINEMENT_EFFORT = {"easy": "low", "normal": "medium", "hard": "high"}
 
 OUTLINE_PROMPT = (
     "You are planning a task for an autonomous multi-model executor, top-down. Now split the whole "
@@ -63,6 +64,13 @@ OUTLINE_PROMPT = (
     "file formats, commands. A part that waits for another uses only what that one provides.\n"
     "- \"size\" is how many tasks you expect the part to take, each about 10-15 tool turns for a "
     "capable model; \"capability\" is the main kind of work in it.\n"
+    "- As the task's lead, assess each part's difficulty in the context of the whole project. Set "
+    "\"difficulty\" (easy/normal/hard), \"refinement_effort\" (low/medium/high/max), and a short "
+    "\"refinement_reason\" in the user's language. Choose by novelty, uncertainty, interacting "
+    "constraints and verification complexity, not just task count. Routine well-specified splitting "
+    "usually needs low or medium; complex integration needs high. Reserve max for exceptional "
+    "reasoning and explain why high would be insufficient; do not use max for every part. This is "
+    "the effort for splitting the part, not its workers or the project's retrospective.\n"
     "- \"requires\" lists shell commands that show the tools, simulators, licenses and services the "
     "whole task needs work on this machine (such as \"gcc --version\" or \"make --version\"); they run in "
     "the steps' sandbox before the first task, so a missing tool is found before any work. Name only "
@@ -76,6 +84,8 @@ OUTLINE_PROMPT = (
     '"goal": "what this part delivers", "acceptance": "how to tell it is done", '
     '"provides": "the contract other parts may rely on", "size": 3, '
     '"capability": "' + CAPABILITY_CHOICES + '", '
+    '"difficulty": "easy | normal | hard", "refinement_effort": "low | medium | high | max", '
+    '"refinement_reason": "why this effort fits this part in this project", '
     '"dependencies": ["keys of earlier parts it needs finished first"]}]}\n'
     + contracts.RULES + '\nUser request:\n'
 )
@@ -315,6 +325,15 @@ async def plan_outline(say: Say, opening: str) -> TaskPlan:
         part.capability = str(item.get("capability") or "coding").split("|")[0].strip()
         if part.capability not in CAPABILITY_CHOICES.split(" | "):
             part.capability = "coding"
+        difficulty = str(item.get("difficulty") or "normal").strip().lower()
+        part.difficulty = difficulty if difficulty in REFINEMENT_EFFORT else "normal"
+        part.refinement_reason = str(item.get("refinement_reason") or "").strip()[:500]
+        requested = str(item.get("refinement_effort") or "").strip().lower()
+        part.refinement_effort = (requested if requested in {"low", "medium", "high", "max"}
+                                  and (requested != "max" or part.refinement_reason)
+                                  else REFINEMENT_EFFORT[part.difficulty])
+        if not part.refinement_reason:
+            part.refinement_reason = "按负责人标注的难度选择推理档；未标注时按常规难度处理。"
         try:
             part.size = max(1, min(int(item.get("size") or 3), MAX_TASKS))
         except (TypeError, ValueError):

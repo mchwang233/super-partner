@@ -6,6 +6,8 @@ from .budget import token_cost
 from .config import settings
 from .models import DIFFICULTY_THRESHOLDS, CostEstimate, ModelProfile, TaskNode
 from .progress import EXPECTED_TURNS, expected_turns
+from .routing_feedback import expected_cost
+from .routing_feedback import note as feedback_note
 
 # Context the project brief's writer needs for a batch of whole files (briefing.BATCH_CHARS).
 BRIEF_CONTEXT = 64_000
@@ -87,7 +89,7 @@ def prefer_api(candidates: list[ModelProfile]) -> tuple[list[ModelProfile], bool
 
 
 def route_node(
-    node: TaskNode, models: list[ModelProfile], configured: set[str], needs_vision: bool = False,
+    node: TaskNode, models: list[ModelProfile], configured: set[str], needs_vision: bool = False, *, feedback=None,
 ) -> TaskNode:
     available = eligible_for_node(node, models, configured, needs_vision)
     eligible = [
@@ -118,7 +120,7 @@ def route_node(
         pool = close_to_best(pool, node)
         key = lambda model: (
             model.execution_priority,
-            node_cost(node, model),
+            expected_cost(node, model, node_cost(node, model), feedback),
             -model.scores.score_for(node.capability),
             -model.scores.reliability,
         )
@@ -126,7 +128,7 @@ def route_node(
         # Easy and normal tasks take the cheapest model that clears the threshold.
         key = lambda model: (
             model.execution_priority,
-            node_cost(node, model),
+            expected_cost(node, model, node_cost(node, model), feedback),
             -model.scores.score_for(node.capability),
             -model.scores.reliability,
         )
@@ -150,6 +152,7 @@ def route_node(
     else:
         order = "优先会员 CLI，其次最便宜" if node.difficulty != "hard" else "选分最高的"
         node.routing_note = f"在达到门槛的模型中{order}。{fit}。"
+    node.routing_note += feedback_note(node, selected, feedback)
     return node
 
 
@@ -221,11 +224,8 @@ def stronger_than(
 def pick_reviewer(
     models: list[ModelProfile], configured: set[str], exclude: Optional[str], tokens: int,
 ) -> Optional[ModelProfile]:
-    """Who checks a result (or whether an attempt is stuck): preferably not the model that
-    produced it; then API models under the API-first policy (membership CLIs first otherwise);
-    then the cheapest model at least as capable in general as the one checked, since a weaker
-    one cannot be trusted to judge its work; failing that, the most capable. Reliability breaks
-    ties."""
+    """Ability is a gate. Prefer an independent eligible judge, otherwise use a fresh
+    conversation with the producer. An unavailable capable judge leaves work unverified."""
     available = [
         model for model in models
         if model.enabled and model.routing_ready and model.id in configured
@@ -235,14 +235,15 @@ def pick_reviewer(
         return None
     checked = next((model for model in models if model.id == exclude), None)
     floor = checked.scores.overall if checked else 0.0
+    available = [model for model in available if model.scores.overall >= floor]
+    if not available:
+        return None
 
     def key(model):
-        able = model.scores.overall >= floor
         return (
             model.id == exclude,
             (model.channel == "cli") if settings.subtasks_prefer_api else model.execution_priority,
-            not able,
-            (model.input_per_million + model.output_per_million) if able else -model.scores.overall,
+            model.input_per_million + model.output_per_million,
             -model.scores.reliability,
         )
     return min(available, key=key)

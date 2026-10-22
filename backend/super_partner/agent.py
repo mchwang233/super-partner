@@ -493,6 +493,16 @@ class Workspace:
         return (await self.run(name, args))[0]
 
     async def run(self, name: str, args: dict) -> tuple[str, bool]:
+        from . import extensions
+        payload = {"tool": name, "arguments": args}
+        if problem := await extensions.hook(self, "before_tool", payload):
+            return f"Error: {problem}; tool was not started", False
+        result = await self._run_tool(name, args)
+        if problem := await extensions.hook(self, "after_tool", {**payload, "ok": result[1], "output": result[0][-8000:]}):
+            return f"{result[0]}\nError: {problem}; tool already ran; inspect effects before repeating", False
+        return result
+
+    async def _run_tool(self, name: str, args: dict) -> tuple[str, bool]:
         """Run one tool: its output, and whether it went through. Failures come back as text so
         the model can correct itself."""
         try:
@@ -502,6 +512,9 @@ class Workspace:
                 raise ToolError("arguments must be a JSON object")
             if name == "Bash":
                 return await self.bash(args.get("command"), args.get("timeout"))
+            if name in settings.api_tool_extensions and not self.read_only and not self.host:
+                from .extensions import execute
+                return await execute(self, name, args)
             handlers = {"Read": self.read, "Write": self.write, "Edit": self.edit, "MultiEdit": self.multi_edit,
                         "Glob": self.glob, "Grep": self.grep, "LS": self.ls}
             if name not in handlers:
@@ -514,7 +527,7 @@ class Workspace:
 
     async def run_all(self, calls: list[tuple[str, dict]]) -> list[tuple[str, bool]]:
         """Run a turn's calls in order; reads and searches alone run at the same time."""
-        if calls and all(name in READ_ONLY_TOOLS for name, _ in calls):
+        if calls and not settings.api_tool_hooks and all(name in READ_ONLY_TOOLS for name, _ in calls):
             return list(await asyncio.gather(*(self.run(name, args) for name, args in calls)))
         return [await self.run(name, args) for name, args in calls]
 

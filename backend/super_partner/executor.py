@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +20,9 @@ from . import (
     retrospect,
     scopes,
     supervisor,
+)
+from . import (
+    conversation as memory,
 )
 from .budget import BudgetExceeded, RequestBudget, StepLimitExceeded, token_cost
 from .cli_channels import CLI_SPECS
@@ -51,11 +56,6 @@ TURN_LIMIT_HINT = "轮工具调用后仍未完成"
 
 # Diagnosis report kept with a step that cannot be done.
 MAX_UNABLE_REPORT = 1500
-# A step's conversation is continued while it is under this share of its model's context window
-# (counting roughly three characters a token); a longer one starts afresh with notes.
-CONTINUE_SHARE = 0.5
-CHARS_PER_TOKEN = 3
-DEFAULT_CONTEXT = 128_000
 
 
 def trace_path(run_id: str, node_id: str, attempt: int) -> Path:
@@ -359,6 +359,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 current = next(n for n in latest.plan.nodes if n.id == node_id)
                 if len(current.attempts) == len(node.attempts):
                     current.attempts.append(NodeAttempt(model_id=node.model_id, outcome=Outcome.SUPERSEDED if current.generation != generation else Outcome.CANCELLED,
+                                                        interrupted=latest.status != RunStatus.CANCELLED,
                                                         reason="上游返工或任务取消，调用已停止。", cost_usd=getattr(exc, "accounted_cost_usd", 0.0),
                                                         **self._take_log(run_id, node_id, getattr(exc, "usage", None))))
                 self._save(latest)
@@ -387,22 +388,50 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             self.node_tasks.pop((run_id, node_id), None)
 
     def _conversation(self, run: ExecutionRun, node) -> Conversation:
-        """The step's conversation with its model, set to continue when its last attempt can be
-        continued: same model, not stopped as stuck, nothing upstream redone since, and still
-        well within the model's context window. Otherwise a new one."""
+        """Restore within the same task generation/dependency revision; model switches receive
+        an archived handoff. Long contexts are compressed by the provider, never discarded."""
         key = (run.id, node.id)
         held, last = self.conversations.get(key), node.attempts[-1] if node.attempts else None
-        model = self.model_lookup.get(node.model_id)
+        if held is None and (saved := self.db.conversation(*key)):
+            held = Conversation(model_id=saved.get("model_id"), state=saved.get("state"), fence=saved.get("fence"))
+        fence = {"generation": node.generation, "project": run.project_dir,
+                 "request": hashlib.sha256(json.dumps([run.prompt, node.instructions, node.acceptance_criteria,
+                                                       node.files, node.reads, node.check], ensure_ascii=False).encode()).hexdigest(),
+                 "dependencies": {item.id: [item.generation, item.attempts[-1].finished_at.isoformat() if item.attempts else None]
+                                  for item in run.plan.nodes if item.id in node.dependencies}}
+
+        def checkpoint(body):
+            latest = self.db.get_run(run.id)
+            current = next((item for item in latest.plan.nodes if item.id == node.id), None) if latest else None
+            if current and current.generation == node.generation:
+                self.db.save_conversation(*key, body)
+
+        def bind(conversation):
+            conversation.fence = fence
+            conversation.checkpoint = checkpoint
+            conversation.archive = lambda body: self.db.archive_conversation(*key, body)
+            conversation.recall = lambda archive_id: self.db.conversation_archive(*key, archive_id)
+            return conversation
+
         upstream = [item.attempts[-1].finished_at for item in run.plan.nodes
                     if item.id in node.dependencies and item.attempts]
-        if (held and last and held.model_id == node.model_id
-                and last.outcome not in {Outcome.SUPERSEDED, Outcome.CANCELLED}
-                and progress.STOPPED not in (last.reason or "")
-                and not any(finished > last.finished_at for finished in upstream)
-                and held.size() < CONTINUE_SHARE * CHARS_PER_TOKEN * (getattr(model, "context_window", None) or DEFAULT_CONTEXT)):
-            held.followup = quality.continue_prompt(node, run)
+        valid = held and (held.fence is None or held.fence == fence)
+        if (valid and held.model_id == node.model_id
+                and (last is None or (last.outcome != Outcome.SUPERSEDED
+                     and (last.outcome != Outcome.CANCELLED or last.interrupted)
+                     and progress.STOPPED not in (last.reason or "")
+                     and not any(finished > last.finished_at for finished in upstream)))):
+            bind(held)
+            held.followup = quality.continue_prompt(node, run) if last else (
+                "The service restarted during this step. Continue from its saved state. "
+                "For any interrupted tool, inspect actual effects before repeating it.\n" + node.instructions)
+            self.conversations[key] = held
             return held
-        self.conversations[key] = Conversation()
+        fresh = bind(Conversation())
+        if valid and held.state:
+            bind(held)
+            fresh.handoff = memory.handoff(held)
+        self.conversations[key] = fresh
         return self.conversations[key]
 
     @staticmethod
@@ -439,6 +468,14 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                        any(item.kind == "image" for item in run.attachments))
             self.emit(run.id, "node.model_switched", node_id=node.id, model_id=previous,
                       next_model_id=node.model_id, reason="model_configuration_changed")
+        elif not node.attempts and node.routing_note and hasattr(self.providers, "configured_models"):
+            from .routing_feedback import collect
+            previous = node.model_id
+            route_node(node, list(self.model_lookup.values()), configured,
+                       any(item.kind == "image" for item in run.attachments), feedback=collect(self.db))
+            if node.model_id != previous:
+                self.emit(run.id, "node.model_switched", node_id=node.id, model_id=previous,
+                          next_model_id=node.model_id, reason="observed_delivery_cost")
 
     def _take_log(self, run_id: str, node_id: str, result=None) -> dict:
         """What an attempt did, for its NodeAttempt, however it ended (finished, cancelled, its
@@ -447,7 +484,11 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         log = self.tool_logs.pop((run_id, node_id), None) or []
         trace = self.tool_traces.pop((run_id, node_id), None)
         turns = getattr(result, "turns", 0) or max((call["turn"] for call in log), default=0)
-        return {"tool_calls": log, "turns": turns, "trace": str(trace) if trace and trace.is_file() else None}
+        latest = self.db.get_run(run_id)
+        node = next((item for item in latest.plan.nodes if item.id == node_id), None) if latest else None
+        elapsed = max(0, (datetime.now(timezone.utc) - node.started_at).total_seconds()) if node and node.started_at else None
+        return {"tool_calls": log, "turns": turns, "trace": str(trace) if trace and trace.is_file() else None,
+                "duration_seconds": elapsed}
 
     def _spread(self, run, node) -> None:
         """Keep one API provider from carrying all of the task's running steps, so that its
@@ -865,6 +906,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                                turn_remaining=(lambda: contract.max_turns - current().contract_turns) if contract and work else None,
                                use_turn=use_turn if contract and work else None,
                                scope=(run.id, node.id) if contract else None, wait_for_step=work)
+        budget.context = {"run_id": run.id, "node_id": node.id if node else None,
+                          "purpose": "work" if work else "review_or_control"}
         result = None
         try:
             result = await call(budget)

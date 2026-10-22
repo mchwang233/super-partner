@@ -126,6 +126,7 @@ catalog_sync = CatalogSync(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    db.interrupt_model_calls()
     catalog_sync.start()
     for run in db.list_runs():
         # An interrupted run may have left a project half-edited; resume only once confirmed.
@@ -611,6 +612,21 @@ async def task_retrospective(run_id: str):
     if body is None:
         raise HTTPException(404, "Task not found or not finished")
     return body
+
+
+@app.get("/api/tasks/{run_id}/calls")
+async def task_model_calls(run_id: str):
+    if not db.get_run(run_id):
+        raise HTTPException(404, "Task not found")
+    records = [item for item in db.model_calls(run_id) if not item.get("delegated")]
+    return {"calls": records, "limit": 1000,
+            "summary": {"calls": len(records), "requests": sum(item["requests"] for item in records),
+                        "unknown_usage": sum(not item["usage_known"] for item in records),
+                        "observed_cost_usd": sum(item["cost_usd"] for item in records),
+                        "input_tokens": sum(item["input_tokens"] for item in records),
+                        "output_tokens": sum(item["output_tokens"] for item in records),
+                        "cached_input_tokens": sum(item["cached_input_tokens"] for item in records),
+                        "retries": sum(item["retries"] for item in records)}}
 
 
 @app.get("/api/improvements/settings", response_model=LearningSettings)

@@ -815,3 +815,7 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 
 /* Markdown shown as plain text until its renderer has loaded (markdown.tsx). */
 .markdown-loading { white-space: pre-wrap; }
+.call-table-scroll{overflow-x:auto}
+.call-insights table{width:100%;border-collapse:collapse;text-align:left;font-size:13px}
+.call-insights th,.call-insights td{padding:9px;border-bottom:1px solid var(--line)}
+.call-insights td small{display:block;color:var(--faint)}
