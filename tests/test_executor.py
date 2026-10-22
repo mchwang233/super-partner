@@ -16,6 +16,94 @@ from super_partner.quota import ModelUnavailable
 from super_partner.routing import estimate, route_node
 
 
+async def test_artifact_pipeline_generates_own_missing_outputs_and_audits_only_accepted_reports(tmp_path, monkeypatch):
+    from artifact_helpers import mock_acceptance, setup_executor
+
+    checks = []
+    mock_acceptance(monkeypatch, checks)
+    executor, db, providers = setup_executor(tmp_path, monkeypatch)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.SUCCEEDED, run.error
+    assert providers.calls == ["vdb", "report", "audit"]
+    assert all(n.artifact_evidence.accepted for n in run.plan.nodes)
+    assert [c[0] for c in checks] == ["validate coverage.vdb", "validate report.txt", "validate audit.txt"]
+    assert run.actual_cost_usd == pytest.approx(0.006)
+    assert all(n.contract_turns == 1 for n in run.plan.nodes)
+
+
+async def test_artifact_missing_external_input_blocks_without_model_calls_or_downstream_audit(tmp_path, monkeypatch):
+    from artifact_helpers import coverage_nodes, setup_executor
+
+    _, report, audit = coverage_nodes()
+    report.dependencies = []
+    report.artifact_contract.inputs[0].source = "external"
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [report, audit])
+    monkeypatch.setattr(settings, "auto_diagnose", True)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.INCOMPLETE and providers.calls == []
+    assert all(n.status == NodeStatus.BLOCKED for n in run.plan.nodes)
+    assert run.plan.nodes[0].attempts[0].outcome == "blocked"
+    assert "coverage.vdb" in run.diagnoses[0].report
+    assert run.actual_cost_usd == 0
+
+
+async def test_artifact_cli_cannot_silently_ignore_declared_limits(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+
+    node = contract_node()
+    node.model_id = "cli:codex"
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [node])
+    executor.model_lookup[node.model_id] = executor.model_lookup["test:worker"].model_copy(
+        update={"id": node.model_id, "channel": "cli"})
+    await executor.execute("artifacts")
+    node = db.get_run("artifacts").plan.nodes[0]
+    assert providers.calls == [] and node.status == NodeStatus.BLOCKED
+    assert "通道" in node.review and node.attempts[0].outcome == "blocked"
+
+
+async def test_artifact_worker_blocked_result_preserves_cost_and_log_without_automatic_recovery(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.providers import ProviderResult
+
+    async def blocked(node, workspace, kwargs):
+        kwargs["tool_log"].append({"turn": 1, "tool": "Bash", "detail": "check license", "ok": False, "output": "license missing"})
+        return ProviderResult("BLOCKED: license missing", 1000, 1000, "test:worker", turns=1)
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [contract_node()], blocked)
+    monkeypatch.setattr(settings, "auto_diagnose", True)
+    await executor.execute("artifacts")
+    node = db.get_run("artifacts").plan.nodes[0]
+    assert providers.calls == ["vdb"] and node.status == NodeStatus.BLOCKED
+    assert node.attempts[0].cost_usd == pytest.approx(0.002)
+    assert node.attempts[0].tool_calls[0].output == "license missing"
+
+
+async def test_artifact_blocked_claim_never_runs_downstream_audit(tmp_path, monkeypatch):
+    from super_partner.providers import ProviderResult
+
+    class BlockedWorker:
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, model_id, prompt, workspace=None, **kwargs):
+            self.calls.append(prompt)
+            return ProviderResult("BLOCKED: upstream evidence missing", 0, 0, model_id)
+
+    node = TaskNode(id="report", title="Report", instructions="Generate text", capability="research", model_id="mock:local")
+    audit = TaskNode(id="audit", title="Audit", instructions="Audit delivery", capability="research", model_id="mock:local", dependencies=["report"])
+    db = Database(tmp_path / "blocked.db")
+    db.save_run(ExecutionRun(id="blocked", prompt="delivery", status=RunStatus.QUEUED, budget_usd=1,
+                             plan=TaskPlan(summary="delivery", nodes=[node, audit])))
+    providers = BlockedWorker()
+    executor = Executor(db, providers, {model.id: model for model in builtin_models()})
+    await executor.execute("blocked")
+    assert db.get_run("blocked").status == RunStatus.INCOMPLETE
+    assert len(providers.calls) == 1
+    assert db.get_run("blocked").plan.nodes[1].status == NodeStatus.BLOCKED
+
+
 @pytest.fixture(autouse=True)
 def execution_only(monkeypatch):
     # Scheduler doubles do not supply reviewers; acceptance is tested in test_quality.py.
@@ -105,6 +193,16 @@ def wide_run(
 
 
 @pytest.mark.asyncio
+async def test_every_ready_step_starts_at_once_by_default(tmp_path: Path):
+    assert settings.max_parallel_nodes == 0
+    database = Database(tmp_path / "test.db")
+    run = wide_run(database, width=8, cost=0, budget=1)
+    providers = SlowProviders(delay=0.1)
+    await Executor(database, providers, {model.id: model for model in builtin_models()}).execute(run.id)
+    assert database.get_run(run.id).status == RunStatus.SUCCEEDED and providers.peak == 8
+
+
+@pytest.mark.asyncio
 async def test_executor_respects_parallel_limit(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "max_parallel_nodes", 2)
     database = Database(tmp_path / "test.db")
@@ -151,6 +249,41 @@ async def test_cancel_stops_running_nodes(tmp_path: Path):
     assert providers.active == 0
     assert result.status == RunStatus.CANCELLED
     assert {node.status for node in result.plan.nodes} == {NodeStatus.CANCELLED}
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_attempt_keeps_its_turns_tool_calls_and_trace(tmp_path: Path, monkeypatch):
+    """What an attempt did is kept however it ends, so the task can be looked back on."""
+    monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
+    database = Database(tmp_path / "test.db")
+    run = wide_run(database, width=1, cost=0, budget=1)
+    started = asyncio.Event()
+
+    class Working:
+        async def complete(self, model_id, prompt, workspace=None, tool_log=None, tool_trace=None, **kwargs):
+            tool_log.append({"turn": 3, "tool": "Bash", "detail": "make test", "ok": False, "output": "1 failed"})
+            tool_trace.parent.mkdir(parents=True, exist_ok=True)
+            tool_trace.write_text('{"turn": 3, "tool": "Bash", "output": "the whole output"}\n')
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError as exc:
+                exc.usage = ProviderResult("", 100, 20, model_id, turns=7)
+                raise
+
+    executor = Executor(database, Working(), {model.id: model for model in builtin_models()})
+    executor.start(run.id)
+    await started.wait()
+    cancelled = database.get_run(run.id)
+    cancelled.status = RunStatus.CANCELLED
+    database.save_run(cancelled)
+    executor.cancel(run.id)
+    with pytest.raises(asyncio.CancelledError):
+        await executor.tasks[run.id]
+    [attempt] = database.get_run(run.id).plan.nodes[0].attempts
+    assert attempt.turns == 7 and [call.detail for call in attempt.tool_calls] == ["make test"]
+    assert attempt.trace and "the whole output" in Path(attempt.trace).read_text()
+    assert Path(attempt.trace).is_relative_to(tmp_path / "data")
 
 
 @pytest.mark.asyncio

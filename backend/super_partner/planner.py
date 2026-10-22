@@ -4,7 +4,7 @@ import re
 from typing import Optional
 from uuid import uuid4
 
-from . import supervisor
+from . import contracts, supervisor
 from .budget import token_cost
 from .models import (
     DIFFICULTY_THRESHOLDS,
@@ -83,11 +83,14 @@ Every task's result is checked against its acceptance_criteria by another model 
 if it fails, so make the criteria concrete and checkable. A verification task lists in
 "verifies" the keys of the tasks it checks (they must also be in its dependencies); if it
 finds problems, those tasks are redone with its findings.
-What executors can do: membership CLIs (Codex, Claude Code) edit files and run shell commands
-in a sandbox that can write only to their working directory and has no network access, so
-they can run syntax checks, tests and scripts but cannot install packages or fetch URLs.
-API models that support tool calls work the same way through file and command tools in
-the same sandbox. Keep acceptance criteria within these limits.
+What executors can do: membership CLIs (Codex, Claude Code) and API models with tools edit files
+and run shell commands in a sandbox. It can write only the task's working directory and /tmp; the
+rest of the system is read-only; there is no root or sudo, so system packages cannot be installed;
+the tools installed on this machine for every step are on PATH. It reaches the internet only if
+the request says the task allows it, and then it can download packages into the working directory
+and call external services. So steps can build, run tests, simulations and scripts with what is
+installed. Keep acceptance criteria within these limits, and name the tools the task needs so they
+are checked before it starts.
 Work that produces files (code, tests, documents) is planned as small work packages, not areas of
 work, in a new task as much as in an existing project. Each task that writes files lists in "files"
 the 1-{max_files} files it creates or changes and in "reads" up to {max_reads} more files it must read
@@ -103,7 +106,7 @@ task lists the files it checks in "reads". Tasks that write no files (research, 
 summary) leave "files" empty.
 Set needs_workspace to true only for tasks that must read or modify files in the target project.
 Token estimates must include expected dependency results and the files given.
-""".replace("{max_files}", "5").replace("{max_reads}", "8")
+""".replace("{max_files}", "5").replace("{max_reads}", "8") + contracts.RULES
 
 PLANNER_PROMPT = """You are the planning engine for an autonomous multi-model executor.
 Decompose the user request into a small, executable DAG of tasks (nodes). Return JSON only, with this shape:
@@ -202,7 +205,9 @@ def _validate_plan(payload: dict) -> TaskPlan:
         nodes.append(node)
     if any(not node.instructions for node in nodes):
         raise ValueError("every planner node needs instructions")
-    return TaskPlan(summary=str(payload.get("summary", "Autonomous task plan"))[:240], nodes=nodes)
+    plan = TaskPlan(summary=str(payload.get("summary", "Autonomous task plan"))[:240], nodes=nodes)
+    contracts.validate(plan)
+    return plan
 
 
 CAPABILITIES = {"coding", "planning", "research", "chinese", "tool_use", "structured_output"}
@@ -226,6 +231,7 @@ def task_node(raw: dict, key: str, dependencies: list[str], verifies: list[str])
         verifies=verifies,
         needs_workspace=raw.get("needs_workspace") is True,
         **package(raw),
+        **contracts.declarations(raw),
     )
 
 
@@ -322,6 +328,15 @@ async def autonomous_plan(
     in_project = project_context is not None or brief is not None
     body = prompt + "".join(f"\n\n{part}" for part in (project_context, brief) if part)
     request = PLANNER_PROMPT + body
+    artifact_work = bool(contracts.stages(TaskNode(id="request", title=prompt, instructions="",
+                                                  capability="planning")) & {"coverage_vdb", "urg_report"})
+
+    def read_plan(text: str) -> TaskPlan:
+        candidate = _validate_plan(_extract_json(text))
+        if artifact_work and not any(node.artifact_contract for node in candidate.nodes):
+            raise contracts.ContractError("Requested artifact work has no declared artifact contracts")
+        return candidate
+
     if session is not None:
         from .outline import OUTLINE_PROMPT
 
@@ -331,6 +346,8 @@ async def autonomous_plan(
             return plan
     planner = select_planner_model(models, configured)
     if planner is None or planner.provider == "mock":
+        if artifact_work:
+            raise contracts.ContractError("Artifact planning blocked: no capable planner to declare evidence and limits")
         plan = heuristic_plan(prompt, in_project)
         plan.planning_note = "No capable configured planner; used deterministic fallback"
         return plan
@@ -352,7 +369,16 @@ async def autonomous_plan(
         charged_id = result.used_model_id or planner.id
         charged_model = next(model for model in models if model.id == charged_id)
         planning_cost = _cost(result, charged_model)
-        plan = _validate_plan(_extract_json(result.text))
+        try:
+            plan = read_plan(result.text)
+        except contracts.ContractError as exc:
+            try:
+                correction = await providers.complete(planner.id, request + "\nInvalid artifact plan: "
+                                                     + str(exc) + "\nReturn the whole corrected plan.", cli_timeout=120)
+                planning_cost += _cost(correction, charged_model)
+                plan = read_plan(correction.text)
+            except Exception as invalid:
+                raise contracts.ContractError(f"Artifact planning blocked: {invalid}") from invalid
         if not in_project:
             # Without a project every node runs in its own scratch workspace, so any model will do.
             for node in plan.nodes:
@@ -365,7 +391,12 @@ async def autonomous_plan(
         if switched:
             plan.planning_note = f"{'、'.join(switched)} 暂不可用，改由 {planner.id} 规划"
         return plan
+    except contracts.ContractError:
+        # A generic fallback loses the required evidence and limits. Fail closed instead.
+        raise
     except Exception as exc:
+        if artifact_work:
+            raise contracts.ContractError(f"Artifact planning blocked: {exc}") from exc
         plan = heuristic_plan(prompt, in_project)
         plan.planner_model_id = planner.id
         plan.planning_cost_usd = round(planning_cost, 6)

@@ -5,6 +5,7 @@ its own."""
 import asyncio
 import json
 
+import pytest
 from super_partner import outline, supervisor
 from super_partner.executor import Executor
 from super_partner.models import (
@@ -304,3 +305,62 @@ def test_a_part_split_into_one_long_chain_goes_back():
     assert any("form one chain" in problem for problem in outline.task_problems(chain))
     fanned = outline.siblings([task("a", "A"), task("b", "B", ["a"]), task("c", "C", ["a"]), task("d", "D", ["b", "c"])], False)
     assert not any("form one chain" in problem for problem in outline.task_problems(fanned))
+async def test_artifact_refinement_rejects_a_contractless_split_after_corrections():
+    import json
+
+    from artifact_helpers import coverage_nodes, raw
+    from super_partner import outline
+    from super_partner.models import PlanPart, TaskPlan
+
+    nodes = [raw(node) for node in coverage_nodes()]
+    nodes[0].pop("artifact_contract")
+    for node in nodes:
+        node["kind"] = "task"
+    messages = []
+
+    async def say(message):
+        messages.append(message)
+        return json.dumps({"children": nodes})
+
+    part = PlanPart(id="p", title="Coverage", size=3)
+    with pytest.raises(ValueError, match="Artifact split blocked"):
+        await outline.refine(say, TaskPlan(summary="coverage", nodes=[], parts=[part]), part)
+    assert len(messages) == 1 + outline.ROUNDS
+
+
+async def test_artifact_refinement_keeps_collection_report_and_audit_dependencies():
+    import json
+
+    from artifact_helpers import coverage_nodes, raw
+    from super_partner import outline
+    from super_partner.models import PlanPart, TaskPlan
+
+    nodes = [{**raw(node), "kind": "task"} for node in coverage_nodes()]
+
+    async def say(message):
+        return json.dumps({"children": nodes})
+
+    part = PlanPart(id="p", title="Coverage", size=3)
+    _, result = await outline.refine(say, TaskPlan(summary="coverage", nodes=[], parts=[part]), part)
+    assert len(result) == 3
+    assert result[1].dependencies == [result[0].id]
+    assert result[2].dependencies == [result[1].id]
+    assert all(node.artifact_contract for node in result)
+
+
+async def test_artifact_producer_part_can_finish_splitting_after_its_consumer():
+    from artifact_helpers import coverage_nodes, raw
+
+    vdb, report, audit = coverage_nodes()
+    first = PlanPart(id="p1", title="Collect", status="refining")
+    second = PlanPart(id="p2", title="Report", dependencies=["p1"], status="ready")
+    report.part_id = audit.part_id = "p2"
+    report.dependencies, report.after_parts = [], ["p1"]
+    plan = TaskPlan(summary="coverage", parts=[first, second], nodes=[report, audit])
+
+    async def say(message):
+        return json.dumps({"children": [{**raw(vdb), "kind": "task"}]})
+
+    _, nodes = await outline.refine(say, plan, first)
+    assert len(nodes) == 1 and nodes[0].artifact_contract.stage == "coverage_vdb"
+

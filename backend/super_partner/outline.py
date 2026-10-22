@@ -15,6 +15,7 @@ from collections.abc import Awaitable
 from typing import Callable, Optional
 from uuid import uuid4
 
+from . import contracts
 from .models import PlanPart, TaskNode, TaskPlan
 from .planner import WORK_RULES, _extract_json, scope_problems, task_node
 
@@ -26,6 +27,11 @@ MAX_TASKS = 60
 ROUNDS = 2
 # This many tasks of one part in a single chain are sent back to be made parallel.
 CHAIN_LIMIT = 4
+# Said to the lead whenever it plans for a task that allows the internet (planner.WORK_RULES).
+INTERNET_NOTE = "(This task allows the internet: its steps' commands may download packages and call external services.)"
+# Commands the outline may name to check the task's tools before it runs (TaskPlan.requires).
+MAX_REQUIRES = 12
+MAX_REQUIRE_CHARS = 4000
 
 TASK_RULES = """A task is what one model does in one go. Every task must be:
 - independent: its model sees only the task's instructions, the files it names and what the tasks
@@ -56,13 +62,22 @@ OUTLINE_PROMPT = (
     "the files it owns, and exact names, function signatures, endpoints and their fields, data and "
     "file formats, commands. A part that waits for another uses only what that one provides.\n"
     "- \"size\" is how many tasks you expect the part to take, each about 10-15 tool turns for a "
-    "capable model; \"capability\" is the main kind of work in it.\n\n"
+    "capable model; \"capability\" is the main kind of work in it.\n"
+    "- \"requires\" lists shell commands that show the tools, simulators, licenses and services the "
+    "whole task needs work on this machine (such as \"gcc --version\" or \"make --version\"); they run in "
+    "the steps' sandbox before the first task, so a missing tool is found before any work. Name only "
+    "what the task cannot do without; [] if it needs nothing special.\n"
+    "- \"folder\" names the task's folder in two to five lowercase English words joined by hyphens "
+    "(such as \"todo-cli-json\"), in English even when the request is not.\n\n"
     "Reply with only a JSON object, no markdown fences:\n"
-    '{"summary": "short objective", "parts": [{"key": "p1", "title": "short title", '
+    '{"summary": "short objective", "folder": "short-english-name", '
+    '"requires": ["commands that show the tools it needs work"], '
+    '"parts": [{"key": "p1", "title": "short title", '
     '"goal": "what this part delivers", "acceptance": "how to tell it is done", '
     '"provides": "the contract other parts may rely on", "size": 3, '
     '"capability": "' + CAPABILITY_CHOICES + '", '
-    '"dependencies": ["keys of earlier parts it needs finished first"]}]}\n\nUser request:\n'
+    '"dependencies": ["keys of earlier parts it needs finished first"]}]}\n'
+    + contracts.RULES + '\nUser request:\n'
 )
 
 PART_ROLE = (
@@ -258,6 +273,8 @@ def task_problems(children: list[dict], expected: Optional[int] = None) -> list[
     ``expected`` is how many tasks the outline expected the part to take (PlanPart.size)."""
     nodes = [item["node"] for item in children if item["kind"] == "task"]
     problems = scope_problems(TaskPlan(summary="", nodes=nodes))
+    coverage = any(contracts.stages(node) & {"coverage_vdb", "urg_report"} for node in nodes)
+    problems += [problem for node in nodes for problem in contracts.node_problems(node, coverage=coverage)]
     problems += [f"{node.title}: no acceptance_criteria; say how a reviewer can tell it is done"
                  for node in nodes if not node.acceptance_criteria]
     if len(chain := longest_chain(children)) >= CHAIN_LIMIT:
@@ -287,9 +304,10 @@ async def plan_outline(say: Say, opening: str) -> TaskPlan:
     """The major parts of a plan, from the lead through ``say``; their tasks come later
     (``refine``). Raises ValueError if the lead's replies cannot be turned into an outline."""
     def read(payload: dict):
-        return str(payload.get("summary") or "").strip(), siblings(payload.get("parts"), False, parts_only=True)
+        return (str(payload.get("summary") or "").strip(), siblings(payload.get("parts"), False, parts_only=True),
+                payload.get("requires"), str(payload.get("folder") or ""))
 
-    summary, raw = await _ask(say, opening, read)
+    summary, raw, requires, folder = await _ask(say, opening, read)
     tree = Tree()
     parts = tree.add(raw, None)
     for part, item in zip(parts, raw):
@@ -302,7 +320,11 @@ async def plan_outline(say: Say, opening: str) -> TaskPlan:
         except (TypeError, ValueError):
             part.size = 3
         part.status = "planned"
-    return TaskPlan(summary=(summary or "Autonomous task plan")[:240], nodes=[], parts=parts)
+    # A command cut short would be a broken one: one too long is left out instead.
+    commands = [text for item in requires if isinstance(item, (str, int))
+                and 0 < len(text := str(item).strip()) <= MAX_REQUIRE_CHARS] if isinstance(requires, list) else []
+    return TaskPlan(summary=(summary or "Autonomous task plan")[:240], nodes=[], parts=parts,
+                    requires=list(dict.fromkeys(commands))[:MAX_REQUIRES], folder=folder[:80])
 
 
 def outline_text(plan: TaskPlan) -> str:
@@ -319,10 +341,14 @@ def outline_text(plan: TaskPlan) -> str:
     return "\n".join(lines)
 
 
-def part_opening(plan: TaskPlan, part: PlanPart) -> str:
-    """The first message to the planner of ``part``, before it is asked to split it."""
+def part_opening(plan: TaskPlan, part: PlanPart, internet: bool = False) -> str:
+    """The first message to the planner of ``part``, before it is asked to split it; ``internet``
+    is whether the task allows it now (it can change after planning)."""
+    request = plan.request.replace(INTERNET_NOTE, "").rstrip()
     return (PART_ROLE + f"\nOutline of the task ({plan.summary}):\n{outline_text(plan)}\n\n"
-            f"Your part: {part.title}\n\nRequest and context:\n{plan.request}\n\n")
+            f"Your part: {part.title}\n\nRequest and context:\n{request}\n\n"
+            + (INTERNET_NOTE if internet else "The task does not allow the internet: its steps have no network.")
+            + "\n\n")
 
 
 async def refine(say: Say, plan: TaskPlan, part: PlanPart, opening: str = "") -> tuple[list[PlanPart], list[TaskNode]]:
@@ -360,6 +386,10 @@ async def refine(say: Say, plan: TaskPlan, part: PlanPart, opening: str = "") ->
             except (ValueError, TypeError, KeyError):
                 break  # keep the split it gave before
         # Depth first: this part's own parts are split before the next one at its level.
+        local = [item["node"] for item in children if item["kind"] == "task"]
+        coverage = any(contracts.stages(node) & {"coverage_vdb", "urg_report"} for node in local)
+        if problems := [p for node in local for p in contracts.node_problems(node, coverage=coverage)]:
+            raise contracts.ContractError("Artifact split blocked: " + "; ".join(problems))
         waiting[0:0] = tree.add(children, current.id)
     if not tree.tasks:
         raise ValueError(f"part {part.title} has no tasks")
@@ -367,6 +397,14 @@ async def refine(say: Say, plan: TaskPlan, part: PlanPart, opening: str = "") ->
     names = {name: item.id for item in waited for name in (item.title, item.id)}
     for node in split.nodes:
         node.after_parts = list(dict.fromkeys(names[name] for name in node.after_parts if name in names))
+    combined = plan.model_copy(deep=True)
+    combined.nodes += split.nodes
+    combined.parts += [item for item in split.parts if item.id != part.id]
+    for item in combined.parts:
+        if item.id == part.id:
+            item.status = "ready"
+    link(combined)
+    contracts.validate(combined, partial=True)
     return [item for item in split.parts if item.id != part.id], split.nodes
 
 

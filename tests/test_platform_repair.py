@@ -1,8 +1,10 @@
 import asyncio
+import inspect
 import json
 import os
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 from super_partner import agent
@@ -10,7 +12,7 @@ from super_partner import platform_repair as platform
 from super_partner.config import settings
 from super_partner.db import Database
 from super_partner.executor import Executor
-from super_partner.models import Diagnosis, NodeStatus, RunStatus
+from super_partner.models import Diagnosis, EngineerJob, NodeStatus, RunStatus
 from super_partner.providers import ProviderResult
 from test_diagnosis import MODELS, Providers, one_node_run
 
@@ -106,6 +108,55 @@ async def test_older_repairs_without_network_permission_validate_offline(tmp_pat
     monkeypatch.setattr(manager, "_check_command", check)
     await manager.check(job)
     assert permissions == [False] * 4
+
+
+@pytest.mark.parametrize("allow_network", [False, True])
+@pytest.mark.parametrize("test_name,network", [
+    ("test_command_output_arrives_under_uvloop_as_in_the_service", False),
+    ("test_command_output_arrives_under_uvloop_as_in_the_service", True),
+    ("test_a_step_allowed_the_internet_is_still_the_user_not_root", True),
+])
+def test_agent_sandbox_checks_follow_validation_network_permission(
+    monkeypatch, request, allow_network, test_name, network,
+):
+    """Exercise the actual checks and fixtures without starting pasta or requiring TUN."""
+    import test_agent
+
+    monkeypatch.setenv("SUPER_PARTNER_VALIDATION_ALLOW_NETWORK", str(allow_network).lower())
+    monkeypatch.setattr(agent, "network_available", lambda: True)
+    monkeypatch.setitem(sys.modules, "uvloop", ModuleType("uvloop"))
+    opened = []
+
+    class WorkspaceOpened(Exception):
+        pass
+
+    def workspace(root, *, network=False):
+        opened.append(network)
+        raise WorkspaceOpened
+
+    monkeypatch.setattr(agent, "Workspace", workspace)
+    check = getattr(test_agent, test_name)
+
+    def exercise():
+        # Resolve the check's real fixtures, including any conditional request for permission.
+        arguments = {name: network if name == "network" else request.getfixturevalue(name)
+                     for name in inspect.signature(check).parameters}
+        result = check(**arguments)
+        if inspect.isawaitable(result):
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(result)
+            finally:
+                loop.close()
+
+    if network and not allow_network:
+        with pytest.raises(pytest.skip.Exception, match="The task disabled network access"):
+            exercise()
+        assert opened == []
+    else:
+        with pytest.raises(WorkspaceOpened):
+            exercise()
+        assert opened == [network]
 
 
 @pytest.mark.parametrize("allow_network", [False, True])
@@ -326,6 +377,46 @@ async def test_platform_diagnosis_edits_copy_and_only_then_schedules_activation(
     assert executor.platform_pending["allow_network"] == network_after
     assert permissions == [network_after] * 5
     assert "broken" in (source_checkout / "backend/super_partner/api.py").read_text()
+
+
+@pytest.mark.parametrize("origin,matching,exists,allowed", [
+    ("retrospective", True, True, True),
+    ("user", True, True, False),
+    ("retrospective", False, True, False),
+    ("retrospective", True, False, False),
+])
+async def test_retrospective_activation_outlives_cancelled_source_only_with_matching_job(
+    tmp_path, monkeypatch, origin, matching, exists, allowed,
+):
+    db = Database(tmp_path / "test.db")
+    if exists:
+        one_node_run(db)
+        run = db.get_run("r")
+        run.status = RunStatus.CANCELLED
+        db.save_run(run)
+    executor = Executor(db, Providers(), MODELS)
+    record = {"id": "repair", "run_id": "r", "engineer_job_id": "engineer", "status": "validated"}
+    db.save_engineer_job(EngineerJob(id="engineer", origin=origin, request="Improve later tasks", status="applying",
+                                     run_id="r", repair_id="repair" if matching else "another"))
+    launched, stopped = [], []
+
+    async def launch(job):
+        launched.append(job)
+
+    async def watch():
+        pass
+
+    monkeypatch.setattr(executor.platform, "launch", launch)
+    monkeypatch.setattr(executor.platform, "save", lambda job: None)
+    monkeypatch.setattr(executor, "_watch_platform", watch)
+    monkeypatch.setattr(executor, "_finish_platform", stopped.append)
+    await executor._activate_platform(record)
+    assert bool(launched) is allowed
+    assert bool(stopped) is not allowed
+    if exists:
+        assert db.get_run("r").status == RunStatus.CANCELLED
+    if not allowed:
+        assert record["status"] == "cancelled"
 
 
 def test_restart_only_resumes_held_runs_with_remaining_budget(tmp_path, source_checkout, monkeypatch):

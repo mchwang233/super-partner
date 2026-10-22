@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import skills
-from .models import ExecutionRun, NodeInput, TaskNode
+from .models import ArtifactEvidence, ExecutionRun, NodeInput, TaskNode
 
 # Marks a review request so the offline demo model can answer it with a verdict.
 REVIEW_MARKER = "[[super-partner:review]]"
@@ -31,6 +31,7 @@ PRIVATE_SUFFIXES = {".key", ".pem", ".p12", ".pfx", ".keystore", ".db", ".sqlite
 LOG_SUFFIXES = {".log", ".txt", ".out"}
 # A worker's own statement that part of its task cannot be done in this environment.
 UNABLE = re.compile(r"^\s*UNABLE:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+BLOCKED = re.compile(r"^\s*(?:STATUS:\s*)?BLOCKED\s*(?::\s*(.*))?$", re.IGNORECASE | re.MULTILINE)
 UNABLE_RULE = (
     "Be honest about what actually happened. If something this step's own task requires cannot "
     "really be done here (no network access, missing credentials, accounts, permissions, hardware or services), "
@@ -59,6 +60,8 @@ class Verdict:
     cost_usd: float = 0.0
     accounted_cost_usd: float = 0.0
     verified: bool = True
+    blocked: Optional[str] = None
+    artifact_evidence: Optional[ArtifactEvidence] = None
 
 
 # --- what a node is told -------------------------------------------------------------------
@@ -119,6 +122,9 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
                         + run.background[:BACKGROUND_CHARS])
     if node.acceptance_criteria:
         sections.append(f"Acceptance criteria (your result will be checked against these):\n{node.acceptance_criteria}")
+    from .contracts import prompt as contract_prompt
+    if contract := contract_prompt(node):
+        sections.append(contract)
     scoped = bool(node.files or node.reads)
     if scoped:
         sections.append(scope_section(node))
@@ -237,8 +243,11 @@ def attempt_notes(node: TaskNode) -> str:
 def continue_prompt(node: TaskNode, run: ExecutionRun) -> str:
     """The message that continues a step's conversation with its model in a new attempt."""
     attempt = node.attempts[-1]
+    from .contracts import prompt as contract_prompt
     sections = [(f"This step continues in a new attempt. Your previous attempt ended "
                  f"({attempt.outcome}): {(attempt.reason or '')[:500]}")]
+    if contract := contract_prompt(node):
+        sections.append(contract)
     if node.feedback:
         sections.append(f"Fix these problems:\n{node.feedback}")
     if clarifications := _clarifications(run):
@@ -274,6 +283,7 @@ def retry_feedback(previous: Optional[str], problem: str) -> str:
 # --- checking a result ---------------------------------------------------------------------
 
 def review_prompt(node: TaskNode, result: str, changed: list[str], diff: str, summarize: bool) -> str:
+    from .contracts import prompt as contract_prompt
     criteria = node.acceptance_criteria or "The result fully and correctly completes the task."
     files = ", ".join(changed[:MAX_LISTED_FILES]) or "(none)"
     summary_rule = (
@@ -289,7 +299,8 @@ def review_prompt(node: TaskNode, result: str, changed: list[str], diff: str, su
     return (
         f"{REVIEW_MARKER}\nYou are reviewing another model's work. Do not modify any files.\n\n"
         f"Task:\n{node.instructions}\n\nAcceptance criteria:\n{criteria}\n\n{rework}"
-        f"Result:\n{result}\n\nFiles changed: {files}\n"
+        + contract_prompt(node) + "\n"
+        + f"Result:\n{result}\n\nFiles changed: {files}\n"
         + (
             "\nEvidence from the workspace (diff or contents of the relevant files, then a listing of the "
             "files that exist). Files this attempt did not change may come from earlier attempts; judge "
@@ -301,6 +312,7 @@ def review_prompt(node: TaskNode, result: str, changed: list[str], diff: str, su
         )
         + '\nReply with JSON only: {"passed": true or false, "reason": "one or two sentences", '
         '"fix": "what to change if not passed, else empty", '
+        '"blocked": "empty, or the missing prerequisite evidence that blocks this step", '
         '"unable": "empty, or what the task required that did not actually happen because of a limit '
         'outside the work, why, and what would make it possible"}.'
         + summary_rule
@@ -330,6 +342,8 @@ def parse_review(text: str) -> Optional[dict]:
         payload = json.loads(text[start:end + 1])
     except json.JSONDecodeError:
         return None
+    if isinstance(payload, dict) and payload.get("status") == "blocked":
+        payload = {**payload, "passed": False, "blocked": str(payload.get("reason") or "missing prerequisite evidence")}
     if not isinstance(payload, dict) or not isinstance(payload.get("passed"), bool):
         return None
     return payload
@@ -339,6 +353,19 @@ def unable_claim(text: str) -> Optional[str]:
     """The last UNABLE line of a result: what its model says cannot be done here."""
     matches = UNABLE.findall(text or "")
     return matches[-1].strip()[:1000] if matches else None
+
+
+def blocked_claim(text: str) -> Optional[str]:
+    matches = BLOCKED.findall(text or "")
+    if matches:
+        return matches[-1].strip()[:1000] or "步骤报告阻塞；详见本次结果和工具日志。"
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(payload, dict) and str(payload.get("status", "")).lower() == "blocked":
+        return str(payload.get("reason") or "步骤报告阻塞。")[:1000]
+    return None
 
 
 def verification_verdict(text: str) -> Optional[tuple[bool, str]]:

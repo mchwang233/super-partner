@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from . import outline, supervisor
+from . import contracts, outline, supervisor
 from .models import RunStatus
 from .routing import NoEligibleModelError, fit_and_route, reestimate
 
@@ -51,7 +51,7 @@ class Refining:
                 return result.text
 
             try:
-                split = await outline.refine(say, run.plan, part, outline.part_opening(run.plan, part))
+                split = await outline.refine(say, run.plan, part, outline.part_opening(run.plan, part, run.allow_network))
                 used = model.id
                 break
             except asyncio.CancelledError:
@@ -72,15 +72,23 @@ class Refining:
                 except NoEligibleModelError as exc:
                     split, error = None, f"没有模型能做「{node.title}」：{exc}"
             if split:
+                previous = run.plan.model_copy(deep=True)
                 run.plan.parts += parts
                 run.plan.nodes += nodes
                 part.status = "ready"
                 outline.link(run.plan)
-                reestimate(run)
-                self._save(run)
-                self.emit(run_id, "part.refined", part_id=part_id, title=part.title, tasks=len(nodes),
-                          parts=len(parts), model_id=used)
-                return
+                try:
+                    contracts.validate(run.plan, partial=True)
+                except contracts.ContractError as exc:
+                    run.plan = previous
+                    part = next(item for item in run.plan.parts if item.id == part_id)
+                    error = str(exc)
+                else:
+                    reestimate(run)
+                    self._save(run)
+                    self.emit(run_id, "part.refined", part_id=part_id, title=part.title, tasks=len(nodes),
+                              parts=len(parts), model_id=used)
+                    return
             part.status, part.error = "failed", error
             if run.status == RunStatus.RUNNING:
                 run.status = RunStatus.PAUSED

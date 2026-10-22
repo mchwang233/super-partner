@@ -16,7 +16,7 @@ import httpx
 from . import agent as agent_tools
 from . import attachments as files
 from . import progress, streaming
-from .budget import BudgetExceeded, ProviderError
+from .budget import BudgetExceeded, ProviderError, StepLimitExceeded
 from .cli_channels import CLI_SPECS, CliChannelRegistry, SessionLost
 from .config import settings
 from .db import Database
@@ -107,6 +107,8 @@ WRAP_UP_TURNS = 5
 # The start of each tool's output kept in the attempt's log, to see what the model saw.
 LOGGED_OUTPUT = 500
 MAX_LOGGED_CALLS = 300
+# How much of each tool output the full trace keeps (agent.Workspace.trace).
+TRACE_OUTPUT = 200_000
 TURN_LIMIT_MARK = "在 {limit} 轮工具调用后仍未完成"
 
 
@@ -251,7 +253,8 @@ class ProviderRegistry:
                 raise ProviderError(str(exc)) from exc
             result = ProviderResult(text=text, input_tokens=0, output_tokens=0, used_model_id=model_id)
         else:
-            result = await self.complete(model_id, _transcript(session.history, prompt), spend_ok=spend_ok)
+            result = await self.complete(model_id, _transcript(session.history, prompt), spend_ok=spend_ok,
+                                         effort=settings.lead_reasoning_effort)
             session.history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": result.text}]
         session.calls += 1
         return result
@@ -264,6 +267,7 @@ class ProviderRegistry:
         network: bool = False, review_workspace: Optional[Path] = None, review_files: list[str] = (),
         watch: Optional[progress.Watch] = None, conversation: Optional[Conversation] = None,
         effort: Optional[str] = None, overrun: Optional[tuple[int, progress.Watch]] = None,
+        tool_trace: Optional[Path] = None,
     ) -> ProviderResult:
         """One model call. With ``act``, an API model works on ``workspace`` through tools
         (see agent.py) until it is done; ``spend_ok(model_id, input, output)`` can stop it.
@@ -283,7 +287,7 @@ class ProviderRegistry:
                     model_id, prompt + files.describe(attachments, with_paths=True),
                     workspace or settings.workspace_root, timeout=cli_timeout,
                     attachments=attachments, repair=repair, **({"network": True} if network else {}),
-                    **({"watch": watch} if watch else {}),
+                    **({"watch": watch} if watch else {}), **({"effort": effort} if effort else {}),
                 )
                 return ProviderResult(
                     text=text, input_tokens=0, output_tokens=0, used_model_id=model_id,
@@ -327,7 +331,7 @@ class ProviderRegistry:
         else:
             agent = agent_tools.Workspace(
                 Path(workspace or settings.workspace_root), host=repair, max_turns=max_turns, log=tool_log,
-                network=network,
+                network=network, trace=tool_trace,
             ) if act else None
         if agent:
             agent.watch, agent.overrun = watch, overrun
@@ -455,9 +459,16 @@ class ProviderRegistry:
         if conversation:
             conversation.model_id, conversation.state, conversation.followup = model_id, state, None
         total_in = total_out = total_cached = turn = 0
+        text = ""
         # Without a limit (the default) a long attempt is checked instead (progress.py).
         watch = getattr(agent, "watch", None)
         limit = (agent.max_turns or settings.api_agent_max_turns or (None if watch else UNWATCHED_TURNS)) if agent else 1
+        hard_limit = getattr(spend_ok, "turn_remaining", None)
+        if hard_limit is not None:
+            remaining = hard_limit()
+            if remaining <= 0:
+                raise StepLimitExceeded("达到声明轮次上限，停止工作包。")
+            limit = min(limit, remaining) if limit is not None else remaining
         interval = settings.progress_check_minutes * 60
         next_check, seen = time.monotonic() + interval, []
 
@@ -484,9 +495,16 @@ class ProviderRegistry:
             # One turn past the limit: the model's chance to answer with a progress summary.
             for turn in itertools.count(1) if limit is None else range(1, limit + 2 if agent else 2):
                 final = bool(agent) and limit is not None and turn > limit
+                if final and hard_limit is not None:
+                    # No paid extra summary request at a declared hard limit.
+                    return ProviderResult(text or "声明轮次已用尽，保留工具日志供诊断。", total_in, total_out,
+                                          model_id, turns=limit, turn_limit=True,
+                                          cached_input_tokens=total_cached)
                 if spend_ok and not spend_ok(model_id, total_in, total_out):
                     raise BudgetExceeded("已达到任务可用的预算，模型调用被中止。")
                 compact(state.get("history"))
+                if begin := getattr(spend_ok, "begin_turn", None):
+                    await begin()
                 try:
                     text, calls, used_in, used_out, truncated = await stepped(state)
                 except ProviderError as exc:
@@ -495,6 +513,8 @@ class ProviderRegistry:
                     # The provider would not take the continued conversation: start afresh.
                     state = conversation.state = fresh
                     resumed = False
+                    if begin:
+                        await begin()
                     text, calls, used_in, used_out, truncated = await stepped(state)
                 state["calls"] = calls
                 used_cached = state.pop("cached", 0) or 0
@@ -525,10 +545,17 @@ class ProviderRegistry:
                                  "ok": ok, "output": output[:LOGGED_OUTPUT]})
                     if agent.log is not None and len(agent.log) < MAX_LOGGED_CALLS:
                         agent.log.append(seen[-1])
+                    if getattr(agent, "trace", None):
+                        _trace(agent.trace, {**seen[-1], "output": output[:TRACE_OUTPUT]})
                 if limit is not None and (note := _turn_note(limit - turn)):
                     call_id, name, output = results[-1]
                     results[-1] = (call_id, name, f"{output}\n\n{note}")
                 state["results"] = results
+                if hard_limit is not None and (
+                    hard_limit() <= 0 or (spend_ok.step_remaining is not None and spend_ok.step_remaining() <= 0)
+                ):
+                    return ProviderResult(text or "声明限额已用尽，保留工具日志供诊断。", total_in, total_out,
+                                          model_id, turns=turn, turn_limit=True, cached_input_tokens=total_cached)
                 expected, check = getattr(agent, "overrun", None) or (0, None)
                 # Far past what a package was planned for: the lead says whether to go on.
                 if (check and turn % (expected * progress.OVERRUN_FACTOR) == 0
@@ -807,6 +834,16 @@ def _cache_point(history: list[dict]) -> list[dict]:
         blocks[-1]["cache_control"] = CACHE_POINT
     last["content"] = blocks
     return [*history[:-1], last]
+
+
+def _trace(path: Path, call: dict) -> None:
+    """Add one tool call to an attempt's full trace; a trace that cannot be written is skipped."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(call, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def _arguments(raw) -> dict:

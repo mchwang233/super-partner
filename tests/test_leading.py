@@ -257,3 +257,22 @@ async def test_a_repair_that_did_not_work_goes_back_to_the_lead_before_the_step_
     # The step was not sent back to meet the same wall: the lead ended it.
     assert len(team.work) == 1 and result.plan.nodes[0].status == NodeStatus.UNABLE
     assert [item.event for item in result.decisions] == ["attempt_failed", "repair_done"]
+@pytest.mark.parametrize("action", ["accept", "retry", "switch_model"])
+async def test_artifact_lead_cannot_accept_missing_evidence_or_restart_exhausted_work(tmp_path, monkeypatch, action):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.models import NodeStatus, RunStatus
+    from super_partner.quality import Verdict
+
+    node = contract_node()
+    node.contract_turns = node.artifact_contract.max_turns
+    node.status = NodeStatus.RUNNING
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [node])
+    run = db.get_run("artifacts")
+    run.status = RunStatus.RUNNING
+    db.save_run(run)
+    await executor._apply_decision("artifacts", "vdb", {"action": action, "model_id": "test:worker"},
+                                   Verdict(False, "not delivered"), "rejected", "attempt_failed")
+    node = db.get_run("artifacts").plan.nodes[0]
+    assert node.status == NodeStatus.BLOCKED and providers.calls == []
+    assert node.contract_turns == node.artifact_contract.max_turns
+

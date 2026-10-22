@@ -328,3 +328,101 @@ async def test_review_receives_build_log_and_keeps_simulation_failure(tmp_path, 
         assert saved.rework_rounds == 0
     finally:
         database.connection.close()
+@pytest.mark.parametrize("content", [None, "", "old report"])
+async def test_artifact_missing_empty_or_unchanged_report_cannot_pass_on_a_claim(tmp_path, monkeypatch, content):
+    from artifact_helpers import contract_node, mock_acceptance, setup_executor
+    from super_partner import contracts
+    from super_partner.models import RunStatus
+
+    async def claim_only(*args):
+        pass
+
+    node = contract_node("write", None, output="report.txt", contract={"max_turns": 1})
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [node], claim_only)
+    root = contracts.workspace(db.get_run("artifacts"), node)
+    root.mkdir(parents=True)
+    if content is not None:
+        (root / "report.txt").write_text(content)
+    checks = []
+    mock_acceptance(monkeypatch, checks)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.INCOMPLETE and len(providers.calls) == 1
+    assert not run.plan.nodes[0].review_passed
+    assert checks == []
+
+
+async def test_artifact_failed_acceptance_preserves_command_log_and_blocks_audit(tmp_path, monkeypatch):
+    from artifact_helpers import mock_acceptance, setup_executor
+    from super_partner.models import NodeStatus
+
+    mock_acceptance(monkeypatch, ok=False)
+    executor, db, providers = setup_executor(tmp_path, monkeypatch)
+    run = db.get_run("artifacts")
+    run.plan.nodes[0].artifact_contract.max_turns = 1
+    db.save_run(run)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert providers.calls == ["vdb"]
+    assert all(node.status == NodeStatus.BLOCKED for node in run.plan.nodes)
+    assert run.plan.nodes[0].artifact_evidence.checks[0]["ok"] is False
+    assert "artifact check failed" in run.plan.nodes[0].attempts[0].tool_calls[-1].output
+    assert run.plan.nodes[0].attempts[0].trace
+
+
+async def test_artifact_accepted_report_becomes_stale_when_upstream_vdb_changes(tmp_path, monkeypatch):
+    from artifact_helpers import coverage_nodes, mock_acceptance, setup_executor
+    from super_partner import contracts
+    from super_partner.models import NodeStatus, RunStatus
+
+    nodes = coverage_nodes()
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, nodes[:2])
+    mock_acceptance(monkeypatch)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.SUCCEEDED
+    (contracts.workspace(run, nodes[0]) / "coverage.vdb" / "coverage.db").write_text("changed simulation")
+    run.plan.nodes.append(nodes[2])
+    run.status = RunStatus.QUEUED
+    providers.nodes[nodes[2].id] = nodes[2]
+    db.save_run(run)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.plan.nodes[2].status == NodeStatus.BLOCKED
+    assert providers.calls == ["vdb", "report"]
+    assert "过期" in run.plan.nodes[2].review
+
+
+@pytest.mark.parametrize("text", ["BLOCKED: missing evidence", "STATUS: BLOCKED", '{"status":"blocked","reason":"missing evidence"}'])
+def test_artifact_blocked_claims_do_not_become_passing_reviews(text):
+    from super_partner import quality
+
+    assert quality.blocked_claim(text)
+
+
+async def test_artifact_unfinished_audit_does_not_rework_accepted_report(tmp_path, monkeypatch):
+    from artifact_helpers import coverage_nodes, mock_acceptance, setup_executor
+    from super_partner.models import NodeStatus, RunStatus
+
+    nodes = coverage_nodes()
+    nodes[2].artifact_contract.max_turns = 2
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, nodes[:2])
+    mock_acceptance(monkeypatch)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.SUCCEEDED
+    run.plan.nodes.append(nodes[2])
+    run.status = RunStatus.QUEUED
+    db.save_run(run)
+
+    async def no_output(*args):
+        pass
+
+    providers.nodes[nodes[2].id], providers.work = nodes[2], no_output
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert providers.calls == ["vdb", "report", "audit", "audit"]
+    assert run.rework_rounds == 0
+    assert all(n.status == NodeStatus.SUCCEEDED and len(n.attempts) == 1 for n in run.plan.nodes[:2])
+    assert run.plan.nodes[2].attempts[-1].outcome == "stopped"
+

@@ -10,6 +10,46 @@ from test_leading import MODELS, Team, decision, run
 CONFIGURED = set(MODELS)
 
 
+@pytest.mark.parametrize("change", [
+    {"remove": ["report"]},
+    {"update": [{"id": "report", "dependencies": []}]},
+    {"update": [{"id": "report", "artifact_contract": None}]},
+    {"update": [{"id": "report", "acceptance_criteria": "Trust the claim"}]},
+])
+def test_artifact_replan_cannot_remove_contract_handoff_or_acceptance(change):
+    from artifact_helpers import coverage_nodes
+
+    current = plan(*coverage_nodes())
+    before = current.model_dump()
+    with pytest.raises(PlanError):
+        change_plan(current, change, list(MODELS.values()), CONFIGURED)
+    assert current.model_dump() == before
+
+
+def test_artifact_replan_preserves_usage_on_allowed_instruction_update():
+    from artifact_helpers import coverage_nodes
+
+    current = plan(*coverage_nodes())
+    current.plan.nodes[1].contract_turns = 2
+    current.plan.nodes[1].contract_cost_usd = 0.5
+    change_plan(current, {"update": [{"id": "report", "instructions": "Parse only the declared VDB"}]},
+                list(MODELS.values()), CONFIGURED)
+    assert current.plan.nodes[1].contract_turns == 2
+    assert current.plan.nodes[1].contract_cost_usd == 0.5
+
+
+def test_artifact_replan_cannot_clone_an_exhausted_deliverable_with_fresh_limits():
+    from artifact_helpers import coverage_nodes, raw
+
+    nodes = coverage_nodes()
+    current = plan(*nodes)
+    current.plan.nodes[0].contract_turns = 3
+    duplicate = {**raw(nodes[0]), "key": "fresh"}
+    with pytest.raises(PlanError, match="duplicate artifact producer"):
+        change_plan(current, {"add": [duplicate]}, list(MODELS.values()), CONFIGURED)
+    assert len(current.plan.nodes) == 3 and current.plan.nodes[0].contract_turns == 3
+
+
 def plan(*nodes):
     return ExecutionRun(id="r", prompt="p", status=RunStatus.RUNNING, budget_usd=1, plan=TaskPlan(summary="s", nodes=list(nodes)))
 

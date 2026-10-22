@@ -205,3 +205,56 @@ def test_helper_only_models_never_run_or_lead_a_task():
     step = TaskNode(id="n", title="t", instructions="i", capability="coding")
     assert [m.id for m in eligible_for_node(step, [helper, worker], {helper.id, worker.id})] == ["x:api"]
     assert [m.id for m in supervisor.candidates([helper, worker], {helper.id, worker.id})] == ["x:api"]
+async def test_artifact_hard_turn_limit_makes_no_extra_summary_request_and_keeps_trace(tmp_path, monkeypatch):
+    from super_partner.budget import RequestBudget
+    from super_partner.models import ModelProfile
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    calls, turns = [], []
+    model_id = "deepseek:deepseek-flash"
+    model = ModelProfile(id=model_id, provider="deepseek", display_name="test", input_per_million=1, output_per_million=1)
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json=reply({"content": "Still working", "tool_calls": [READ]}))
+
+    async def turn():
+        turns.append(1)
+
+    async def charge(cost):
+        pass
+
+    budget = RequestBudget({model_id: model}, lambda: 1, {}, charge, asyncio.Event(),
+                           turn_remaining=lambda: 2 - len(turns), use_turn=turn)
+    registry = ProviderRegistry(models={model_id: model})
+    registry.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    log, trace = [], tmp_path / "trace.jsonl"
+    try:
+        result = await registry.complete(model_id, "work", tmp_path, act=True, spend_ok=budget,
+                                         tool_log=log, tool_trace=trace)
+    finally:
+        await registry.client.aclose()
+    assert len(calls) == len(turns) == result.turns == 2
+    assert result.turn_limit and len(log) == 2 and len(trace.read_text().splitlines()) == 2
+    assert result.input_tokens == result.output_tokens == 2
+
+
+async def test_artifact_limit_survives_provider_failure_after_a_plain_response(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.budget import ProviderError
+    from super_partner.models import NodeStatus
+
+    async def fail(node, workspace, kwargs):
+        error = ProviderError("truncated reply")
+        error.usage = ProviderResult("", 1000, 1000, "test:worker", turns=1)
+        raise error
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch,
+                                           [contract_node(contract={"max_turns": 1})], fail)
+    await executor.execute("artifacts")
+    node = db.get_run("artifacts").plan.nodes[0]
+    assert node.status == NodeStatus.BLOCKED and providers.calls == ["vdb"]
+    assert node.attempts[0].turns == node.contract_turns == 1
+    assert node.attempts[0].cost_usd == pytest.approx(0.002)
+    assert "truncated reply" in node.review
+

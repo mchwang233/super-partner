@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-from . import quality, replan, supervisor
+from . import contracts, progress, quality, replan, supervisor
 from .budget import BudgetExceeded
 from .config import settings
 from .models import (
@@ -157,7 +157,7 @@ class Leading:
         """Why a plan change cannot be made, tried on a copy of the task; None if it can."""
         try:
             self._change_plan(self.db.get_run(run_id).model_copy(deep=True), change, deciding)
-        except (replan.PlanError, AttributeError, TypeError, KeyError) as exc:
+        except (replan.PlanError, ValueError, AttributeError, TypeError, KeyError) as exc:
             # A malformed change (not the shape asked for) is as unusable as an impossible one.
             return str(exc) or type(exc).__name__
         return None
@@ -177,6 +177,13 @@ class Leading:
         """Every step has finished: the lead checks the whole result against the request. True if
         it sent work back or changed the plan, so the task goes on; False to finish it."""
         run = self.db.get_run(run_id)
+        for node in run.plan.nodes:
+            try:
+                contracts.accepted(run, node)
+            except contracts.ArtifactBlocked as exc:
+                self._stop_contract(run, node, str(exc))
+                self._save(run)
+                return True
         if not self._can_lead() or not (run.supervisor and run.supervisor.model_id):
             return False
         counted = [item for item in run.decisions if item.action != "fallback"
@@ -229,6 +236,18 @@ class Leading:
             node = next(item for item in run.plan.nodes if item.id == node_id)
             if run.status == RunStatus.CANCELLED or node.status not in {NodeStatus.RUNNING, NodeStatus.PENDING}:
                 return
+            if node.artifact_contract and action in {"accept", "retry", "switch_model"}:
+                try:
+                    if action == "accept":
+                        contracts.accepted(run, node)
+                    elif reason_to_stop := progress.limit_reason(node):
+                        raise contracts.ArtifactBlocked(reason_to_stop)
+                    elif node.attempts and node.attempts[-1].outcome in {Outcome.BLOCKED, Outcome.STOPPED}:
+                        raise contracts.ArtifactBlocked(node.attempts[-1].reason or "产物契约已阻塞")
+                except contracts.ArtifactBlocked as exc:
+                    self._stop_contract(run, node, str(exc))
+                    self._save(run)
+                    return
             made = Decision(
                 node_id=node_id, event=event, action=action, reason=reason, instructions=instructions,
                 model_id=decision.get("model_id"), targets=decision.get("targets", []),

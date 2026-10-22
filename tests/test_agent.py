@@ -546,6 +546,47 @@ async def test_a_task_in_the_platforms_own_folder_still_cannot_read_its_data(out
 
 
 @needs_bwrap
+@pytest.mark.skipif(not agent.network_available(), reason="pasta is not installed")
+@pytest.mark.parametrize("network", [False, True])
+def test_command_output_arrives_under_uvloop_as_in_the_service(tmp_path, network, request):
+    """uvicorn runs the API on uvloop, whose subprocess pipes are sockets: with the internet
+    allowed (pasta around the sandbox) every command once came back as printing nothing."""
+    if network:
+        request.getfixturevalue("network_enabled")
+    uvloop = pytest.importorskip("uvloop")
+    workspace = agent.Workspace(tmp_path, network=network)
+    loop = uvloop.new_event_loop()  # its own loop: the other tests keep theirs
+    try:
+        output = loop.run_until_complete(workspace.call("Bash", {"command": "echo hello; echo oops >&2; exit 3"}))
+    finally:
+        loop.close()
+        workspace.close()
+    assert output == "Exit code 3\nhello\noops"
+
+
+@needs_bwrap
+@pytest.mark.skipif(not agent.network_available(), reason="pasta is not installed")
+async def test_a_step_allowed_the_internet_is_still_the_user_not_root(tmp_path, network_enabled):
+    """pasta makes the sandbox root of a namespace of its own: a step would think it is root."""
+    (tmp_path / "mine.txt").write_text("x")
+    workspace = agent.Workspace(tmp_path, network=True)
+    try:
+        output = await workspace.call("Bash", {"command": "id -u; stat -c %u mine.txt; touch new.txt"})
+    finally:
+        workspace.close()
+    assert output.split() == [str(os.getuid())] * 2 and (tmp_path / "new.txt").stat().st_uid == os.getuid()
+
+
+def test_repairs_have_the_real_dev_so_they_can_start_a_steps_sandbox(tmp_path):
+    """A repair checks a step the way it runs; with the internet that needs /dev/net/tun."""
+    from super_partner.cli_channels import repair_command
+    host = agent.Workspace(tmp_path, host=True).host_args("true")
+    assert host[host.index("--dev-bind") + 1:host.index("--dev-bind") + 3] == ["/dev", "/dev"] and "--dev" not in host
+    cli = repair_command("codex", ["exec"])
+    assert cli[cli.index("--dev-bind") + 1:cli.index("--dev-bind") + 3] == ["/dev", "/dev"] and "--dev" not in cli
+
+
+@needs_bwrap
 async def test_host_mode_commands_leave_the_sandbox_but_cannot_use_sudo(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-leak")

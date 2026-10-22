@@ -84,3 +84,130 @@ def test_non_cli_nodes_are_unaffected(tmp_path):
     run = cli_run(budget=0.0001)
     assert fallback_executor(tmp_path)._fallback_allowed(run, run.plan.nodes[1])
 
+@pytest.mark.parametrize("unsafe", ["../outside.txt", "/tmp/outside.txt", ".env", ".git/config", "secrets.json", ".super-partner/tasks.db"])
+def test_artifact_paths_cannot_read_private_or_outside_files(tmp_path, unsafe):
+    from super_partner.contracts import ArtifactBlocked, fingerprint
+    from super_partner.models import Artifact
+
+    with pytest.raises(ArtifactBlocked):
+        fingerprint(tmp_path, Artifact(path=unsafe))
+
+
+def test_artifact_directory_does_not_follow_symlinks(tmp_path):
+    from super_partner.contracts import ArtifactBlocked, fingerprint
+    from super_partner.models import Artifact
+
+    root = tmp_path / "work"
+    (root / "coverage.vdb").mkdir(parents=True)
+    (tmp_path / "outside").write_text("outside")
+    (root / "coverage.vdb" / "link").symlink_to(tmp_path / "outside")
+    with pytest.raises(ArtifactBlocked, match="符号链接"):
+        fingerprint(root, Artifact(path="coverage.vdb", kind="directory"))
+
+
+def test_artifact_host_checks_cannot_read_custom_platform_data_names(tmp_path, monkeypatch):
+    from super_partner.config import settings
+    from super_partner.contracts import ArtifactBlocked, fingerprint
+    from super_partner.models import Artifact
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path / "private-store")
+    monkeypatch.setattr(settings, "workspace_root", tmp_path / "all-jobs")
+    monkeypatch.setattr(settings, "database_path", tmp_path / "hidden.sqlite")
+    for name in ("private-store/evidence.txt", "all-jobs/another-task/report.txt", "hidden.sqlite", "hidden.sqlite-wal"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("private-data")
+        with pytest.raises(ArtifactBlocked, match="平台"):
+            fingerprint(tmp_path, Artifact(path=name))
+    own = settings.workspace_root / "this-task"
+    own.mkdir()
+    (own / "report.txt").write_text("own evidence")
+    assert fingerprint(own, Artifact(path="report.txt"))
+
+
+async def test_artifact_cost_reservation_preserves_task_budget_and_declared_cap():
+    import asyncio
+
+    from super_partner.budget import BudgetExceeded, RequestBudget, StepLimitExceeded
+    from super_partner.models import ModelProfile
+
+    model = ModelProfile(id="test:model", provider="test", display_name="test", input_per_million=1, output_per_million=1)
+
+    async def charge(cost):
+        pass
+
+    # Plenty of task budget cannot buy a request forbidden by the work package's limit.
+    budget = RequestBudget({model.id: model}, lambda: 10, {}, charge, asyncio.Event(), step_remaining=lambda: 0.000001)
+    with pytest.raises(StepLimitExceeded):
+        await budget.reserve(model.id, {"input": "test"})
+    # Plenty of step budget cannot bypass the run budget either.
+    budget = RequestBudget({model.id: model}, lambda: 0.000001, {}, charge, asyncio.Event(), step_remaining=lambda: 10)
+    with pytest.raises(BudgetExceeded):
+        await budget.reserve(model.id, {"input": "test"})
+    reservations = {object(): 0.999}
+    budget = RequestBudget({model.id: model}, lambda: 1, reservations, charge, asyncio.Event(), step_remaining=lambda: 0.002)
+    maximum = await budget.reserve(model.id, {"input": "test"}, 4096)
+    assert 1 <= maximum < 1000
+    assert sum(reservations.values()) <= 1
+    budget.release()
+
+
+async def test_artifact_acceptance_keeps_task_network_and_host_permissions(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, mock_acceptance, setup_executor
+
+    checks = []
+    mock_acceptance(monkeypatch, checks)
+    executor, _, _ = setup_executor(tmp_path, monkeypatch, [contract_node()])
+    await executor.execute("artifacts")
+    assert checks == [("validate coverage.vdb", False, False)]
+
+
+async def test_artifact_simultaneous_progress_checks_share_step_reservations():
+    import asyncio
+
+    from super_partner.budget import RequestBudget
+    from super_partner.models import ModelProfile
+
+    model = ModelProfile(id="test:model", provider="test", display_name="test", input_per_million=1, output_per_million=1)
+    reservations, changed = {}, asyncio.Event()
+
+    async def charge(cost):
+        pass
+
+    def budget():
+        return RequestBudget({model.id: model}, lambda: 10, reservations, charge, changed,
+                             step_remaining=lambda: 0.001, scope="node")
+
+    work, check = budget(), budget()
+    await work.reserve(model.id, {"input": "work"}, 1000)
+    pending = asyncio.create_task(check.reserve(model.id, {"input": "check"}, 1000))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    work.release()
+    await asyncio.wait_for(pending, 1)
+    assert sum(reservations.values()) <= 0.001
+    check.release()
+
+
+async def test_artifact_progress_check_cannot_deadlock_waiting_on_its_worker():
+    import asyncio
+
+    from super_partner.budget import RequestBudget, StepReservationBusy
+    from super_partner.models import ModelProfile
+
+    model = ModelProfile(id="test:model", provider="test", display_name="test", input_per_million=1, output_per_million=1)
+    reservations = {}
+
+    async def charge(cost):
+        pass
+
+    def budget(wait):
+        return RequestBudget({model.id: model}, lambda: 10, reservations, charge, asyncio.Event(),
+                             step_remaining=lambda: 0.001, scope="node", wait_for_step=wait)
+
+    worker, checker = budget(True), budget(False)
+    await worker.reserve(model.id, {"input": "work"}, 1000)
+    with pytest.raises(StepReservationBusy):
+        await asyncio.wait_for(checker.reserve(model.id, {"input": "check"}, 1000), 1)
+    worker.release()
+

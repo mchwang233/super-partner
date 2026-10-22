@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from . import contracts
 from .models import ExecutionRun, ModelProfile, NodeStatus, TaskNode
 from .outline import MAX_TASKS
 from .planner import _difficulty, package
@@ -26,7 +27,8 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
     """Apply ``change`` ({"add", "remove", "update"}) to ``run``'s plan in place. ``deciding`` is
     the step the decision is about, which may be changed although it is held as running.
     Returns the titles added, removed and updated."""
-    nodes = {node.id: node for node in run.plan.nodes}
+    # Validate on copies: a rejected edit must not partially mutate the active plan.
+    nodes = {node.id: node.model_copy(deep=True) for node in run.plan.nodes}
 
     def changeable(node_id: str, what: str) -> TaskNode:
         node = nodes.get(node_id)
@@ -37,6 +39,8 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
         return node
 
     removed = [changeable(str(item), "remove") for item in change.get("remove") or []]
+    if any(node.artifact_contract for node in removed):
+        raise PlanError("artifact contract steps cannot be removed to bypass delivery or stop limits")
     gone = {node.id for node in removed}
     add = change.get("add") or []
     if not isinstance(add, list):
@@ -78,6 +82,7 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
             dependencies=resolve(raw.get("dependencies") or [], f"step {raw['key']} dependencies"),
             verifies=resolve(raw.get("verifies") or [], f"step {raw['key']} verifies"),
             needs_workspace=workspace, **_difficulty(raw), **package(raw),
+            **contracts.declarations(raw),
             part_id=str(raw["part"]) if str(raw.get("part")) in parts else default_part,
         ))
 
@@ -86,6 +91,13 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
         node = changeable(str(raw.get("id")), "update")
         if node.id in gone:
             raise PlanError(f"update: step {node.id} is also removed")
+        if node.artifact_contract:
+            if "artifact_contract" in raw and raw["artifact_contract"] != node.artifact_contract.model_dump():
+                raise PlanError("artifact contracts and stop limits cannot be weakened by replanning")
+            if "acceptance_criteria" in raw and raw["acceptance_criteria"] != node.acceptance_criteria:
+                raise PlanError("artifact acceptance criteria must be preserved")
+        elif "artifact_contract" in raw:
+            node.artifact_contract = contracts.declarations(raw)["artifact_contract"]
         for field in ("title", "instructions", "acceptance_criteria"):
             if raw.get(field):
                 setattr(node, field, str(raw[field]).strip()[:120 if field == "title" else 20_000])
@@ -96,13 +108,17 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
             node.dependencies = resolve(raw["dependencies"], f"step {node.id} dependencies")
         updated.append(node)
 
-    remaining = [node for node in run.plan.nodes if node.id not in gone] + added
+    remaining = [node for node in nodes.values() if node.id not in gone] + added
     if len(remaining) > MAX_TASKS:
         raise PlanError(f"a plan may have at most {MAX_TASKS} steps")
     for node in remaining:
         node.dependencies = [item for item in node.dependencies if item not in gone]
         node.verifies = [item for item in node.verifies if item not in gone]
     _check_acyclic(remaining)
+    try:
+        contracts.validate(run.plan.model_copy(update={"nodes": remaining}), partial=True)
+    except contracts.ContractError as exc:
+        raise PlanError(str(exc)) from exc
     for node in added:
         try:
             route_node(node, models, configured, needs_vision)

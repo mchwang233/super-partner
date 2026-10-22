@@ -18,11 +18,12 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field
 
 from . import attachments as files
-from . import briefing, publish
+from . import briefing, folders, learning, publish, retrospect
 from . import diagnosis as diagnosis_module
 from .benchmarks import BenchmarkCatalog
 from .catalog_sync import CatalogSync, seed_catalog
 from .config import settings
+from .contracts import ContractError
 from .db import Database
 from .executor import Executor
 from .models import (
@@ -31,10 +32,12 @@ from .models import (
     DiagnosisMessage,
     Event,
     ExecutionRun,
+    LearningSettings,
     NodeStatus,
     RunStatus,
     SupervisorSession,
 )
+from .outline import INTERNET_NOTE
 from .planner import autonomous_plan
 from .projects import (
     NativePickerError,
@@ -141,6 +144,7 @@ async def lifespan(_: FastAPI):
             db.save_run(run)
     executor.restore_platform()
     executor.restore_engineer()
+    executor.restore_learning()
     try:
         yield
     finally:
@@ -477,17 +481,27 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
     needs_vision = any(item.kind == "image" for item in attached)
     background = change_background(parent) if parent else None
     request = body.prompt + files.describe(attached, with_paths=False)
+    if body.allow_network:
+        # The lead plans within what the steps' sandbox allows (planner.WORK_RULES).
+        request += "\n\n" + INTERNET_NOTE
+    executor.sync_improvements()
+    lessons = learning.selected(db, request)
+    if note := learning.instruction(lessons):
+        request += "\n\n" + note
     # The lead plans from the project brief, so it can cut the work into scoped packages.
     root = Path(project_dir) if project_dir else settings.workspace_root / parent.folder_id if parent else None
     brief, brief_cost = None, 0.0
     if root and root.is_dir() and any(root.iterdir()):
         writer = brief_writer(list(models.values()), configured) if settings.project_brief else None
         brief, brief_cost = await briefing.planning_brief(root, settings.data_dir, providers, writer)
-    plan = await autonomous_plan(
-        f"{background}\n\n新需求：\n{request}" if background else request, list(models.values()), configured, providers,
-        project_context=await asyncio.to_thread(project_context, project_dir) if project_dir else None,
-        session=(session := SupervisorSession()), brief=brief,
-    )
+    try:
+        plan = await autonomous_plan(
+            f"{background}\n\n新需求：\n{request}" if background else request, list(models.values()), configured, providers,
+            project_context=await asyncio.to_thread(project_context, project_dir) if project_dir else None,
+            session=(session := SupervisorSession()), brief=brief,
+        )
+    except ContractError as exc:
+        raise HTTPException(422, {"status": "blocked", "reason": str(exc)}) from exc
     plan.planning_cost_usd = round(plan.planning_cost_usd + brief_cost, 6)
     catalog = list(models.values())
     if parent:
@@ -512,7 +526,11 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
         actual_cost_usd=plan.planning_cost_usd, background=background,
         parent_run_id=parent.id if parent else None, workspace_id=parent.folder_id if parent else None,
         supervisor=session if session.model_id else None,
+        improvement_uses=lessons,
     )
+    if not parent and not project_dir:
+        # A readable folder, not the task's id: 20261021-1441-async-fifo-uvm.
+        run.folder_name = await asyncio.to_thread(folders.task_folder, plan.folder or plan.summary or body.prompt)
     db.save_run(run)
     db.add_event(Event(
         run_id=run.id, kind="plan.created",
@@ -580,6 +598,79 @@ def list_tasks():
     return db.list_runs()
 
 
+@app.get("/api/retrospectives/recurring")
+async def recurring_problems(min_runs: int = 2):
+    """Problems that came up in at least ``min_runs`` finished tasks, most frequent first."""
+    return await asyncio.to_thread(retrospect.recurring, db, max(1, min_runs))
+
+
+@app.get("/api/tasks/{run_id}/retrospective")
+async def task_retrospective(run_id: str):
+    """A finished task's look back: each step's estimate against its cost and turns, and its problems."""
+    body = db.retrospective(run_id) or await asyncio.to_thread(retrospect.record, db, run_id)
+    if body is None:
+        raise HTTPException(404, "Task not found or not finished")
+    return body
+
+
+@app.get("/api/improvements/settings", response_model=LearningSettings)
+def learning_settings():
+    return learning.preferences(db)
+
+
+@app.put("/api/improvements/settings", response_model=LearningSettings)
+def set_learning_settings(body: LearningSettings):
+    db.save_learning_settings(body.model_dump())
+    return body
+
+
+def improvement_view(item):
+    job = db.get_engineer_job(item.engineer_job_id) if item.engineer_job_id else None
+    return {**item.model_dump(mode="json"), "effects": db.improvement_effects(item.id),
+            "engineer_job": job.model_dump(mode="json") if job else None}
+
+
+@app.get("/api/improvements")
+def list_improvements():
+    executor.sync_improvements()
+    return [improvement_view(item) for item in db.improvements()]
+
+
+@app.get("/api/tasks/{run_id}/learning")
+def task_learning(run_id: str):
+    run = get_task(run_id)
+    executor.sync_improvements()
+    return {"review": db.learning_review(run_id),
+            "retrospective": db.retrospective(run_id) or retrospect.record(db, run_id),
+            "improvements": [improvement_view(item) for item in db.improvements(run_id)],
+            "applied": [{"id": use["id"], "title": use["title"], "node_ids": use.get("node_ids", []),
+                         "planning": use.get("planning", False), "source_run_id": use["run_id"]}
+                        for use in run.improvement_uses]}
+
+
+@app.post("/api/tasks/{run_id}/learning", status_code=202)
+async def start_task_learning(run_id: str):
+    get_task(run_id)
+    try:
+        return executor.start_learning(run_id, manual=True)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/improvements/{item_id}/disable")
+def disable_improvement(item_id: str):
+    item = db.improvement(item_id)
+    if not item:
+        raise HTTPException(404, "找不到改进项。")
+    if item.kind == "platform":
+        raise HTTPException(409, "已应用的平台改动需要通过平台工程师回退；未应用的工作可在工程师中放弃。")
+    if item.status != "active":
+        raise HTTPException(409, "只能停用已生效的 Skill 或执行规则。")
+    item.status = "disabled"
+    db.save_improvement(item)
+    return item
+
+
 @app.get("/api/tasks/{run_id}", response_model=ExecutionRun)
 def get_task(run_id: str):
     run = db.get_run(run_id)
@@ -590,9 +681,14 @@ def get_task(run_id: str):
 
 @app.delete("/api/tasks/{run_id}", status_code=204)
 async def delete_task(run_id: str):
-    if any(task and not task.done() for task in (executor.tasks.get(run_id), executor.diagnosing.get(run_id))):
+    if any(task and not task.done() for task in (executor.tasks.get(run_id), executor.diagnosing.get(run_id),
+                                               executor.learning_tasks.get(run_id))):
         raise HTTPException(409, "任务仍在执行或结束处理中，请稍后再删除。")
     existing = db.get_run(run_id)
+    if any(job.run_id == run_id and job.improvement_id and job.status not in {"applied", "failed", "rejected", "cancelled"}
+           for job in db.engineer_jobs(1000)):
+        raise HTTPException(409, "该任务的改进仍由平台工程师处理，请完成或放弃后再删除。")
+    learned_skills = [item.id for item in db.improvements(run_id) if item.kind == "skill"]
     deleted_attachments = existing.attachments if existing else []
     try:
         deleted = db.delete_run(run_id)
@@ -600,7 +696,11 @@ async def delete_task(run_id: str):
         raise HTTPException(409, str(exc)) from exc
     if not deleted:
         raise HTTPException(404, "Task not found")
+    shutil.rmtree(Path(settings.data_dir) / "traces" / run_id, ignore_errors=True)
+    for item_id in learned_skills:
+        shutil.rmtree(Path(settings.data_dir) / "learned-skills" / item_id, ignore_errors=True)
     executor.tasks.pop(run_id, None)
+    executor.learning_tasks.pop(run_id, None)
     executor.locks.pop(run_id, None)
     executor.reservations.pop(run_id, None)
     executor.budget_events.pop(run_id, None)
@@ -850,6 +950,10 @@ async def cancel_task(run_id: str):
     db.save_run(run)
     db.add_event(Event(run_id=run.id, kind="run.cancelled"))
     executor.cancel(run.id)
+    if not (task := executor.tasks.get(run.id)) or task.done():
+        # Nothing was running to stop: look back on the task now (otherwise the executor does).
+        retrospect.record(db, run.id)
+        executor.finish_learning(run.id)
     return run
 
 

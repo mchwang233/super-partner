@@ -205,3 +205,16 @@ def test_reviews_also_go_to_api_models_first():
     configured = {"cli:claude", "openai:gpt-5.6-luna"}
     assert pick_reviewer(models, configured, exclude="openai:gpt-6", tokens=1000).id == "openai:gpt-5.6-luna"
     assert pick_reviewer(models, {"cli:claude"}, exclude=None, tokens=1000).id == "cli:claude"
+async def test_artifact_invalid_plan_is_returned_as_blocked_not_an_executable_fallback(task_api, monkeypatch):
+    from super_partner.contracts import ContractError
+
+    api, client = task_api
+
+    async def invalid(*args, **kwargs):
+        raise ContractError("missing accepted report dependency")
+
+    monkeypatch.setattr(api, "autonomous_plan", invalid)
+    response = await client.post("/api/tasks", json={"prompt": "Generate a coverage report", "budget_usd": 1})
+    assert response.status_code == 422
+    assert response.json()["detail"]["status"] == "blocked"
+    assert "report dependency" in response.json()["detail"]["reason"]

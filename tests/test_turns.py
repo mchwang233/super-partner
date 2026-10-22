@@ -116,3 +116,66 @@ async def test_a_verifier_out_of_turns_is_retried_without_sending_back_the_work_
     # Two turn limits on the flash model hand the verification to the stronger CLI.
     assert [a.model_id for a in check.attempts] == ["x:flash", "x:flash", "cli:claude"]
     assert check.status == NodeStatus.SUCCEEDED
+
+
+async def test_artifact_turn_limit_accumulates_across_retries_and_cannot_be_reset_by_resume(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+
+    async def no_output(*args):
+        pass
+
+    node = contract_node(contract={"max_turns": 2})
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [node], no_output)
+    monkeypatch.setattr(settings, "max_node_attempts", 10)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    node = run.plan.nodes[0]
+    assert node.status == NodeStatus.BLOCKED and node.contract_turns == 2
+    assert providers.calls == ["vdb", "vdb"]
+    assert [a.outcome for a in node.attempts] == ["unverified", "stopped"]
+    assert "轮次上限" in node.review and node.attempts[-1].tool_calls
+    assert run.actual_cost_usd == pytest.approx(sum(a.cost_usd for a in node.attempts))
+    run.status, node.status = RunStatus.QUEUED, NodeStatus.PENDING
+    node.failed_attempts = 0
+    db.save_run(run)
+    await Executor(db, providers, executor.model_lookup).execute("artifacts")
+    assert providers.calls == ["vdb", "vdb"]
+    assert db.get_run("artifacts").plan.nodes[0].attempts[-1].outcome == "stopped"
+
+
+async def test_artifact_cost_limit_stops_instead_of_budget_pause_or_retry(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+
+    async def no_output(*args):
+        pass
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch,
+                                           [contract_node(contract={"max_cost_usd": 0.002})], no_output)
+    monkeypatch.setattr(settings, "auto_diagnose", True)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.INCOMPLETE
+    assert providers.calls == ["vdb"] and run.actual_cost_usd == pytest.approx(0.002)
+    node = run.plan.nodes[0]
+    assert node.attempts[-1].outcome == "stopped" and "费用上限" in node.review
+    assert node.contract_cost_usd == pytest.approx(0.002)
+
+
+async def test_artifact_quota_error_at_declared_limit_stops_before_switching_models(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.quota import ModelUnavailable
+
+    async def unavailable(node, workspace, kwargs):
+        error = ModelUnavailable("test:worker", datetime.now(timezone.utc), "quota exhausted")
+        error.usage = ProviderResult("", 1000, 1000, "test:worker", turns=1)
+        raise error
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch,
+                                           [contract_node(contract={"max_turns": 1})], unavailable)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.INCOMPLETE
+    assert providers.calls == ["vdb"] and run.plan.nodes[0].attempts[-1].outcome == "stopped"
+    assert run.plan.nodes[0].attempts[-1].cost_usd == pytest.approx(0.002)

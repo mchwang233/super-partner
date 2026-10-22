@@ -28,7 +28,20 @@ WAITING = "It is now waiting for its model's reply to one request: {minutes:.0f}
 # and again at every further multiple; how the error reads when the lead stops it.
 OVERRUN_FACTOR = 2
 OVERRUN = "超出预计轮数，负责人已停止这次尝试："
+CRITICAL_OVERRUN = "这一步挡着后面的步骤，用时远超预期，负责人已停止这次尝试（可以换更快的模型）："
 EXPECTED_TURNS = {"easy": 10, "normal": 15, "hard": 25}
+
+
+def limit_reason(node: TaskNode) -> Optional[str]:
+    """Hard declared limits survive retries, rework and model switches."""
+    contract = node.artifact_contract
+    if not contract:
+        return None
+    if node.contract_turns >= contract.max_turns:
+        return f"达到声明轮次上限 {contract.max_turns}，停止工作包；保留产物与日志供诊断。"
+    if node.contract_cost_usd >= contract.max_cost_usd:
+        return f"达到声明费用上限 ${contract.max_cost_usd:g}，停止工作包；保留产物与日志供诊断。"
+    return None
 
 
 def expected_turns(node: TaskNode) -> Optional[int]:

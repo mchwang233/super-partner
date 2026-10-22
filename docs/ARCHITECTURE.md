@@ -8,7 +8,9 @@ Keep it current: a change that moves a responsibility updates this file in the s
 ```
 api.create_task ── planner.autonomous_plan ── routing.route_node        (plan, pick a model per step;
                                                                          with a lead: major parts only, outline.py)
-api.confirm_task ── Executor.execute ── _dispatch                       (run ready steps in parallel;
+api.confirm_task ── Executor.execute ── _preflight                     (check sandbox, tools, internet, models first:
+                                         │                                preflight.py; repair once, else pause)
+                                         └─ _dispatch                    (run ready steps in parallel;
                                           └─ _split_parts               split every major part at once, refining.py)
   _execute_node ── _work ── _complete ── providers.complete             (one attempt of one step)
                                           ├─ cli_channels  (membership CLIs: claude, codex, ...)
@@ -23,7 +25,16 @@ api.confirm_task ── Executor.execute ── _dispatch                       
      └─ STATUS: PLATFORM_REPAIR ── _fix_platform ── platform_repair     (fix Super Partner itself)
   all steps done ── _final_review (the lead: done / rework / replan) ── succeeded
   run ends: succeeded / failed / incomplete (_end_incomplete) / paused
+  finished run ── retrospect.record ── Learning.finish_learning (when enabled)
+    └─ _learn: conclusion + improvement items ── independent validation ── active skill/rule
+       └─ platform item ── engineer (copy, tests, activation; automatic when configured, even after source-task cancellation)
+    next task: selected / attach ── planning and step instructions ── observe (before/after)
 ```
+
+Retrospective analysis and lesson validation use `learning.strongest_model`: highest overall
+capability, then planning and reliability; a different validator only among equally strong models.
+Calls use separate empty conversations and diagnosis reasoning effort, with the existing budget,
+availability, context and task CLI-permission checks.
 
 ## Who owns what
 
@@ -31,12 +42,17 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 |---|---|---|
 | HTTP API, task lifecycle endpoints | `api.py` | `create_task`, `follow_up_task`, `resume_task`, `reopen_node`, `reply_to_diagnosis`, `set_network_access` |
 | Records and statuses | `models.py` | `RunStatus`, `NodeStatus`, `Outcome` (attempt outcomes), `DiagnosisStatus`, `FINISHED`, `TaskNode`, `NodeAttempt`, `Diagnosis`, `ExecutionRun` |
-| Storage (SQLite, JSON bodies) | `db.py` | `Database.save_run`, `get_run`, events |
+| Declared artifact handoffs and stop limits | `contracts.py`, `models.py` | Optional `TaskNode.artifact_contract` (`ArtifactContract`: stage, external/dependency inputs, file/directory outputs, acceptance commands, blocking conditions, total turns/cost); `plan_problems`, `prepare`, `delivery_snapshot`, `accepted`; `ArtifactEvidence`, persistent `contract_turns/contract_cost_usd` |
+| Storage (SQLite, JSON bodies) | `db.py` | `Database.save_run`, `get_run`, events, `save_retrospective` |
+| Skills for the steps: SKILL.md files with the `tools` they cover, general in `skills/steps/`, this machine's in `<data_dir>/skills/` (first); a step is given those whose tools it names | `skills.py` | `library`, `for_step` (`quality.node_prompt`), `section`, `save_machine` |
+| The check before a task's first step, in a real step sandbox with the task's settings: the sandbox's output and exit code, the tools the lead listed (`TaskPlan.requires`, from `OUTLINE_PROMPT`) and, as warnings, the programs the steps' checks call, the internet, each API model; one environment repair, then a pause with what is missing (going on runs anyway); then this machine's skill for each special tool the task needs, written by a model trying it in a step's sandbox and kept for later tasks (`_prepare_skills`, `needed_tools`, `tool_groups`, `skill_prompt`; setting `preflight_skills`) | `preflight.py` (mixed into `Executor`) | `Preflighting._preflight`, `sandbox_checks`, `tool_commands`, `_model_checks`, `_preflight_repair`, `repair_prompt`; `ExecutionRun.preflight`, settings `preflight`, `preflight_command_timeout`, `preflight_network_url` |
+| Looking back on finished tasks: each step's estimate against its cost and turns, its problems named by kind and key, counted across tasks, marked when they come back after a repair; a diagnosis is told the same problem's earlier cases | `retrospect.py` | `record` (on `END_EVENTS` in `Executor.emit`, and on cancel), `review`, `repaired_areas`, `program`, `recurring`, `similar` (`diagnosis.repair_prompt` `history`); API `/api/retrospectives/recurring`, `/api/tasks/{id}/retrospective` |
+| Turning retrospectives into verified improvements: separate bounded budget, recorded evidence, sandbox checks for skills, independent review for skills/advisory rules, platform engineer jobs for source/platform rules; immutable lesson snapshots in later plans and steps, comparisons only with the same model/difficulty mix | `learning.py` (mixed into `Executor`) | `Learning.finish_learning`, `start_learning`, `_learn`, `_validate_lesson`, `_learning_engineer`, `restore_learning`, `sync_improvements`; `selected`, `attach`, `instruction`, `observe`; `LearningSettings`, `LearningReview`, `Improvement`, `ExecutionRun.improvement_uses`; tables `learning_reviews`, `improvements`, `improvement_effects`, `learning_settings`; API `/api/tasks/{id}/learning`, `/api/improvements`, `/api/improvements/settings`, `/api/improvements/{id}/disable`; `docs/design/continuous-improvement.md` |
 | Planning | `planner.py` | `autonomous_plan` (by the lead when one is available: `_plan_as_lead`), `_validate_plan` (flat plan, when no lead plans), `task_node`, `WORK_RULES`; project work as small packages (`TaskNode.files/reads/provides/check`, `package`, `scope_problems` sends broad steps back to the lead) |
 | The lead plans top-down (docs/design/plan-parts.md): before the run, major parts (大项) by function with their contracts (`provides`); each part later split level by level until every piece is an independent task | `outline.py` | `plan_outline`, `OUTLINE_PROMPT`, `refine`, `part_opening`, `refine_message`, `siblings`, `task_problems`, `Tree`, `link` (a wait on a part becomes a wait on its last tasks), `waits_on_unsplit`, `MAX_DEPTH`, `MAX_TASKS`, `task_problems` (sends back a split with a line of `CHAIN_LIMIT` waits, `longest_chain`, or far more tasks than the part's `size`); `TaskPlan.parts/request/in_project/unsplit_cost`, `PlanPart.status/size/provides`, `TaskNode.part_id`, `TaskPlan.part_path`; estimate `routing.part_estimate`, `fit_and_route` |
 | Splitting a running task's major parts into tasks, all at once, each in its own lead conversation; a part that cannot be split pauses the task | `refining.py` (mixed into `Executor`) | `_split_parts` (from `_dispatch`), `_split_part`, `PREFIX`; events `part.refining`, `part.refined`, `part.refine_failed` |
 | The task's lead: one conversation from planning to the end (docs/design/supervisor.md) | `supervisor.py` | `candidates`, `ask`, `handover`, `trim`; `Executor.ask_lead`, `ProviderRegistry.converse`, `CliChannelRegistry.converse`, `ExecutionRun.supervisor` |
-| Model choice | `routing.py` | `route_node` (first pick), `strongest_for` (retry), `stronger_than` (escalation), `spread_to` (a step past its provider's share of the running steps, `Executor._spread`, settings `max_steps_per_provider` (off by default), `spread_cost_factor`), `pick_reviewer` (the cheapest model no weaker overall than the one checked, `CapabilityScore.overall`), `diagnosers`; `node_cost` (an API model's tool loop turn by turn, cached input at the cache price: `LOOP_*`), `reestimate` (after splitting or replanning) |
+| Model choice | `routing.py` | `route_node` (first pick; a hard step takes the cheapest within `hard_score_margin` of the best, `close_to_best`), `strongest_for` (retry), `stronger_than` (escalation), `spread_to` (a step past its provider's share of the running steps, `Executor._spread`, settings `max_steps_per_provider` (off by default), `spread_cost_factor`), `pick_reviewer` (the cheapest model no weaker overall than the one checked, `CapabilityScore.overall`), `diagnosers`; `node_cost` (an API model's tool loop turn by turn, cached input at the cache price: `LOOP_*`), `reestimate` (after splitting or replanning) |
 | Scheduling, attempts, step outcomes | `executor.py` | `Executor`; see "Executor" below |
 | Reviewing a result | `review.py` (mixed into `Executor`) | `_check`, `_reviewer`, `MAX_BACKUPS` |
 | The lead's decisions after a failed attempt, and its questions to the user; while it decides, `ExecutionRun.lead_thinking` (`_thinking`); a repair it asks for (`Diagnosis.trigger == "lead_repair"`, `decision_id`) comes back to it (`_after_repair`) before the step runs again | `leading.py` (mixed into `Executor`) | `_decide`, `_ask_for_decision`, `_apply_decision`, `_after_repair`, `_decisions_left`, `start_lead_answer`, `start_lead_chat`; prompts in `supervisor.failure_message`, `repair_message`, `parse_decision` |
@@ -47,14 +63,15 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | What happens after a failure without a lead (fallback: retry model, meaning of a diagnosis) | `recovery.py` | `retry_model`, `failed_models`, `after_diagnosis`, `turns_for`, `MODEL_FAILURES` |
 | Prompts for steps and reviews, verdict parsing | `quality.py` | `node_prompt`, `continue_prompt`, `attempt_notes`, `review_prompt`, `parse_review`, `UNABLE_RULE`, `unable_claim`, `retry_feedback` |
 | Diagnosis prompts and parsing | `diagnosis.py` | `prompt`, `repair_prompt`, `platform_instructions`, `parse`, `STATUS` |
-| API model calls, output caps, tool loop | `providers.py` | `ProviderRegistry.complete`, `_send`, `output_ceiling`, `_loop`, `_answer` (thinking written into the content, as MiniMax does, stays in the history only), `_cache_point` (Anthropic: the system prompt and the newest message marked for the prompt cache), `reasoning_fields` (the step's reasoning effort in each API's own fields; a model that rejects it is sent none, `no_effort`), `Conversation` (a step's next attempt continues it; chosen by `Executor._conversation`) |
+| API model calls, output caps, tool loop | `providers.py` | `ProviderRegistry.complete`, `_send`, `output_ceiling`, `_loop`, `_answer` (thinking written into the content, as MiniMax does, stays in the history only), `_cache_point` (Anthropic: the system prompt and the newest message marked for the prompt cache), `reasoning_fields` (the step's reasoning effort in each API's own fields; a model that rejects it is sent none, `no_effort`), `Conversation` (a step's next attempt continues it; chosen by `Executor._conversation`); every tool call in full to the attempt's trace file (`_trace`, `NodeAttempt.trace`, `executor.trace_path`, kept by `Executor._take_log` however the attempt ends) |
 | Streamed replies (server-sent events) put back together into the provider's non-streamed reply; a request stops only when nothing arrives for `api_reply_deadline` (`ProviderRegistry._post`, `_stream`, `StreamSilent`) | `streaming.py` | `openai`, `anthropic`, `gemini`, `events`, `StreamError` |
-| CLI model calls and their sandboxes | `cli_channels.py` | `CliChannelRegistry.complete`, `_with_network`, `repair_command` |
+| CLI model calls and their sandboxes | `cli_channels.py` | `CliChannelRegistry.complete`, `_with_network`, `repair_command` (the real /dev), `codex_settings` (Codex runs with the platform's reasoning effort, the lead's service tier, and without the user's plugins, apps and MCP servers: `CODEX_EXTRAS`, `codex_servers`); what a CLI step is told about its sandbox: `quality.cli_environment` |
+| Readable folder names (`20261021-1441-async-fifo-uvm`) for tasks and leads; leads' folders outside any project | `folders.py` | `task_folder` (`ExecutionRun.folder_name`, from the outline's `folder`), `lead_folder`, `lead_root` (setting `lead_root`) |
 | Project brief for planning (file summaries by the cheapest API model, refreshed for changed files only), and the files a step is given: a package's own files in full, otherwise the file list and the files it names | `briefing.py` | `planning_brief`, `refresh`, `render`, `attached_files`, `likely_files`; `Executor._with_files`, `quality.scope_section`, `routing.brief_writer` |
 | A work package far past its expected turns goes to the lead (continue, or stop and then split) | `progress.py`, `review.py` | `expected_turns`, `OVERRUN_FACTOR`; `_overrun_check`, `supervisor.overrun_message` |
 | Steps in one project at once: disjoint package files run together, unscoped steps alone | `scopes.py` | `FolderLock.hold`, `Scope.clashes`, `Scope.own`; `Executor._work` |
-| Tools and sandbox for API models: Claude Code's tools (Bash, Read, Write, Edit, MultiEdit, Glob, Grep, LS); Bash keeps its directory and the attempt's /tmp, which the file tools reach as /tmp too; the sandbox hides the platform's data folder, the other tasks' folders and the database (`Workspace._platform_data`) | `agent.py` | `TOOLS`, `Workspace.run`, `run_all` (reads at once), `bash`, `project_map`, `sandbox_args`, `network_prefix`; history compaction `providers.compact`; effort by difficulty `settings.reasoning_by_difficulty` |
-| Checking long attempts instead of turn limits and timeouts | `progress.py` | `check_prompt`, `parse`, `api_evidence`, `cli_evidence`, `Stopped`; the check itself is `Executor._progress_watch` (review.py) |
+| Tools and sandbox for API models: Claude Code's tools (Bash, Read, Write, Edit, MultiEdit, Glob, Grep, LS); Bash keeps its directory and the attempt's /tmp, which the file tools reach as /tmp too, and captures output through a file (under uvloop a pipe is a socket, whose output pasta lost); the sandbox hides the platform's data folder, the other tasks' folders and the database (`Workspace._platform_data`) | `agent.py` | `TOOLS`, `Workspace.run`, `run_all` (reads at once), `bash`, `project_map`, `sandbox_args`, `network_prefix`; history compaction `providers.compact`; effort by difficulty `settings.reasoning_by_difficulty`, for leads `lead_reasoning_effort`, for diagnoses `diagnosis_reasoning_effort`; with the internet the step stays the user, not root (`maps_user`); what a step is told about its sandbox: `AGENT_INSTRUCTIONS`, repairs `HOST_INSTRUCTIONS` |
+| Checking long attempts by default; explicit artifact contracts have hard cumulative limits; a step others wait for far past its expected minutes goes to the lead (`Review._critical_check`, `supervisor.critical_overrun_message`) | `progress.py` | `check_prompt`, `parse`, `api_evidence`, `cli_evidence`, `Stopped`, `limit_reason`; the check itself is `Executor._progress_watch` (review.py) |
 | Per-request budget reservations, cost of a call | `budget.py` | `RequestBudget.reserve`, `token_cost` (cached input at the cache price; `providers.cached_tokens`) |
 | Quota / outage detection and cooldown | `quota.py` | `QuotaTracker.classify`, `mark`, `exhausted` |
 | Shared machine fixes (tools dir, env) | `environment.py` | `tools_dir`, `command_env`, `profiles`, `shell_setup` (scripts each step command sources first: setting `sandbox_profiles` or `"profiles"` in `sandbox.json`), `host_ports` (with `license_daemon_ports`: a license server's vendor daemons, from lmgrd's process tree in /proc, or for an lmgrd of another user by tracing `lmutil lmstat`: `_probe`, cached `PROBE_TTL`) |
@@ -68,7 +85,7 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 `Executor` (`executor.py`) mixes in `Reviewing` (`review.py`), `Leading` (`leading.py`), `Diagnosing`
 (`diagnosing.py`), `SelfRepair` (`self_repair.py`), `Engineering` (`engineer.py`) and `Refining` (`refining.py`); they share its state (`db`, `locks`, `_complete`, `_save`, `emit`).
 
-- `execute` / `_dispatch`: the run loop; starts ready nodes up to `max_parallel_nodes`.
+- `execute` / `_dispatch`: the run loop; starts every ready node, or up to `max_parallel_nodes` when that is set (0, the default: no limit).
 - `_execute_node`: one attempt; exceptions map to outcomes (`budget`, `error`, quota → `_switch_model`).
 - `_check` (review.py): review or verification verdict; `quality.Verdict(passed, reason, fix, unable, ...)`.
 - `_finish`: appends the `NodeAttempt` with an `Outcome`.
@@ -85,6 +102,33 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 - `_fix_platform` → `platform_repair.check` → `_activate_platform` (self_repair.py): self-repair,
   applied by restart.
 
+Artifact work packages add gates without replacing the original acceptance criteria, task budget,
+or sandbox permissions. Planning separates VDB collection, URG text reports and delivery audit
+when these jobs are requested; it does not require all three for a report from an existing VDB,
+a collection-only request, or unrelated coverage work. Flat planning, part refinement and replanning
+share `contracts` validation; an invalid contract cannot fall back to an unbounded plan. Dependency
+inputs must name an ancestor's declared output; external inputs need no producer. Outputs are
+allowed to be absent before the step runs. VDBs are directories; overlapping directory/file scopes
+are serialized by `scopes.py`.
+
+`Executor._work` records the input fingerprints and the generation's output baseline before a
+contracted step runs. `Reviewing._artifact_check` checks nonempty, fresh files/directories and runs
+the declared commands through the ordinary `agent.Workspace` sandbox. Command results are saved in
+the attempt trace and `ArtifactEvidence`, then the original review still applies. A consumer checks
+the producer's accepted evidence and current fingerprints (including transitive inputs), so a changed
+VDB invalidates its old report. Evidence paths reject traversal, symlinks and private files. A missing
+audit output does not send already accepted upstream work back for rework.
+
+`RequestBudget` preserves run-wide reservations and additionally caps a contracted step's calls,
+including its reviews/progress checks. Calls for that step share reservations. Worker turns and all
+associated API charges are persisted at each request and survive retry, model switch, rework and
+restart. A hard turn cap makes no extra paid summary request. CLI or tool-less channels that cannot
+enforce it return `blocked`. Missing prerequisites or an explicit `BLOCKED` result also block; a
+limit without accepted delivery records `Outcome.STOPPED`. `_stop_contract` preserves the attempt,
+logs, charges and a deterministic task diagnosis, blocks consumers and ends incomplete without
+automatic diagnosis/retry. Lead acceptance and replanning cannot erase these gates or limits.
+Legacy records have no contract and retain their existing execution policy.
+
 ## Tests
 
 | Area | Tests |
@@ -94,11 +138,18 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 | Unable steps | `test_unable.py` |
 | Network, sandbox, tools | `test_network.py`, `test_agent.py`, `test_safety.py` |
 | Providers, output caps | `test_providers.py`, `test_streaming.py`, `test_quota.py` |
+| Looking back on tasks | `test_retrospect.py` |
+| Learning from finished tasks, validation, budget, reuse, effect comparisons | `test_learning.py`, `test_engineer.py` (automatic platform improvements) |
+| Folder names | `test_folders.py` |
+| Steps others wait for | `test_critical_path.py` |
+| The check before the first step | `test_preflight.py` |
+| Skills | `test_skills.py` |
 | Spreading steps over providers | `test_spread.py` |
 | Progress checks | `test_progress.py` |
 | The lead's conversation | `test_supervisor.py` |
 | The lead's decisions | `test_leading.py`, `test_replan.py` (plan changes, final review) |
 | Planning in parts | `test_outline.py`, `test_packages.py` |
+| Artifact contracts, freshness, audit gates and cumulative limits (temporary files and fake models, no URG dependency) | `test_packages.py`, `test_outline.py`, `test_replan.py`, `test_executor.py`, `test_turns.py`, `test_progress.py`, `test_review_evidence.py`, `test_leading.py`, `test_safety.py`; helpers in `artifact_helpers.py` |
 | Review prompts and evidence | `test_quality.py`, `test_review_evidence.py` |
 | Platform self-repair | `test_platform_repair.py` |
 | The platform engineer | `test_engineer.py` |
@@ -109,8 +160,17 @@ api.confirm_task ── Executor.execute ── _dispatch                       
 Commands: `python -m pytest -q tests/test_x.py` (one area), `python -m pytest -q` (all backend,
 about 35 s), `cd frontend && npm test` and `npm run build` (only when the frontend changed).
 
+Live network sandbox tests use `tests/conftest.py`'s `network_enabled` fixture to honor the
+validation controller's `SUPER_PARTNER_VALIDATION_ALLOW_NETWORK` setting. Tests with both offline
+and online cases request it only for the online case, so offline command checks still run.
+`test_platform_repair.py` exercises these gates with simulated workspaces and both permissions;
+it needs neither a real network namespace nor a TUN device.
+
 ## Frontend (`frontend/`)
 
 `src.tsx` (app shell, task creation, actions), `lead.tsx` (the task's conversation, in its own "对话" tab that opens when it waits for you: the lead's decisions, questions and messages), `lead-engineer.tsx` (the platform engineer in that conversation: its jobs' lines and cards, @平台工程师, bringing it in), `engineer-bubble.tsx` (the platform engineer's own chat, from a bubble in the page's corner; no navigation entry), `result-page.tsx` (results, requirement change),
 `plan-parts.tsx` (the progress view: major parts as stages that open in place, `PlanView`), `plan-graph.tsx` (steps and attempts), `engineer.tsx` (the platform engineer's page), `diagnosis.tsx` (diagnosis chat), `mission-history.tsx`
 (task list), `model-profiles.tsx` (models), `style.css` (tokens and styles).
+
+`retrospective.tsx` is the result page's “复盘与改进” tab: learning settings and budget, conclusions,
+items and validation evidence, platform-job progress, lessons used, effect comparisons and disabling future use.

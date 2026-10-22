@@ -25,12 +25,18 @@ class Scope:
     def clashes(self, other: Scope) -> bool:
         if self.everything or other.everything:
             return True
-        return bool(self.writes & (other.writes | other.reads) or self.reads & other.writes)
+        def overlap(left, right):
+            return any(a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
+                       for a in left for b in right)
+        return overlap(self.writes, other.writes | other.reads) or overlap(self.reads, other.writes)
 
 
 def of(node) -> Scope:
     """A step's scope: its package's files; nothing for a step that writes no files (a review or
     summary); everything for one that writes files the planner did not name."""
+    if node.artifact_contract:
+        return Scope(list(set(node.files) | {item.path for item in node.artifact_contract.outputs}),
+                     list(set(node.reads) | {item.path for item in node.artifact_contract.inputs}))
     if node.files or node.reads:
         return Scope(node.files, node.reads)
     return Scope() if writes_files(node) else Scope([], [])

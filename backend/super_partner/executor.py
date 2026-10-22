@@ -6,17 +6,30 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
-from . import briefing, outline, progress, quality, scopes, supervisor
-from .budget import BudgetExceeded, RequestBudget, token_cost
+from . import (
+    briefing,
+    contracts,
+    learning,
+    outline,
+    progress,
+    quality,
+    retrospect,
+    scopes,
+    supervisor,
+)
+from .budget import BudgetExceeded, RequestBudget, StepLimitExceeded, token_cost
 from .cli_channels import CLI_SPECS
 from .config import settings
 from .db import Database
 from .diagnosing import Diagnosing
 from .engineer import Engineering
 from .leading import Leading
+from .learning import Learning
 from .models import Diagnosis, Event, ExecutionRun, NodeAttempt, NodeStatus, Outcome, RunStatus
 from .platform_repair import PlatformRepairs
+from .preflight import Preflighting
 from .projects import git_snapshot
 from .providers import Conversation, ProviderRegistry
 from .quota import ModelUnavailable, failure_kind
@@ -45,7 +58,12 @@ CHARS_PER_TOKEN = 3
 DEFAULT_CONTEXT = 128_000
 
 
-class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining):
+def trace_path(run_id: str, node_id: str, attempt: int) -> Path:
+    """Where an attempt's full tool trace goes: under the data folder, which steps cannot read."""
+    return Path(settings.data_dir).resolve() / "traces" / run_id / f"{node_id}-{attempt}.jsonl"
+
+
+class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining, Preflighting, Learning):
     """Runs a task's steps: scheduling, attempts, retries and step outcomes. Reviewing
     (review.py), the lead's decisions (leading.py), diagnosing (diagnosing.py), self-repair
     (self_repair.py), the platform engineer (engineer.py) and splitting major parts into tasks
@@ -56,6 +74,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         self.providers = providers
         self.model_lookup = model_lookup
         self.tasks: dict[str, asyncio.Task] = {}
+        self.learning_tasks: dict[str, asyncio.Task] = {}
+        self.closing = False
         self.diagnosing: dict[str, asyncio.Task] = {}
         self.locks: dict[str, asyncio.Lock] = {}
         # One message at a time in each task's conversation with its lead.
@@ -67,6 +87,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         self.node_tasks: dict[tuple[str, str], asyncio.Task] = {}
         # Tool calls of each node's attempt in progress, written onto the attempt when it ends.
         self.tool_logs: dict[tuple[str, str], list[dict]] = {}
+        # Where each running attempt writes its full tool trace (NodeAttempt.trace).
+        self.tool_traces: dict[tuple[str, str], Path] = {}
         # Each step's conversation with its API model, continued by its next attempt.
         self.conversations: dict[tuple[str, str], Conversation] = {}
         self.reservations: dict[str, dict] = {}
@@ -99,7 +121,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 task.cancel()
 
     async def shutdown(self) -> None:
+        self.closing = True
         tasks = set(self.tasks.values()) | set(self.diagnosing.values())
+        tasks |= set(self.learning_tasks.values())
         tasks |= {task for task in (self.maintenance_task, self.engineer_task) if task}
         for task in tasks:
             if not task.done():
@@ -108,6 +132,10 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
 
     def emit(self, run_id: str, kind: str, **data) -> None:
         self.db.add_event(Event(run_id=run_id, kind=kind, data=data))
+        if kind in retrospect.END_EVENTS:
+            # The task has ended: look back on it while its records are fresh.
+            retrospect.record(self.db, run_id)
+            self.finish_learning(run_id)
 
     async def execute(self, run_id: str) -> None:
         run = self.db.get_run(run_id)
@@ -128,6 +156,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 run.id, "workspace.snapshot", project_dir=run.project_dir,
                 **await asyncio.to_thread(git_snapshot, Path(run.project_dir)),
             )
+        if not await self._preflight(run_id):
+            return  # paused: something the task needs is missing (preflight.py)
         running: dict[asyncio.Task, str] = {}
         try:
             while True:
@@ -166,7 +196,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                         f"{node.title}（{(node.review or (node.attempts[-1].reason if node.attempts else '') or '未知原因')[:160]}）"
                         for node in failed
                     ))
-                unable = [node for node in run.plan.nodes if node.status == NodeStatus.UNABLE]
+                unable = [node for node in run.plan.nodes if node.status in {NodeStatus.UNABLE, NodeStatus.BLOCKED}]
                 if unable:
                     self._end_incomplete(run, unable)
                     return
@@ -193,6 +223,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                     if node.status == NodeStatus.RUNNING:
                         node.status = NodeStatus.CANCELLED
                 self._save(run)
+                # With the cancelled steps' attempts recorded, the task can be looked back on.
+                retrospect.record(self.db, run_id)
+                self.finish_learning(run_id)
             raise
         except Exception as exc:
             await self._stop_nodes(running)
@@ -245,7 +278,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         held_back = False
         for node in ready:
             # Splits at work do not count: they are the lead's conversations, not steps.
-            if sum(not item.startswith(PREFIX) for item in running.values()) >= settings.max_parallel_nodes:
+            limit = settings.max_parallel_nodes
+            if limit and sum(not item.startswith(PREFIX) for item in running.values()) >= limit:
                 break
             if node.estimated_cost_usd and reserved + node.estimated_cost_usd > run.budget_usd:
                 held_back = True
@@ -325,7 +359,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 current = next(n for n in latest.plan.nodes if n.id == node_id)
                 if len(current.attempts) == len(node.attempts):
                     current.attempts.append(NodeAttempt(model_id=node.model_id, outcome=Outcome.SUPERSEDED if current.generation != generation else Outcome.CANCELLED,
-                                                        reason="上游返工或任务取消，调用已停止。", cost_usd=getattr(exc, "accounted_cost_usd", 0.0)))
+                                                        reason="上游返工或任务取消，调用已停止。", cost_usd=getattr(exc, "accounted_cost_usd", 0.0),
+                                                        **self._take_log(run_id, node_id, getattr(exc, "usage", None))))
                 self._save(latest)
                 if current.generation != generation:
                     return
@@ -334,7 +369,12 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             exc.accounted_cost_usd = getattr(exc, "accounted_cost_usd", 0.0) + work_accounted
             await self._finish(run_id, node_id, None, quality.Verdict(False, str(exc)), inputs, [],
                                getattr(exc, "accounted_cost_usd", 0.0), "budget", generation=generation,
-                               accounted=getattr(exc, "accounted_cost_usd", 0.0))
+                               accounted=getattr(exc, "accounted_cost_usd", 0.0), usage=getattr(exc, "usage", None))
+        except (contracts.ArtifactBlocked, StepLimitExceeded) as exc:
+            spent = getattr(exc, "accounted_cost_usd", 0.0) + work_accounted
+            await self._finish(run_id, node_id, None, quality.Verdict(False, str(exc)), inputs, [], spent,
+                               Outcome.STOPPED if isinstance(exc, StepLimitExceeded) else Outcome.BLOCKED,
+                               generation=generation, accounted=spent, usage=getattr(exc, "usage", None))
         except ModelUnavailable as exc:
             await self._switch_model(run_id, node_id, exc)
             return
@@ -342,7 +382,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             exc.accounted_cost_usd = getattr(exc, "accounted_cost_usd", 0.0) + work_accounted
             await self._finish(run_id, node_id, None, quality.Verdict(False, str(exc)), inputs, [],
                                getattr(exc, "accounted_cost_usd", 0.0), "error", generation=generation,
-                               accounted=getattr(exc, "accounted_cost_usd", 0.0))
+                               accounted=getattr(exc, "accounted_cost_usd", 0.0), usage=getattr(exc, "usage", None))
         finally:
             self.node_tasks.pop((run_id, node_id), None)
 
@@ -400,6 +440,15 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             self.emit(run.id, "node.model_switched", node_id=node.id, model_id=previous,
                       next_model_id=node.model_id, reason="model_configuration_changed")
 
+    def _take_log(self, run_id: str, node_id: str, result=None) -> dict:
+        """What an attempt did, for its NodeAttempt, however it ended (finished, cancelled, its
+        model unavailable): its tool calls, its turns (from the model's usage, else the calls),
+        and its full trace if one was written."""
+        log = self.tool_logs.pop((run_id, node_id), None) or []
+        trace = self.tool_traces.pop((run_id, node_id), None)
+        turns = getattr(result, "turns", 0) or max((call["turn"] for call in log), default=0)
+        return {"tool_calls": log, "turns": turns, "trace": str(trace) if trace and trace.is_file() else None}
+
     def _spread(self, run, node) -> None:
         """Keep one API provider from carrying all of the task's running steps, so that its
         outage or rate limit does not stop them all: past ``max_steps_per_provider`` the node
@@ -435,8 +484,17 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 return
             node = next(item for item in run.plan.nodes if item.id == node_id)
             node.attempts.append(NodeAttempt(model_id=exc.model_id, outcome=exc.kind, reason=str(exc),
-                                            cost_usd=getattr(exc, "accounted_cost_usd", 0.0)))
-            self._route_after_unavailable(run, node, exc)
+                                            cost_usd=getattr(exc, "accounted_cost_usd", 0.0),
+                                            **self._take_log(run_id, node_id, getattr(exc, "usage", None))))
+            if node.artifact_contract:
+                node.contract_turns = max(node.contract_turns, sum(a.turns for a in node.attempts))
+                node.contract_cost_usd = max(node.contract_cost_usd, sum(a.cost_usd for a in node.attempts))
+            if reason := progress.limit_reason(node):
+                node.attempts[-1].outcome = Outcome.STOPPED
+                node.attempts[-1].reason = reason + "\n" + str(exc)
+                self._stop_contract(run, node, node.attempts[-1].reason, Outcome.STOPPED)
+            else:
+                self._route_after_unavailable(run, node, exc)
             self._save(run)
 
     def _route_after_unavailable(self, run: ExecutionRun, node, exc: ModelUnavailable,
@@ -482,6 +540,16 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         """Have ``model_id`` do ``node`` in its working folder: the user's project or the
         task's scratch folder. Returns (result, changed files, cost, working folder).
         ``conversation`` continues the step's last attempt when it holds a followup."""
+        async with self.locks.setdefault(run.id, asyncio.Lock()):
+            latest = self.db.get_run(run.id)
+            learning.attach(self.db, latest)
+            for item in latest.improvement_uses:
+                if learning.matches(item, learning.node_text(node), node.capability) and node.id not in item["node_ids"]:
+                    item["node_ids"].append(node.id)
+            run.improvement_uses = latest.improvement_uses
+            self._save(latest)
+        if lessons := learning.instruction(run.improvement_uses, node):
+            prompt += "\n\n" + lessons
         in_project = bool(run.project_dir and node.needs_workspace)
         if in_project:
             prompt = (
@@ -506,9 +574,22 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 # A continued conversation has its files already.
                 prompt = await asyncio.to_thread(self._with_files, run, node, workspace, prompt)
             log = self.tool_logs[run.id, node.id] = []
+            trace = self.tool_traces[run.id, node.id] = trace_path(run.id, node.id, len(node.attempts) + 1)
+            if node.artifact_contract:
+                if reason := progress.limit_reason(node):
+                    raise StepLimitExceeded(reason)
+                if model_id.startswith("cli:") or not act:
+                    raise contracts.ArtifactBlocked("此通道不能可靠执行声明的工具轮次上限；需要可计数的 API 工具通道。")
+                await asyncio.to_thread(contracts.prepare, run, node)
+                async with self.locks.setdefault(run.id, asyncio.Lock()):
+                    latest = self.db.get_run(run.id)
+                    current = next(item for item in latest.plan.nodes if item.id == node.id)
+                    for field in ("contract_generation", "artifact_inputs", "artifact_baseline", "artifact_evidence"):
+                        setattr(current, field, getattr(node, field))
+                    self._save(latest)
             result = await self._complete(
                 run, node, model_id, prompt, workspace, allow_api_fallback=fallback and not in_project,
-                attachments=run.attachments, act=act, max_turns=turns_for(node), tool_log=log,
+                attachments=run.attachments, act=act, max_turns=turns_for(node), tool_log=log, tool_trace=trace,
                 watch=self._progress_watch(run, node, model_id),
                 effort=settings.reasoning_by_difficulty.get(node.difficulty),
                 **({"conversation": conversation} if conversation else {}),
@@ -525,7 +606,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
 
 
     async def _finish(self, run_id: str, node_id: str, result, verdict: quality.Verdict, inputs, changed, cost: float, outcome: Optional[str],
-                      generation: Optional[int] = None, accounted: float = 0.0) -> None:
+                      generation: Optional[int] = None, accounted: float = 0.0, usage=None) -> None:
         """Record an attempt, then accept the node, retry it, or send verified work back."""
         lock = self.locks.setdefault(run_id, asyncio.Lock())
         async with lock:
@@ -534,23 +615,34 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 return
             node = next(item for item in run.plan.nodes if item.id == node_id)
             stale = generation is not None and node.generation != generation
+            logged = self._take_log(run_id, node_id, result or usage)
+            if node.artifact_contract and not stale:
+                node.contract_turns = max(node.contract_turns, sum(a.turns for a in node.attempts) + logged["turns"])
+                node.contract_cost_usd = max(node.contract_cost_usd, sum(a.cost_usd for a in node.attempts)
+                                             + cost + verdict.cost_usd)
+                node.artifact_evidence = verdict.artifact_evidence
+                if verdict.passed:
+                    try:
+                        contracts.accepted(run, node)
+                    except contracts.ArtifactBlocked as exc:
+                        verdict.passed, verdict.reason = False, str(exc)
+                if not verdict.passed and (reason := progress.limit_reason(node)):
+                    outcome, verdict.reason = Outcome.STOPPED, reason + "\n" + verdict.reason
             # A verification that ran out of turns has not finished, which says nothing against
             # the work it verifies: it is retried itself rather than sending that work back.
             unfinished = bool(getattr(result, "turn_limit", False)) and TURN_LIMIT_HINT in (verdict.reason or "")
-            outcome = outcome or (Outcome.UNABLE if verdict.unable else Outcome.UNVERIFIED if not verdict.verified
+            outcome = outcome or (Outcome.BLOCKED if verdict.blocked else Outcome.UNABLE if verdict.unable else Outcome.UNVERIFIED if not verdict.verified
                                   else Outcome.PASSED if verdict.passed
                                   else Outcome.VERIFY_FAILED if node.verifies and not unfinished
                                   else Outcome.REJECTED)
             if stale:
                 outcome = Outcome.SUPERSEDED
             spent = round(cost + verdict.cost_usd, 6)
-            log = self.tool_logs.pop((run_id, node_id), None) or []
             node.attempts.append(NodeAttempt(
                 model_id=(result.used_model_id if result else None) or node.model_id, outcome=outcome,
                 reason=verdict.reason, reviewer_model_id=verdict.reviewer_model_id, cost_usd=spent,
-                turns=getattr(result, "turns", 0) or max((call["turn"] for call in log), default=0),
                 turn_limit=bool(getattr(result, "turn_limit", False)) or TURN_LIMIT_HINT in (verdict.reason or ""),
-                tool_calls=log,
+                **logged,
             ))
             accounted += getattr(result, "accounted_cost_usd", 0.0) + verdict.accounted_cost_usd
             run.actual_cost_usd = round(run.actual_cost_usd + max(0.0, spent - accounted), 6)
@@ -563,7 +655,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             if result is not None:
                 node.result, node.summary = result.text, verdict.summary
                 node.changed_files = list(dict.fromkeys([*node.changed_files, *changed]))
-            if outcome == Outcome.BUDGET:
+            if outcome in {Outcome.BLOCKED, Outcome.STOPPED}:
+                self._stop_contract(run, node, verdict.reason, outcome)
+            elif outcome == Outcome.BUDGET:
                 node.status = NodeStatus.PENDING
                 self._pause_for_budget(run)
             elif outcome == Outcome.PASSED:
@@ -601,6 +695,26 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             await self._repair(run_id, node_id, verdict, outcome)
 
 
+    def _stop_contract(self, run, node, reason: str, outcome: str = Outcome.BLOCKED) -> None:
+        """Record a deterministic diagnosis, without another model call or automatic recovery."""
+        node.status, node.review_passed = NodeStatus.BLOCKED, False
+        node.review = node.unable_reason = reason
+        if node.artifact_evidence:
+            node.artifact_evidence.accepted = False
+        if not node.result:
+            node.result = f"BLOCKED: {reason}"
+        report = (f"{reason}\n累计轮次：{node.contract_turns}；累计费用：${node.contract_cost_usd:.6f}。\n"
+                  + contracts.prompt(node))
+        if node.attempts and node.attempts[-1].trace:
+            report += f"\n日志：{node.attempts[-1].trace}"
+        run.diagnoses.append(Diagnosis(id=uuid4().hex[:8], trigger="artifact_contract", node_id=node.id,
+                                       status="done", scope="task", verdict="blocked", report=report,
+                                       finished_at=datetime.now(timezone.utc)))
+        for downstream in run.plan.nodes:
+            if downstream.id in quality.descendants(run, {node.id}) and downstream.status == NodeStatus.PENDING:
+                downstream.status = NodeStatus.BLOCKED
+                downstream.review = downstream.unable_reason = f"上游「{node.title}」没有已验收的交付：{reason}"
+        self.emit(run.id, "node.blocked", node_id=node.id, reason=reason, outcome=outcome)
 
 
 
@@ -712,9 +826,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         if latest and latest.allow_network and not kwargs.get("repair"):
             kwargs["network"] = True
         return await self._charged(run, node, model_id, lambda budget: self.providers.complete(
-            model_id, prompt, workspace, spend_ok=budget, **kwargs))
+            model_id, prompt, workspace, spend_ok=budget, **kwargs), work=bool(kwargs.get("tool_trace")))
 
-    async def _charged(self, run, node, model_id, call):
+    async def _charged(self, run, node, model_id, call, *, work=False):
         """Run ``call(budget)``, a model call, against the task's budget. Persist each received
         usage report, even if a later round fails or is cancelled."""
         async def charge(cost):
@@ -724,14 +838,33 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 latest = self.db.get_run(run.id)
                 if latest:
                     latest.actual_cost_usd = round(latest.actual_cost_usd + cost, 6)
+                    current = next((item for item in latest.plan.nodes if node and item.id == node.id), None)
+                    if current and current.artifact_contract:
+                        current.contract_cost_usd += cost
                     self._save(latest)
 
         def remaining():
             latest = self.db.get_run(run.id)
             return latest.budget_usd - latest.actual_cost_usd if latest else float("-inf")
 
+        def current():
+            latest = self.db.get_run(run.id)
+            return next(item for item in latest.plan.nodes if item.id == node.id)
+
+        async def use_turn():
+            async with self.locks.setdefault(run.id, asyncio.Lock()):
+                latest = self.db.get_run(run.id)
+                step = next(item for item in latest.plan.nodes if item.id == node.id)
+                step.contract_turns += 1
+                self._save(latest)
+
+        contract = node.artifact_contract if node else None
         budget = RequestBudget(self.model_lookup, remaining, self.reservations.setdefault(run.id, {}), charge,
-                               self.budget_events.setdefault(run.id, asyncio.Event()))
+                               self.budget_events.setdefault(run.id, asyncio.Event()),
+                               step_remaining=(lambda: contract.max_cost_usd - current().contract_cost_usd) if contract else None,
+                               turn_remaining=(lambda: contract.max_turns - current().contract_turns) if contract and work else None,
+                               use_turn=use_turn if contract and work else None,
+                               scope=(run.id, node.id) if contract else None, wait_for_step=work)
         result = None
         try:
             result = await call(budget)

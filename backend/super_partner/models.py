@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -154,6 +154,8 @@ class Outcome:
     CANCELLED = "cancelled"
     QUOTA = "quota"                  # the model ran out of usage; another takes over
     UNAVAILABLE = "unavailable"      # the model's service is down; another takes over
+    BLOCKED = "blocked"              # missing artifact evidence or an unenforceable contract
+    STOPPED = "stopped"              # a declared work-package limit was reached
 
 
 class DiagnosisStatus:
@@ -184,6 +186,9 @@ class NodeAttempt(BaseModel):
     turns: int = 0
     turn_limit: bool = False
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    # Every tool call with its whole output, one JSON line each (tool_calls keeps only the start
+    # of the first ones): a file under the data folder, for looking back at what happened.
+    trace: Optional[str] = None
     finished_at: datetime = Field(default_factory=utcnow)
 
 
@@ -192,6 +197,42 @@ class NodeInput(BaseModel):
     node_id: str
     form: str  # full | summary | truncated
     changed_files: int = 0
+
+
+class Artifact(BaseModel):
+    """A named file or directory, relative to the step's workspace."""
+    path: str = Field(min_length=1)
+    kind: Literal["file", "directory"] = "file"
+
+
+class ArtifactInput(Artifact):
+    # External evidence must already exist. Dependency evidence must also have been accepted.
+    source: Literal["external", "dependency"]
+
+
+class ArtifactContract(BaseModel):
+    stage: Optional[Literal["coverage_vdb", "urg_report", "delivery_audit"]] = None
+    inputs: list[ArtifactInput]
+    outputs: list[Artifact] = Field(min_length=1)
+    acceptance_commands: list[str] = Field(min_length=1)
+    blocked_when: list[str] = Field(min_length=1)
+    max_turns: int = Field(gt=0, strict=True)
+    max_cost_usd: float = Field(gt=0, allow_inf_nan=False)
+
+    @field_validator("acceptance_commands", "blocked_when")
+    @classmethod
+    def nonempty(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("contract declarations must not be blank")
+        return values
+
+
+class ArtifactEvidence(BaseModel):
+    generation: int
+    inputs: dict[str, str] = Field(default_factory=dict)
+    outputs: dict[str, str] = Field(default_factory=dict)
+    checks: list[dict] = Field(default_factory=list)
+    accepted: bool = False
 
 
 class TaskNode(BaseModel):
@@ -216,6 +257,14 @@ class TaskNode(BaseModel):
     reads: list[str] = Field(default_factory=list)
     provides: str = ""
     check: str = ""
+    artifact_contract: Optional[ArtifactContract] = None
+    artifact_evidence: Optional[ArtifactEvidence] = None
+    # Persisted at each request, never reset by automatic retry, rework or a model switch.
+    contract_turns: int = 0
+    contract_cost_usd: float = 0.0
+    contract_generation: Optional[int] = None
+    artifact_baseline: dict[str, str] = Field(default_factory=dict)
+    artifact_inputs: dict[str, str] = Field(default_factory=dict)
     # The innermost plan part (PlanPart) this task belongs to; None in a plan without parts.
     part_id: Optional[str] = None
     # Major parts whose finished work this task runs or tests, so it waits for them (outline.link).
@@ -293,6 +342,27 @@ class PlanPart(BaseModel):
     error: Optional[str] = None
 
 
+class PreflightCheck(BaseModel):
+    """One check before a task's first step: what it is, the command, and how it went. A
+    blocking one that fails stops the task until it is repaired or the user goes on anyway."""
+    name: str
+    command: str = ""
+    ok: bool = True
+    blocking: bool = True
+    output: str = ""
+
+
+class Preflight(BaseModel):
+    checked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    passed: bool = True
+    checks: list[PreflightCheck] = Field(default_factory=list)
+    # A repair was tried for the failed checks; the task was paused for the user over them.
+    repaired: bool = False
+    paused: bool = False
+    # This machine's skills the steps will be given: prepared now, or kept from earlier tasks.
+    skills: list[str] = Field(default_factory=list)
+
+
 class TaskPlan(BaseModel):
     summary: str
     nodes: list[TaskNode]
@@ -301,6 +371,11 @@ class TaskPlan(BaseModel):
     # later; and whether its steps work in a project folder.
     request: str = ""
     in_project: bool = False
+    # Commands that show the tools, licenses and services the task needs work here, from the
+    # lead's outline; run before the first step (preflight.py).
+    requires: list[str] = Field(default_factory=list)
+    # A few English words naming the task, for its folder (OUTLINE_PROMPT "folder").
+    folder: str = ""
     estimate: Optional[CostEstimate] = None
     planning_method: str = "heuristic"
     planner_model_id: Optional[str] = None
@@ -451,6 +526,9 @@ class EngineerJob(BaseModel):
     node_id: Optional[str] = None
     decision_id: Optional[str] = None
     diagnosis_id: Optional[str] = None
+    improvement_id: Optional[str] = None
+    # Explicitly enabled for retrospective jobs; ordinary component approvals stay unchanged.
+    auto_apply: bool = False
     # The isolated source copy (platform_repair.PlatformRepairs job id), and what it changed.
     repair_id: Optional[str] = None
     files: list[str] = Field(default_factory=list)
@@ -470,6 +548,49 @@ class EngineerJob(BaseModel):
 # Engineer jobs in these states are over; those in WAITING wait for the user.
 ENGINEER_DONE = {"applied", "failed", "rejected", "cancelled"}
 ENGINEER_WAITING = {"plan_ready", "ready", "needs_input"}
+
+
+class LearningSettings(BaseModel):
+    enabled: bool = False
+    budget_usd: float = Field(default=0.5, ge=0, le=100)
+    auto_platform: bool = True
+
+
+class LearningReview(BaseModel):
+    run_id: str
+    revision: str
+    status: str = "queued"  # queued | analyzing | validating | done | blocked | failed
+    conclusion: str = ""
+    model_id: Optional[str] = None
+    budget_usd: float = 0.5
+    cost_usd: float = 0
+    # The remaining budget handed to platform jobs, counted once, even across restarts.
+    allocated_usd: float = 0
+    auto_platform: bool = False
+    error: Optional[str] = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class Improvement(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    run_id: str
+    revision: str
+    kind: Literal["skill", "rule", "platform"]
+    title: str = Field(min_length=1, max_length=160)
+    rationale: str = Field(min_length=1, max_length=2000)
+    content: str = Field(min_length=1, max_length=7000)
+    tools: list[str] = Field(default_factory=list)
+    capability: Optional[str] = None
+    source_nodes: list[str] = Field(default_factory=list)
+    problem_kind: str = ""
+    problem_key: str = ""
+    check: str = Field(default="", max_length=4000)
+    status: str = "proposed"  # proposed | validating | active | engineering | failed | disabled
+    validation: dict = Field(default_factory=dict)
+    baseline: dict = Field(default_factory=dict)
+    engineer_job_id: Optional[str] = None
+    applied_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class ExecutionRun(BaseModel):
@@ -505,7 +626,14 @@ class ExecutionRun(BaseModel):
     # they share (when there is no project), and what the planner and steps are told about it.
     parent_run_id: Optional[str] = None
     workspace_id: Optional[str] = None
+    # The readable name of its scratch folder (folders.task_folder); older tasks use their id.
+    folder_name: Optional[str] = None
     background: Optional[str] = None
+    # The check before the first step (preflight.py): its last result.
+    preflight: Optional[Preflight] = None
+    # Immutable content and baseline of the validated improvements actually supplied to this run.
+    improvement_uses: list[dict] = Field(default_factory=list)
+    improvements_prepared: bool = False
     actual_cost_usd: float = 0.0
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -515,7 +643,7 @@ class ExecutionRun(BaseModel):
     @property
     def folder_id(self) -> str:
         """Name of the scratch folder under workspace_root; shared along a chain of changes."""
-        return self.workspace_id or self.id
+        return self.workspace_id or self.folder_name or self.id
 
 
 class Event(BaseModel):
