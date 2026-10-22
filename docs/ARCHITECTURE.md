@@ -6,7 +6,9 @@ Keep it current: a change that moves a responsibility updates this file in the s
 ## Life of a task
 
 ```
-api.create_task ── planner.autonomous_plan ── team.form (when employee_teams; before splitting)
+api.create_task ── planner.autonomous_plan ── team.form (when employee_teams; before task planning)
+                                         ├─ task_planning.plan_tasks (when direct_task_planning:
+                                         │      executable tasks, employees, dependencies, no part refinement)
                                          └─ routing.route_node        (plan, pick a model per step;
                                                                          with a lead: major parts only, outline.py)
 api.confirm_task ── Executor.execute ── _preflight                     (check sandbox, tools, internet, models first:
@@ -37,6 +39,21 @@ capability, then planning and reliability; a different validator only among equa
 Calls use separate empty conversations and diagnosis reasoning effort, with the existing budget,
 availability, context and task CLI-permission checks.
 
+Initial lead planning (`planner._plan_as_lead`) retains a validated employee roster when an
+outline fails and another lead takes over. Optional `team_reasoning_effort` and
+`planning_reasoning_effort` apply only during their respective calls; the persistent lead's
+policy is restored afterwards. `planning_call_timeout` bounds each such call, including API
+queueing/retries and CLI execution, and finishes cancellation before trying another lead.
+Empty effort settings and a zero deadline preserve the legacy call policy. These controls do
+not alter refinement or retrospective model/effort selection.
+
+With `direct_task_planning`, `task_planning.py` asks for complete work items once and reuses
+the ordinary DAG, assignment and artifact-contract validators. Plans contain nodes and no parts,
+so the existing dispatcher runs ready tasks without invoking refinement. One task is valid; there
+is no compulsory file-count/turn-count subdivision. Unknown file scope uses the existing full
+workspace lock. Employee model selection is retained at creation and confirmation. Legacy stored
+part-based plans remain unchanged, and explicit worker delegation remains available.
+
 `LearningReview.automatic` distinguishes automatic work from an explicit manual request and
 defaults to true for legacy records. Cancellation stops pending automatic work through
 `skip_cancelled_learning`; source checks reject late model replies. `restore_learning` skips
@@ -58,6 +75,7 @@ history, active lessons and already submitted independent platform jobs remain i
 | Turning retrospectives into verified improvements: separate bounded budget, recorded evidence, sandbox checks for skills, independent review for skills/advisory rules, platform engineer jobs for source/platform rules; immutable lesson snapshots in later plans and steps, comparisons only with the same model/difficulty mix | `learning.py` (mixed into `Executor`) | `Learning.finish_learning`, `start_learning`, `_learn`, `_validate_lesson`, `_learning_engineer`, `restore_learning`, `sync_improvements`; `selected`, `attach`, `instruction`, `observe`; `LearningSettings`, `LearningReview`, `Improvement`, `ExecutionRun.improvement_uses`; tables `learning_reviews`, `improvements`, `improvement_effects`, `learning_settings`; API `/api/tasks/{id}/learning`, `/api/improvements`, `/api/improvements/settings`, `/api/improvements/{id}/disable`; `docs/design/continuous-improvement.md` |
 | Project employees and delegation | `team.py`, `models.py`, `executor.py` | Opt-in `employee_teams`: `form` chooses staff/models/capabilities/Skills before the outline; `Employee`, `PlanPart.employee_id`, `TaskNode.employee_id`; `route` preserves the chosen model, `context` supplies shared requirements/interfaces and delivery history, `refresh_skills` snapshots assigned instructions. `DELEGATE_TASKS` requests become validated child nodes in the same run; `_delegate_result` atomically saves the child graph and yielded parent, which resumes only after accepted children. One active task per employee, provider-aware admission, inherited contract costs/turns via `governors`. `frontend/team.tsx` shows staff, tasks, delegation and shared agreements. See `docs/design/project-team.md`. |
 | Planning | `planner.py` | `autonomous_plan` (by the lead when one is available: `_plan_as_lead`), `_validate_plan` (flat plan, when no lead plans), `task_node`, `WORK_RULES`; project work as small packages (`TaskNode.files/reads/provides/check`, `package`, `scope_problems` sends broad steps back to the lead) |
+| Direct executable task planning | `task_planning.py`, `planner.py`, `api.py` | Opt-in `direct_task_planning`: `plan_tasks` returns complete task matters, owners, dependencies and acceptance, with no later refinement. Reuses task parsing, contract gates and employee routing. See `docs/design/direct-task-planning.md`. |
 | The lead plans top-down (docs/design/plan-parts.md): before the run, major parts (大项) by function with their contracts (`provides`); each part later split level by level until every piece is an independent task | `outline.py` | `plan_outline`, `OUTLINE_PROMPT`, `refine`, `part_opening`, `refine_message`, `siblings`, `task_problems`, `Tree`, `link` (a wait on a part becomes a wait on its last tasks), `waits_on_unsplit`, `MAX_DEPTH`, `MAX_TASKS`, `task_problems` (sends back a split with a line of `CHAIN_LIMIT` waits, `longest_chain`, or far more tasks than the part's `size`); `TaskPlan.parts/request/in_project/unsplit_cost`, `PlanPart.status/size/provides`, `TaskNode.part_id`, `TaskPlan.part_path`; estimate `routing.part_estimate`, `fit_and_route` |
 | Splitting a running task's major parts into tasks, all at once, each in its own lead conversation; a part that cannot be split pauses the task. Combined-plan contract errors, including concurrent merge conflicts, return the rejected split and latest handoffs to the same conversation for at most `outline.ROUNDS` corrections before model fallback. Publication validates a copied plan under the run lock; cancelled/deleted tasks cannot receive late splits. With `adaptive_refinement`, the lead's per-part `difficulty/refinement_effort/refinement_reason` selects the conversation effort: routine low/medium, complex high, exceptional max with a reason. Old unannotated plans default to normal/medium; the main lead and retrospective policy stay independent | `refining.py` (mixed into `Executor`), `outline.py` | `_split_parts`, `_split_part`, `combine_split`, `SplitConflict`, `correction_message`, `REFINEMENT_EFFORT`; `SupervisorSession.reasoning_effort` → providers/CLI; events `part.refining`, `part.refine_attempt`, `part.refine_correcting`, `part.refined`, `part.refine_failed`; `frontend/plan-parts.tsx` shows the selection and reason |
 | The task's lead: one conversation from planning to the end (docs/design/supervisor.md) | `supervisor.py` | `candidates`, `ask`, `handover`, `trim`; `Executor.ask_lead`, `ProviderRegistry.converse`, `CliChannelRegistry.converse`, `ExecutionRun.supervisor` |
@@ -163,6 +181,7 @@ attempt. See `docs/design/call-runtime.md` for configuration and limits.
 | Area | Tests |
 |---|---|
 | Team formation, assignments, delegation, recovery and shared budgets | `tests/test_team.py` |
+| Direct tasks without refinement; planning stage effort, deadlines and staffing reuse | `tests/test_direct_planning.py`, `tests/test_planning_latency.py` |
 | Executor flow, retries | `tests/test_executor.py`, `test_recovery.py`, `test_recovery_regressions.py`, `test_turns.py`, `test_resume.py` |
 | Diagnosis | `test_diagnosis.py`, `test_diagnosis_interaction.py` |
 | Unable steps | `test_unable.py` |

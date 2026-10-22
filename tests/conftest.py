@@ -35,6 +35,10 @@ def isolated_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "skill_reuse_first", False)
     monkeypatch.setattr(settings, "adaptive_refinement", False)
     monkeypatch.setattr(settings, "employee_teams", False)
+    monkeypatch.setattr(settings, "direct_task_planning", False)
+    monkeypatch.setattr(settings, "team_reasoning_effort", "")
+    monkeypatch.setattr(settings, "planning_reasoning_effort", "")
+    monkeypatch.setattr(settings, "planning_call_timeout", 0)
 
 
 @pytest.fixture

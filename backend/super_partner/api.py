@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field
 
 from . import attachments as files
-from . import briefing, folders, learning, publish, retrospect
+from . import briefing, folders, learning, publish, retrospect, team
 from . import diagnosis as diagnosis_module
 from .benchmarks import BenchmarkCatalog
 from .catalog_sync import CatalogSync, seed_catalog
@@ -512,7 +512,9 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
             if parent:
                 # Every step changes files the earlier task left, so it needs a model that can act.
                 node.needs_workspace = True
-            if note := fit_and_route(node, catalog, configured, needs_vision):
+            if plan.employees:
+                team.route(node, plan, catalog, configured, needs_vision)
+            elif note := fit_and_route(node, catalog, configured, needs_vision):
                 plan.planning_note = f"{plan.planning_note}; {note}" if plan.planning_note else note
         for part in plan.parts:
             if part.status == "planned":
@@ -765,6 +767,9 @@ async def confirm_task(run_id: str, body: ConfirmTask):
     try:
         for node in run.plan.nodes:
             if node.status in {NodeStatus.SUCCEEDED, NodeStatus.RUNNING}:
+                continue
+            if run.plan.employees:
+                team.route(node, run.plan, list(models.values()), configured, any(a.kind == "image" for a in run.attachments))
                 continue
             available = eligible_for_node(node, list(models.values()), configured, any(a.kind == "image" for a in run.attachments))
             if not any(model.id == node.model_id for model in available):

@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     max_parallel_nodes: int = Field(default=0, ge=0)
     # New projects form a durable team before planning. Existing records keep their workflow.
     employee_teams: bool = False
+    # New plans contain executable tasks immediately, with no subsequent part refinement.
+    direct_task_planning: bool = False
     team_max_employees: int = Field(default=8, ge=1, le=12)
     team_max_delegation_depth: int = Field(default=3, ge=1, le=5)
     team_max_delegations: int = Field(default=6, ge=1, le=20)
@@ -114,6 +116,11 @@ class Settings(BaseSettings):
     reasoning_by_difficulty: dict[str, str] = Field(default_factory=lambda: {"easy": "low", "normal": "medium", "hard": "max"})
     # The task's lead plans and decides for the whole task: it thinks hardest. Diagnoses a step below.
     lead_reasoning_effort: str = "max"
+    # Initial staffing and outline generation can use their own effort, without changing the
+    # retained lead, refinement or retrospective. Empty/zero preserve the existing policy.
+    team_reasoning_effort: Literal["", "low", "medium", "high", "max"] = ""
+    planning_reasoning_effort: Literal["", "low", "medium", "high", "max"] = ""
+    planning_call_timeout: float = Field(default=0, ge=0)
     # Let the lead's per-part difficulty/effort assessment control refinement conversations.
     adaptive_refinement: bool = False
     diagnosis_reasoning_effort: str = "high"

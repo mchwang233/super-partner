@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
 import re
+from functools import partial
 from typing import Optional
 from uuid import uuid4
 
@@ -187,10 +189,10 @@ def _difficulty(raw: dict) -> dict:
     return {"difficulty": difficulty_for(threshold), "quality_threshold": threshold}
 
 
-def _validate_plan(payload: dict) -> TaskPlan:
+def _validate_plan(payload: dict, minimum_nodes: int = 2) -> TaskPlan:
     raw_nodes = payload.get("nodes")
-    if not isinstance(raw_nodes, list) or not 2 <= len(raw_nodes) <= MAX_NODES:
-        raise ValueError(f"planner must return 2-{MAX_NODES} nodes")
+    if not isinstance(raw_nodes, list) or not minimum_nodes <= len(raw_nodes) <= MAX_NODES:
+        raise ValueError(f"planner must return {minimum_nodes}-{MAX_NODES} nodes")
     key_to_id: dict[str, str] = {}
     nodes: list[TaskNode] = []
     for index, raw in enumerate(raw_nodes):
@@ -276,25 +278,51 @@ def scope_problems(plan: TaskPlan) -> list[str]:
 
 
 async def _plan_as_lead(request: str, models: list[ModelProfile], configured: set[str], providers,
-                        session: SupervisorSession, in_project: bool, team_request: str = "") -> Optional[TaskPlan]:
+                        session: SupervisorSession, in_project: bool, team_request: str = "",
+                        artifact_work: bool = False) -> Optional[TaskPlan]:
     """The best lead splits the request into major parts in its own conversation (outline.py),
     which ``session`` then holds; the parts are split into tasks when the task runs. None if no
     lead can plan."""
     from . import outline
 
     spent = [0.0]
+    roster = None
     for model in supervisor.candidates(models, configured)[:supervisor.MAX_LEADS]:
         fresh = supervisor.new_session(model)
 
-        async def say(text: str, fresh=fresh, model=model, spent=spent) -> str:
-            result = await providers.converse(fresh, text)
-            spent[0] += _cost(result, model)
-            return result.text
+        async def say(text: str, effort: str, stage: str, fresh=fresh, model=model, spent=spent) -> str:
+            previous = fresh.reasoning_effort
+            fresh.reasoning_effort = effort or previous
+            try:
+                logger.info("planning stage %s on %s (effort=%s)", stage, model.id,
+                            fresh.reasoning_effort or settings.lead_reasoning_effort)
+                if seconds := settings.planning_call_timeout:
+                    # The outer deadline also bounds API retries/queueing and providers that do
+                    # not enforce the CLI timeout argument. Cancellation finishes before fallback.
+                    result = await asyncio.wait_for(providers.converse(fresh, text, timeout=seconds), seconds)
+                else:
+                    result = await providers.converse(fresh, text)
+                spent[0] += _cost(result, model)
+                return result.text
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(f"{stage} exceeded {settings.planning_call_timeout:g}s") from exc
+            finally:
+                fresh.reasoning_effort = previous
 
         try:
-            roster = await team.form(say, team_request or request, models, configured) if settings.employee_teams else None
+            # A valid team is a completed decision. An outline timeout/model switch must not
+            # discard it, spend another staffing call or change employee identities.
+            if settings.employee_teams and roster is None:
+                roster = await team.form(partial(say, effort=settings.team_reasoning_effort, stage="team"),
+                                         team_request or request, models, configured)
             opening = supervisor.ROLE + request + (team.assignment_prompt(roster) if roster else "")
-            plan = await outline.plan_outline(say, opening, team_plan=roster)
+            if settings.direct_task_planning:
+                from .task_planning import plan_tasks
+                plan = await plan_tasks(partial(say, effort=settings.planning_reasoning_effort, stage="tasks"),
+                                        opening, roster, artifact_work)
+            else:
+                plan = await outline.plan_outline(partial(say, effort=settings.planning_reasoning_effort, stage="outline"),
+                                                  opening, team_plan=roster)
         except Exception as exc:
             # The next lead tries; with none left, the usual single-call planner does.
             logger.warning("lead %s could not plan: %s", model.id, exc)
@@ -308,7 +336,12 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
         plan.planning_note = f"由负责人 {model.display_name} 划分大项；执行时各大项同时细化成任务，负责人全程跟进"
         if plan.employees:
             plan.planning_note = f"负责人 {model.display_name} 先配置 {len(plan.employees)} 名员工，再划分和分配工作；员工可委派子任务"
+        if settings.direct_task_planning:
+            plan.planning_note = (f"负责人 {model.display_name} 已明确 {len(plan.nodes)} 个任务的事项、依赖和验收条件；"
+                                  "按依赖直接执行，不再细化" + (f"；分配给 {len(plan.employees)} 名员工" if plan.employees else ""))
         return plan
+    if settings.direct_task_planning:
+        raise contracts.ContractError("未能生成有效的直接任务计划；请检查可用负责人模型或任务约束后重试。")
     if settings.employee_teams and supervisor.candidates(models, configured):
         raise contracts.ContractError("负责人未能建立有效团队和分工；请调整可用模型后重新规划。")
     return None
@@ -345,10 +378,16 @@ async def autonomous_plan(
             raise contracts.ContractError("Requested artifact work has no declared artifact contracts")
         return candidate
 
-    if session is not None:
+    if session is not None or settings.direct_task_planning:
         from .outline import OUTLINE_PROMPT
 
-        plan = await _plan_as_lead(OUTLINE_PROMPT + body, models, configured, providers, session, in_project, team_request=body)
+        planning_prompt = OUTLINE_PROMPT
+        if settings.direct_task_planning:
+            from .task_planning import PROMPT
+            planning_prompt = PROMPT
+        plan = await _plan_as_lead(planning_prompt + body, models, configured, providers,
+                                   session if session is not None else SupervisorSession(), in_project,
+                                   team_request=body, artifact_work=artifact_work)
         if plan:
             plan.request = body
             return plan
