@@ -4,11 +4,16 @@ import httpx
 import pytest
 from super_partner import secrets
 from super_partner.catalog import builtin_models
-from super_partner.config import settings
+from super_partner.config import Settings, settings
 from super_partner.db import Database
 from super_partner.executor import Executor
 from super_partner.models import CapabilityScore, ModelProfile
 from super_partner.quota import QuotaTracker
+
+# Tests start from the platform's defaults, not this machine's .env (provider limits, timeouts,
+# feature switches): the same tests must pass on any machine.
+for _name, _value in Settings(_env_file=None):
+    setattr(settings, _name, _value)
 
 
 def scored_models() -> list[ModelProfile]:
