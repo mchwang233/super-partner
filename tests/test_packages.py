@@ -161,6 +161,49 @@ def test_artifact_contract_requires_real_producer_dependency_and_separate_audit(
         _validate_plan({"nodes": nodes})
 
 
+@pytest.mark.parametrize("title", ["从真实 VDB 生成并复现 URG 文本报告", "基于已验收VDB生成URG报告",
+                                  "读取 VDB 生成 URG 文本报告", "Generate URG report from existing VDB",
+                                  "Generate URG text report using the accepted VDB"])
+def test_report_consuming_vdb_is_not_misclassified_as_vdb_production(title):
+    from artifact_helpers import coverage_nodes, raw
+    from super_partner import contracts
+    from super_partner.planner import _validate_plan
+
+    nodes = coverage_nodes()
+    nodes[1].title = title
+    assert contracts.stages(nodes[1]) == {"urg_report"}
+    assert len(_validate_plan({"nodes": [raw(n) for n in nodes]}).nodes) == 3
+    nodes[1].artifact_contract = None
+    assert contracts.stages(nodes[1]) == {"urg_report"}
+    assert contracts.node_problems(nodes[1]) == [f"{title}: artifact_contract is required"]
+
+
+@pytest.mark.parametrize("title", ["从 RTL 生成 VDB 并生成 URG 报告", "Generate VDB and URG report from RTL",
+                                  "收集 VDB，然后从 VDB 生成 URG 报告"])
+def test_input_wording_cannot_hide_combined_artifact_production(title):
+    from artifact_helpers import coverage_nodes, raw
+    from super_partner.planner import _validate_plan
+
+    nodes = coverage_nodes()
+    nodes[1].title = title
+    with pytest.raises(ValueError, match="separate artifact stages"):
+        _validate_plan({"nodes": [raw(n) for n in nodes]})
+
+
+def test_missing_vdb_suffix_correction_explains_the_required_format():
+    from artifact_helpers import coverage_nodes
+    from super_partner import contracts
+
+    producer, report, _ = coverage_nodes()
+    producer.files = ["artifacts/coverage"]
+    producer.artifact_contract.outputs[0].path = producer.files[0]
+    report.reads = ["artifacts/coverage"]
+    report.artifact_contract.inputs[0].path = report.reads[0]
+    for node in (producer, report):
+        assert any(".vdb" in message for message in contracts.node_problems(node))
+    assert "path ending in .vdb" in contracts.RULES
+
+
 def test_artifact_external_vdb_report_needs_no_collection_node_and_old_records_still_load():
     from artifact_helpers import coverage_nodes, raw
     from super_partner.planner import _validate_plan

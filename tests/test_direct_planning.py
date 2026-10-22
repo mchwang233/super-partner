@@ -60,6 +60,25 @@ async def test_one_complete_task_is_enough_without_forced_splitting():
     assert len(plan.nodes) == 1 and not plan.parts
 
 
+async def test_verification_of_transitive_dependencies_needs_no_model_correction():
+    payload = {**TASKS, "nodes": [TASKS["nodes"][0], {**TASKS["nodes"][0], "key": "report", "dependencies": ["build"]},
+        {**TASKS["nodes"][1], "dependencies": ["report"], "verifies": ["build", "report"]}]}
+    provider = Planner(payload)
+    plan = await planned(provider)
+    assert len(provider.messages) == 2  # team + tasks, no regeneration of a valid dependency graph
+    first, second, audit = plan.nodes
+    assert set(audit.dependencies) == set(audit.verifies) == {first.id, second.id}
+    assert payload["nodes"][-1]["dependencies"] == ["report"]  # raw input is not rewritten
+
+
+@pytest.mark.parametrize("verified", ["missing", "independent"])
+async def test_verification_cannot_add_unknown_or_unrelated_work(verified):
+    payload = {**TASKS, "nodes": [{**TASKS["nodes"][0], "key": "independent"}, TASKS["nodes"][0],
+        {**TASKS["nodes"][1], "verifies": [verified]}]}
+    with pytest.raises(ContractError):
+        await planned(Planner(payload))
+
+
 @pytest.mark.parametrize("change", [{"dependencies": ["missing"]}, {"employee_id": "missing"},
                                   {"dependencies": ["build"]}, {"acceptance_criteria": ""}])
 async def test_invalid_task_graph_or_assignment_is_not_executed(change):

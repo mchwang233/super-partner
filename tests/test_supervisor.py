@@ -226,6 +226,34 @@ def fake_cli(tmp_path, monkeypatch, name, script):
     monkeypatch.setenv("PATH", f"{path.parent}:{os.environ['PATH']}")
 
 
+async def test_codex_resume_receives_config_in_its_own_option_scope(tmp_path, monkeypatch):
+    """Exec's -c flags before `resume` are not inherited by the resume parser."""
+    from super_partner import cli_channels
+
+    monkeypatch.setattr(cli_channels.shutil, "which", lambda name: str(tmp_path / name))
+    monkeypatch.setattr(cli_channels, "codex_servers", lambda: ["test_mcp"])
+    monkeypatch.setattr(settings, "codex_without_extras", True)
+    monkeypatch.setattr(settings, "codex_lead_service_tier", "fast")
+    cli, commands = CliChannelRegistry(), []
+
+    async def run(spec, command, cwd, stdin, timeout):
+        commands.append(command)
+        return ('{"type":"thread.started","thread_id":"saved"}\n'
+                '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}')
+
+    monkeypatch.setattr(cli, "_run", run)
+    result, sid = await cli.converse("cli:codex", "plan", tmp_path, session_id="saved", effort="high")
+    assert (result, sid) == ("ok", "saved")
+    command = commands[0]
+    resumed = command[command.index("resume") + 1:]
+    # Check the receiving command scope, not just the presence of flags anywhere in argv.
+    assert 'model_reasoning_effort="high"' in resumed
+    assert 'service_tier="fast"' in resumed
+    assert 'mcp_servers.test_mcp.enabled=false' in resumed
+    assert 'sandbox_mode="read-only"' in resumed
+    assert all(resumed[resumed.index(feature) - 1] == "--disable" for feature in cli_channels.CODEX_EXTRAS)
+
+
 async def test_claude_and_codex_continue_their_own_conversations(tmp_path, monkeypatch):
     log = tmp_path / "args.log"
     fake_cli(tmp_path, monkeypatch, "claude", f'#!/bin/sh\necho "$@" >> {log}\ncat > /dev/null\n'

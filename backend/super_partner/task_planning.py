@@ -15,7 +15,8 @@ Do not solve the project or inspect the environment during this planning respons
 
 List tasks in dependency order. A task waits only for results it actually needs. Independent work may
 run together. Describe concrete handoffs in provides. Use an independent verification task when needed;
-its verifies are dependency keys it checks. Assign employee_id from the team when a team is supplied.
+its verifies are keys it checks, and every such key must also be listed in its dependencies, including
+transitive prerequisites. Assign employee_id from the team when a team is supplied.
 Choose difficulty easy/normal/hard for execution, and estimate the complete work item's token use.
 For file work, list known files it owns and reads, relative to the workspace. Do not invent unknown
 paths or split work solely to meet a file/turn count. If the scope is unknown, leave files/reads empty;
@@ -41,14 +42,21 @@ async def plan_tasks(say, opening: str, roster: TaskPlan = None, artifact_work: 
         plan = _validate_plan(payload, minimum_nodes=1)
         if artifact_work and not any(n.artifact_contract for n in plan.nodes):
             raise contracts.ContractError("Requested artifact work needs declared evidence and limits")
+        by_key = {str(raw.get("key", f"n{i + 1}")): node for i, (raw, node) in enumerate(zip(payload["nodes"], plan.nodes))}
         for node, raw in zip(plan.nodes, payload["nodes"]):
             if not node.acceptance_criteria:
                 raise ValueError(f"{node.title}: describe how its result will be accepted")
             if any(not contracts.safe_name(path) for path in node.files + node.reads):
                 raise ValueError(f"{node.title}: file scope must use safe relative paths")
             verifies = raw.get("verifies") or []
-            if not isinstance(verifies, list) or any(key not in (raw.get("dependencies") or []) for key in verifies):
+            ancestors = {upstream.id for upstream in contracts.ancestors(node, plan.nodes)}
+            if not isinstance(verifies, list) or any(not isinstance(key, str) or key not in by_key
+                                                     or by_key[key].id not in ancestors for key in verifies):
                 raise ValueError(f"{node.title}: verifies must name dependencies")
+            # An auditor may name an indirect prerequisite. Add only redundant graph edges:
+            # ordering is unchanged, the reviewer gets that result, and no model retry is needed.
+            node.verifies = list(dict.fromkeys(by_key[key].id for key in verifies))
+            node.dependencies = list(dict.fromkeys([*node.dependencies, *node.verifies]))
             if roster:
                 employee = team.member(roster, node.employee_id)
                 if not employee or node.capability not in employee.capabilities:
@@ -63,6 +71,7 @@ async def plan_tasks(say, opening: str, roster: TaskPlan = None, artifact_work: 
             raise ValueError(f"requires allows at most {MAX_REQUIRES} commands")
         plan.requires = list(dict.fromkeys(cmd.strip() for cmd in requires))
         plan.folder = str(payload.get("folder") or "")[:80]
+        contracts.validate(plan)  # expanded verification still needs all original evidence/limits
         return plan
 
     return await _ask(say, opening, read)

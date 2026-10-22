@@ -34,7 +34,8 @@ Choose explicit limits appropriate for the work and available budget, not these 
 Inputs are evidence that MUST already exist, not files this step is responsible for generating.
 Use inputs: [] when there are none. A dependency input must be an output of an ancestor step;
 declare that dependency (after_parts across major parts). External evidence needs no producer.
-Declare VDBs as directory artifacts, text reports and audit records as file artifacts. List outputs
+Declare VDBs as directory artifacts with a path ending in .vdb (for example artifacts/run.vdb);
+use that exact path and kind in the consumer's inputs. Text reports and audit records are file artifacts. List outputs
 in files and inputs in reads. Audit consumes accepted reports, never an unfinished report or a
 worker's verbal completion claim. New output files are expected to be absent at startup.
 Writing a generator/parser script, its unit tests or documentation is preparation, not report
@@ -76,8 +77,16 @@ def stages(node: TaskNode) -> set[str]:
     """Recognize explicit jobs, not arbitrary mentions of coverage in a software request."""
     text = node.title.lower()
     found = set()
+    production = r"采集|生成|收集|collect|generat|capture|simulat"
+    # "Generate a report from VDB" names an input, not another production stage.
+    # Keep phrases that actually produce it ("from RTL generate VDB") and always
+    # respect declared VDB writes below; input wording cannot conceal a real output.
+    vdb_work = re.sub(
+        r"(?:\bfrom\b|\busing\b|从|基于|使用|读取|消费)([^,;。；\n]{0,40}?)vdb",
+        lambda match: match.group(0) if re.search(production, match.group(1)) else "", text,
+    )
     if any(path.rstrip("/").endswith(".vdb") for path in node.files) or (
-        "vdb" in text and re.search(r"采集|生成|收集|collect|generat|capture|simulat", text)
+        "vdb" in vdb_work and re.search(production, vdb_work)
     ):
         found.add("coverage_vdb")
     # Tool names in helper/document titles do not make those tasks artifact production.
@@ -123,10 +132,10 @@ def node_problems(node: TaskNode, *, coverage: bool = False) -> list[str]:
     if contract.stage == "coverage_vdb" and not any(
         item.kind == "directory" and item.path.endswith(".vdb") for item in contract.outputs
     ):
-        errors.append("coverage_vdb must deliver a VDB directory")
+        errors.append("coverage_vdb must deliver a VDB directory (kind=directory, path ending in .vdb)")
     if contract.stage == "urg_report":
         if not any(item.kind == "directory" and item.path.endswith(".vdb") for item in contract.inputs):
-            errors.append("urg_report must consume a VDB directory")
+            errors.append("urg_report must consume a VDB directory (kind=directory, path ending in .vdb)")
         if not any(item.kind == "file" for item in contract.outputs):
             errors.append("urg_report must deliver a text report file")
     if contract.stage == "delivery_audit" and not any(item.kind == "file" for item in contract.inputs):

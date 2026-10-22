@@ -47,12 +47,20 @@ queueing/retries and CLI execution, and finishes cancellation before trying anot
 Empty effort settings and a zero deadline preserve the legacy call policy. These controls do
 not alter refinement or retrospective model/effort selection.
 
+Codex continuation options belong to the `exec resume` subcommand: `cli_channels.converse`
+places effort, service tier and disabled extras after `resume`, alongside the read-only sandbox
+setting. Options attached to the outer `exec` may be ignored by the resume parser. Regression
+tests check the receiving option scope, not just the presence of requested flags.
+
 With `direct_task_planning`, `task_planning.py` asks for complete work items once and reuses
 the ordinary DAG, assignment and artifact-contract validators. Plans contain nodes and no parts,
 so the existing dispatcher runs ready tasks without invoking refinement. One task is valid; there
 is no compulsory file-count/turn-count subdivision. Unknown file scope uses the existing full
 workspace lock. Employee model selection is retained at creation and confirmation. Legacy stored
 part-based plans remain unchanged, and explicit worker delegation remains available.
+If a verification task names an existing transitive prerequisite, direct planning adds the
+redundant direct dependency locally rather than regenerating the plan. Unknown or unrelated
+targets still fail; artifact validation runs again after normalization.
 
 `LearningReview.automatic` distinguishes automatic work from an explicit manual request and
 defaults to true for legacy records. Cancellation stops pending automatic work through
@@ -178,6 +186,11 @@ limit without accepted delivery records `Outcome.STOPPED`. `_stop_contract` pres
 logs, charges and a deterministic task diagnosis, blocks consumers and ends incomplete without
 automatic diagnosis/retry. Lead acceptance and replanning cannot erase these gates or limits.
 Legacy records have no contract and retain their existing execution policy.
+
+Artifact-stage inference distinguishes a report's input wording (such as "from VDB generate
+URG report") from VDB production; declared VDB writes and genuinely combined production remain
+separate-stage validation errors. Planning guidance and validation errors both state the existing
+directory-kind and `.vdb` suffix requirement, avoiding needless whole-plan corrections.
 
 Ordinary packages with a declared `check` now execute it in the task sandbox before model review.
 A failed command cannot be overridden by the worker claiming success. Review selection treats

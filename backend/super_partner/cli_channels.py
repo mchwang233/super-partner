@@ -397,7 +397,10 @@ class CliChannelRegistry:
                      "-c", 'sandbox_mode="read-only"', "-"] if session_id else [*SESSION_ARGS[model_id], "-"])
             # Refinement can use the lead's per-part choice; ordinary lead calls keep their default.
             options = codex_settings(effort or settings.lead_reasoning_effort, settings.codex_lead_service_tier)
-            args = [args[0], *options, *args[1:]]
+            # `exec resume` parses its own options. Overrides on the outer `exec` are
+            # discarded on resume, restoring the user's effort/tier/plugins instead.
+            position = 3 if session_id else 1
+            args = [*args[:position], *options, *args[position:]]
             if record := calls.row():
                 chosen = effort or settings.lead_reasoning_effort
                 record["effective_effort"] = CODEX_EFFORTS.get(chosen, chosen)
