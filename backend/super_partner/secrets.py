@@ -1,8 +1,12 @@
+import contextlib
 import json
 import logging
 import os
 import subprocess
 import sys
+import tempfile
+import time
+from pathlib import Path
 from typing import Optional
 
 import keyring
@@ -105,21 +109,63 @@ def _read_provider_keys() -> dict[str, str]:
     return values
 
 
+@contextlib.contextmanager
+def _one_at_a_time(wait: float):
+    """Let processes of this user read the keyring one after another: several at once make a
+    desktop keyring slow enough to time out. After ``wait`` seconds a process goes ahead anyway."""
+    try:
+        import fcntl
+    except ImportError:  # no flock (Windows): read as before
+        yield
+        return
+    path = Path(tempfile.gettempdir()) / f"super-partner-keyring-{os.getuid()}.lock"
+    try:
+        handle = path.open("a")
+    except OSError:
+        yield
+        return
+    with handle:
+        deadline, locked = time.monotonic() + wait, False
+        while not locked and time.monotonic() < deadline:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if locked:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _read_in_child(timeout: float) -> dict:
+    """The saved keys, read by a separate process that can be killed and reaped if the keyring
+    waits for an unlock dialog; it is tried once more, given twice the time, if it is only slow.
+    Credentials stay in pipes, never in logs or on disk."""
+    for limit in (timeout, timeout * 2):
+        with _one_at_a_time(limit * 3):
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "super_partner.secrets"],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                    timeout=limit, check=True,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+        values = json.loads(result.stdout)
+        if not isinstance(values, dict):
+            raise TypeError("Invalid keyring response")
+        return values
+    raise subprocess.TimeoutExpired("keyring", timeout * 3)
+
+
 def hydrate_provider_keys(timeout: float = 10.0) -> None:
     """Load saved keys without letting a locked desktop keyring block startup."""
     if all(env_name in os.environ for env_name in SECRET_ENV.values()):
         return
     try:
-        # A separate process can be killed and reaped if the keyring waits for an
-        # unlock dialog. Keep credentials in pipes, never in logs or on disk.
-        result = subprocess.run(
-            [sys.executable, "-m", "super_partner.secrets"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            timeout=timeout, check=True,
-        )
-        values = json.loads(result.stdout)
-        if not isinstance(values, dict):
-            raise TypeError("Invalid keyring response")
+        values = _read_in_child(timeout)
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         # Exception output may contain credentials, so only log a fixed message.
         logger.warning(

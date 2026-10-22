@@ -397,3 +397,12 @@ async def test_continuing_a_task_paused_by_a_diagnosis_reruns_the_failed_step_wi
     assert stored.error is None and (stored.plan.nodes[0].status, stored.plan.nodes[0].failed_attempts) == (NodeStatus.PENDING, 0)
     assert stored.plan.nodes[0].environment_fixes == 0
     assert stored.plan.nodes[0].feedback == "node missing\n诊断建议：先安装 node"
+
+
+def test_a_diagnosis_is_told_where_the_full_trace_is():
+    from super_partner import diagnosis
+    from super_partner.models import NodeAttempt, ToolCall
+    attempt = NodeAttempt(outcome="rejected", turns=2, tool_calls=[ToolCall(turn=1, tool="Bash", detail="make")],
+                          trace="/data/traces/r/n-1.jsonl")
+    assert "/data/traces/r/n-1.jsonl" in diagnosis._tool_summary(attempt, last=True)
+    assert "/data/traces" not in diagnosis._tool_summary(attempt.model_copy(update={"trace": None}), last=True)

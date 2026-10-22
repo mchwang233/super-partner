@@ -17,7 +17,31 @@ class Settings(BaseSettings):
     project_roots: list[Path] = [Path.home()]
     allow_host_shell: bool = False
     default_budget_usd: float = 2.0
-    max_parallel_nodes: int = 3
+    # Steps of one task running at once; 0: no limit, every step whose inputs are ready starts
+    # (steps changing the same files still take turns, scopes.py).
+    max_parallel_nodes: int = Field(default=0, ge=0)
+    # A hard step takes the strongest model, unless a cheaper one scores within this many points:
+    # a point or two is not worth a model many times slower and dearer (GLM 5.3 against DeepSeek
+    # Flash, 2026-10-21: 93.9 against 92.3 for coding, about 8 times slower and 20 times dearer).
+    hard_score_margin: float = Field(default=2.0, ge=0)
+    # A step others wait for is put to the lead once it has run this many times its expected
+    # minutes (its expected turns at minutes_per_turn): go on, or stop for a faster model.
+    minutes_per_turn: float = Field(default=0.5, gt=0)
+    critical_overrun_factor: float = Field(default=2.0, gt=0)
+    # Before a task's first step, check the step sandbox, the tools and licenses the plan needs,
+    # the internet (if allowed) and the models (preflight.py).
+    preflight: bool = True
+    preflight_command_timeout: float = Field(default=120, gt=0)
+    # Before the first step, write this machine's skill for each tool the task needs that has none
+    # yet, by trying it in a step's sandbox (preflight.py, skills.py); at most this long each.
+    preflight_skills: bool = True
+    # Optional post-task learning; the UI can persist overrides. Its budget is separate and shown.
+    learning_enabled: bool = False
+    learning_budget_usd: float = Field(default=0.5, ge=0, le=100)
+    learning_auto_platform: bool = True
+    skill_preparation_timeout: float = Field(default=900, gt=0)
+    # A public address that shows the internet can be reached from a step's sandbox.
+    preflight_network_url: str = "https://pypi.org/simple/"
     # Steps of one task running on one API provider at once; a step past it goes to another
     # provider's model if one can do it for at most spread_cost_factor times the cost. Off (0) by
     # default: steps one after another on one provider are fine (a failing one switches model
@@ -56,6 +80,18 @@ class Settings(BaseSettings):
     # A step's reasoning effort by its difficulty: thinking hard on every turn of an easy step only
     # makes it slower. Calls outside steps (reviews, summaries) use deepseek_reasoning_effort.
     reasoning_by_difficulty: dict[str, str] = Field(default_factory=lambda: {"easy": "low", "normal": "medium", "hard": "max"})
+    # The task's lead plans and decides for the whole task: it thinks hardest. Diagnoses a step below.
+    lead_reasoning_effort: str = "max"
+    diagnosis_reasoning_effort: str = "high"
+    # Codex's service tier for the lead ("fast", "flex", ...); empty keeps the user's Codex config.
+    codex_lead_service_tier: str = ""
+    # Codex as the platform runs it leaves out the user's plugins, apps and MCP servers, which its
+    # leads and steps do not use and which slow every start.
+    codex_without_extras: bool = True
+    # Where the leads' conversations keep their folders (a CLI conversation is tied to one); outside
+    # any project, so a CLI does not take a project's instructions (AGENTS.md, CLAUDE.md) for its own.
+    # Empty: <XDG cache>/super-partner/leads.
+    lead_root: Optional[Path] = None
     # Seconds to wait for one API response; long outputs take minutes to generate.
     api_request_timeout: float = Field(default=600, ge=30)
     # A response not complete after this many seconds, even if data keeps arriving, fails at

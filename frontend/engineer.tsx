@@ -4,7 +4,7 @@ import { Composer, when, type Diagnosis } from "./diagnosis";
 
 export type EngineerMessage = { role: "user" | "engineer" | "lead" | "system"; text: string; created_at: string };
 export type EngineerJob = {
-  id: string; kind: "repair" | "component"; origin: "user" | "lead" | "diagnosis"; title: string; request: string;
+  id: string; kind: "repair" | "component"; origin: "user" | "lead" | "diagnosis" | "retrospective"; title: string; request: string;
   status: string; plan?: string | null; report?: string | null; question?: string | null; choices?: string[];
   run_id?: string | null; node_id?: string | null; files?: string[]; checks?: string[]; diff?: string | null;
   commit?: string | null; model_id?: string | null; messages?: EngineerMessage[]; budget_usd: number; cost_usd: number;
@@ -22,7 +22,7 @@ export const ENGINEER_STATUS: Record<string, { label: string; tone: string }> = 
   rejected: { label: "已放弃", tone: "muted" }, cancelled: { label: "已取消", tone: "muted" },
 };
 const KIND = { repair: "修复", component: "组件" } as const;
-const ORIGIN = { user: "你提出", lead: "负责人请求", diagnosis: "任务诊断发起" } as const;
+const ORIGIN = { user: "你提出", lead: "负责人请求", diagnosis: "任务诊断发起", retrospective: "任务复盘改进" } as const;
 const SPEAKER: Record<string, string> = { user: "你", engineer: "平台工程师", lead: "负责人", system: "系统" };
 
 /** Jobs waiting for the user: a plan to approve, a change to apply, or a question. */

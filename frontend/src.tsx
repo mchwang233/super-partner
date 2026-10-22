@@ -152,6 +152,9 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "run.confirmed":data=>`确认执行，预算 ${formatUsd(data.budget_usd??0)}`,
   "run.resumed":data=>`从中断处继续，预算 ${formatUsd(data.budget_usd??0)}`,
   "run.started":()=>"开始执行",
+  "run.preflight_started":()=>"执行前检查：沙箱、工具、网络和模型",
+  "run.preflight":data=>data.passed ? `执行前检查通过${data.warnings?.length ? `（${data.warnings.length} 项警告：${data.warnings.join("、")}）` : ""}`
+    : data.overruled ? `执行前检查仍有 ${data.failed.length} 项没通过，按你的决定继续执行` : `执行前检查有 ${data.failed.length} 项没通过：${data.failed.join("、")}`,
   "part.refining":data=>`大项「${data.title}」开始细化成任务`,
   "part.refined":data=>`大项「${data.title}」细化为 ${data.tasks} 个任务${data.parts?`、${data.parts} 个子项`:""}${data.model_id?`（${data.model_id}）`:""}`,
   "part.refine_failed":data=>`大项「${data.title}」没能细化：${data.error??""}`,
@@ -171,7 +174,7 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "node.retry":(data,title)=>data.reason==="environment_fixed"?`${title(data.node_id)}：环境已修复，重新执行`:`${title(data.node_id)}：未通过，准备重试（${data.reason??""}）`,
   "node.failed":(data,title)=>`${title(data.node_id)}：失败（${data.error??""}）`,
   "run.rework":(data,title)=>`${title(data.verifier)} 发现问题，第 ${data.round} 轮返工：${data.problems??""}`,
-  "approval.required":data=>`暂停：${({budget_insufficient:"预算不足以启动下一步",budget_exceeded:"花费超过预算",interrupted:"服务重启打断了执行",user_paused:"你手动暂停了任务",quota_exhausted:"模型额度用完，且没有其它可用模型",model_unavailable:"模型服务不可用，且没有其它可用模型",diagnosis_unresolved:"诊断后仍无法自动解决，请查看诊断报告",decision_limit:"负责人决策次数已用完，等你查看后继续"} as Record<string,string>)[data.reason]??data.reason}`,
+  "approval.required":data=>`暂停：${({budget_insufficient:"预算不足以启动下一步",budget_exceeded:"花费超过预算",interrupted:"服务重启打断了执行",user_paused:"你手动暂停了任务",quota_exhausted:"模型额度用完，且没有其它可用模型",model_unavailable:"模型服务不可用，且没有其它可用模型",diagnosis_unresolved:"诊断后仍无法自动解决，请查看诊断报告",preflight_failed:"执行前检查没有通过，缺少任务需要的工具或环境",decision_limit:"负责人决策次数已用完，等你查看后继续"} as Record<string,string>)[data.reason]??data.reason}`,
   "run.succeeded":data=>`任务完成，共花费 ${formatUsd(data.actual_cost_usd??0)}`,
   "run.incomplete":data=>`任务结束，有 ${(data.unable??[]).length} 个步骤无法完成 · 共花费 ${formatUsd(data.actual_cost_usd??0)}`,
   "run.cancelled":()=>"任务已取消",

@@ -38,6 +38,10 @@ async def test_delete_finished_history_preserves_files_and_other_records(
     artifact.write_text("keep artifact")
     run = saved_run(api.db, status=status, project_dir=project)
     other = saved_run(api.db, "other")
+    traces = {item: settings.data_dir / "traces" / item for item in (run.id, other.id)}
+    for folder in traces.values():
+        folder.mkdir(parents=True)
+        (folder / "n-1.jsonl").write_text("{}\n")
 
     response = await client.delete(f"/api/tasks/{run.id}")
 
@@ -49,6 +53,8 @@ async def test_delete_finished_history_preserves_files_and_other_records(
     assert len(api.db.events(other.id)) == 2
     assert project_file.read_text() == "print('keep me')"
     assert artifact.read_text() == "keep artifact"
+    # Its tool traces go with it; the other task keeps its own.
+    assert not traces[run.id].exists() and (traces[other.id] / "n-1.jsonl").exists()
     reopened = Database(settings.db_path)
     try:
         assert reopened.get_run(run.id) is None

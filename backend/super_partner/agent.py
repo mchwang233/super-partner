@@ -24,6 +24,7 @@ import re
 import shlex
 import shutil
 import signal
+import subprocess
 import tempfile
 import weakref
 from pathlib import Path, PurePosixPath
@@ -195,7 +196,12 @@ AGENT_INSTRUCTIONS = (
     "- File paths may be absolute or relative to the working directory. The file tools work in the "
     "working directory and in /tmp (the same /tmp Bash sees); look at other files, read-only, with Bash.\n"
     "- Bash keeps its working directory between calls and /tmp for this whole attempt; its output "
-    "comes back to you in full. Commands have no network access{ports}.{profiles}\n"
+    "comes back to you in full.\n"
+    "- Where you are: a sandbox. Only the working directory and /tmp can be written; the rest of the "
+    "system is read-only and the user's home folder is hidden (HOME is the working directory). You are an "
+    "ordinary user, not root: sudo, system packages and system files are out of reach. Commands have no "
+    "network access{ports}.{profiles} When something the task needs is missing or blocked here, do not "
+    "work around it with stand-ins or fake results: say exactly what is missing.\n"
     "- Search with Grep and Glob, read with Read, and change files with Edit or MultiEdit (Write for new "
     "files or full rewrites), not with grep, find, cat, sed or echo in Bash.\n"
     "- You can call several tools in one turn, and you should whenever the calls do not depend on each "
@@ -229,7 +235,10 @@ def sandbox_available() -> bool:
 HOST_INSTRUCTIONS = (
     "You can act with tools: Read, Write, Edit, MultiEdit, Glob, Grep and LS work in the working "
     "directory; Bash runs on the host machine as the user, with network access but without root "
-    "(sudo is blocked), starting in the working directory and keeping its directory between calls. "
+    "(sudo and other setuid programs are blocked), starting in the working directory and keeping its "
+    "directory between calls. You are not in the task's steps' sandbox: they can write only their working "
+    "directory and /tmp, do not see the home folder and reach the internet only if the task allows it, so "
+    "what works for you may not work for them; check a repair the way a step runs. "
     "Make independent tool calls in the same turn. When the work is done, reply without calling a tool."
 )
 
@@ -270,6 +279,21 @@ def proxy_ports() -> list[int]:
 
 def network_available() -> bool:
     return shutil.which("pasta") is not None
+
+
+@functools.lru_cache(maxsize=1)
+def maps_user() -> bool:
+    """Whether a sandbox inside pasta can map the user back (bwrap --unshare-user --uid): not
+    when this process is itself in a user namespace mapping only the user (a repair's commands)."""
+    uid, gid = str(os.getuid()), str(os.getgid())
+    try:
+        done = subprocess.run(
+            ["pasta", "--config-net", "--quiet", "--", "bwrap", "--unshare-user", "--uid", uid, "--gid", gid,
+             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", "true"],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
 
 
 def network_prefix(forward: list[int]) -> list[str]:
@@ -375,8 +399,11 @@ class Workspace:
     """Carries out tool calls inside one directory, for one attempt of a step."""
 
     def __init__(self, root: Path, host: bool = False, max_turns: int | None = None, log: list | None = None,
-                 network: bool = False, read_only: bool = False, readable_files: list[str] = ()):
+                 network: bool = False, read_only: bool = False, readable_files: list[str] = (),
+                 trace: Path | None = None):
         self.root = root.resolve()
+        # Where every tool call is written in full (see providers._loop).
+        self.trace = trace
         self.read_only = read_only
         self.readable_files = {
             path for name in readable_files
@@ -737,9 +764,12 @@ class Workspace:
         network = (network_prefix(proxy_ports()) if network_available() else []) if self.network else []
         isolated = [] if self.network else ["--unshare-net"]
         outer, inner, masked = self._platform_data()
+        # pasta runs the sandbox as root of a user namespace of its own; map the user back, so a
+        # step sees itself as the user it is (not root, which it is not) and its files as theirs.
+        user = ["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid())] if network and maps_user() else []
         return [
             *network,
-            "bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--bind", self.tmp(), "/tmp", *bridge,
+            "bwrap", *user, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--bind", self.tmp(), "/tmp", *bridge,
             # Hide the user's home (keys, tokens, other projects) and the platform's data (its
             # database, every task's folder), then expose only this folder and the tools the
             # environment repairs installed.
@@ -774,7 +804,8 @@ class Workspace:
         no_new_privs, so sudo and other setuid programs cannot raise privileges."""
         env = {name: value for name, value in os.environ.items() if name not in SECRET_ENV.values()}
         return [
-            "bwrap", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--die-with-parent", "--new-session",
+            # The real /dev: a repair checks the steps' sandbox, which needs /dev/net/tun for the internet.
+            "bwrap", "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc", "--die-with-parent", "--new-session",
             "--clearenv", *[arg for name, value in environment.command_env(env).items() for arg in ("--setenv", name, value)],
             "--chdir", str(self.root), "--", "/bin/bash", "-c",
             self._script(shlex.quote(str(Path(self.tmp()) / ".sp-cwd"))), "bash", str(self.cwd), command,
@@ -792,25 +823,27 @@ class Workspace:
         except (TypeError, ValueError) as exc:
             raise ToolError("timeout must be a number of milliseconds") from exc
         ports = [] if self.host else sandbox_ports()
-        async with port_bridge(ports) as ports_dir:
-            process = await asyncio.create_subprocess_exec(
-                *(self.host_args(command) if self.host else self.sandbox_args(command, ports_dir, ports)),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, start_new_session=True,
-            )
-            # wait_for must not cancel communicate: it may already have read output that
-            # would then be lost when a long compilation or simulation times out.
-            talk = asyncio.create_task(process.communicate())
-            timed_out = False
-            try:
-                output, _ = await asyncio.wait_for(asyncio.shield(talk), timeout=seconds)
-            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                output, _ = await talk
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
-                timed_out = True
+        # The output goes to a file, not a pipe from the event loop: under uvloop (as uvicorn
+        # runs us) that is a socket, whose output pasta (a task allowing the internet) loses.
+        # A file also keeps everything a timed-out compilation or simulation printed.
+        with tempfile.TemporaryFile() as captured:
+            async with port_bridge(ports) as ports_dir:
+                process = await asyncio.create_subprocess_exec(
+                    *(self.host_args(command) if self.host else self.sandbox_args(command, ports_dir, ports)),
+                    stdin=asyncio.subprocess.DEVNULL, stdout=captured, stderr=captured, start_new_session=True,
+                )
+                timed_out = False
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=seconds)
+                except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    await process.wait()
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    timed_out = True
+            captured.seek(0)
+            output = captured.read()
         reset = self._follow_cwd()
         text = (_clip(output.decode(errors="replace").rstrip("\n")) or "(the command printed no output)") + reset
         if timed_out:

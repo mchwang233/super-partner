@@ -10,8 +10,8 @@ import asyncio
 import json
 import re
 from typing import Optional
-from uuid import uuid4
 
+from . import folders
 from .budget import ProviderError
 from .cli_channels import SESSION_CLIS, SessionLost
 from .config import settings
@@ -51,7 +51,7 @@ def candidates(models: list[ModelProfile], configured: set[str], exclude=()) -> 
 
 def new_session(model: ModelProfile, previous: Optional[SupervisorSession] = None) -> SupervisorSession:
     """A fresh conversation for ``model``, in a folder of its own (a CLI conversation is tied to it)."""
-    session = SupervisorSession(model_id=model.id, cwd=str(settings.data_dir / "supervisors" / uuid4().hex))
+    session = SupervisorSession(model_id=model.id, cwd=str(folders.lead_folder(model.id)))
     if previous and previous.model_id:
         session.previous = [*previous.previous, previous.model_id]
     return session
@@ -321,6 +321,21 @@ def overrun_message(node, turns: int, expected: int, evidence: str) -> str:
         ("Is it still doing its own package and close to done, or is the package too big, under-specified, "
          "or going wrong? Stopped, the attempt fails and you then decide what to do (for a package too "
          "big: replan to split it). End with exactly one line: `VERDICT: CONTINUE` or "
+         "`VERDICT: STOP: <why, in Chinese>`."),
+    ])
+
+
+def critical_overrun_message(node, model_id: str, minutes: float, expected: float, waiting: list[str],
+                             evidence: str) -> str:
+    """A step the rest of the task waits for, running far past its expected time on its model."""
+    return "\n".join([
+        (f"EVENT: step [{node.id}] {node.title} has run {minutes:.0f} minutes on {model_id}; about "
+         f"{expected:.0f} were expected. It is not stuck, but {len(waiting)} steps wait for it: "
+         + "; ".join(waiting[:8]) + "."),
+        f"What it has been doing:\n{evidence}",
+        ("Should it go on, or stop so that you can give it to a faster model (switch_model) or split it? "
+         "Its files stay in the working directory for the next attempt. Stop it only if it is slow or "
+         "off track, not when it is about to finish. End with exactly one line: `VERDICT: CONTINUE` or "
          "`VERDICT: STOP: <why, in Chinese>`."),
     ])
 

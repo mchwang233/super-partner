@@ -173,6 +173,27 @@ async def test_a_model_that_rejects_the_effort_answers_without_it_from_then_on(m
     assert "reasoning_effort" not in sent[1] and "reasoning_effort" not in sent[2]
 
 
+async def test_the_full_trace_keeps_every_call_and_its_whole_output(tmp_path, monkeypatch):
+    """The stored tool calls keep the start of the first ones; the trace keeps everything."""
+    from super_partner import providers
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    monkeypatch.setattr(providers, "MAX_LOGGED_CALLS", 1)
+    (tmp_path / "big.txt").write_text(("x" * 100 + "\n") * 30 + "END")
+    read = {"id": "c1", "type": "function", "function": {"name": "Read", "arguments": json.dumps({"file_path": "big.txt"})}}
+    sent, log, trace = [], [], tmp_path / "trace" / "n-1.jsonl"
+    registry = registry_with([
+        deepseek({"content": None, "tool_calls": [read, {**read, "id": "c2"}]}, "tool_calls"),
+        deepseek({"content": "done"}, "stop"),
+    ], sent)
+    try:
+        await registry.complete("deepseek:deepseek-flash", "work", tmp_path, act=True, tool_log=log, tool_trace=trace)
+    finally:
+        await registry.client.aclose()
+    assert len(log) == 1 and "END" not in log[0]["output"]
+    calls = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert len(calls) == 2 and all(call["output"].endswith("END") and call["tool"] == "Read" for call in calls)
+
+
 async def test_tool_calls_continue_and_reasoning_goes_back_to_deepseek(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
     sent = []

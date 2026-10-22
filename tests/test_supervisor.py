@@ -198,10 +198,64 @@ async def test_claude_and_codex_continue_their_own_conversations(tmp_path, monke
     await cli.converse("cli:codex", "接下来？", tmp_path, "x-9")
     first, second, third, fourth = log.read_text().splitlines()
     assert "--session-id" in first and "--resume c-1" in second and "Edit,Write,NotebookEdit" in first
-    assert "--sandbox read-only" in third and "exec resume x-9" in fourth
+    assert "--sandbox read-only" in third and fourth.startswith("exec ") and "resume x-9" in fourth
+    # The lead thinks hardest, in both a new and a continued conversation.
+    assert 'model_reasoning_effort="max"' in third and 'model_reasoning_effort="max"' in fourth
+
+
+async def test_codex_runs_with_the_platforms_effort_and_without_the_users_extras(tmp_path, monkeypatch):
+    from super_partner import cli_channels
+    from super_partner.config import settings
+    home = tmp_path / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('model = "x"\n[mcp_servers.node_repl]\ncommand = "n"\n'
+                                      '[mcp_servers."my server"]\ncommand = "m"\n[mcp_servers.node_repl.env]\nA = "1"\n')
+    log = tmp_path / "args.log"
+    fake_cli(tmp_path, monkeypatch, "codex", f'#!/bin/sh\necho "$@" >> {log}\ncat > /dev/null\n'
+             'echo \'{"type":"thread.started","thread_id":"x-9"}\'\n'
+             'echo \'{"type":"item.completed","item":{"type":"agent_message","text":"收到"}}\'\n')
+    monkeypatch.setattr(settings, "codex_lead_service_tier", "fast")
+    cli = CliChannelRegistry()
+    await cli.converse("cli:codex", "规划", tmp_path)
+    await cli.complete("cli:codex", "做这一步", tmp_path, effort="low")
+    await cli.complete("cli:codex", "照旧", tmp_path)
+    lead, step, plain = log.read_text().splitlines()
+    assert 'model_reasoning_effort="max"' in lead and 'service_tier="fast"' in lead
+    assert 'model_reasoning_effort="low"' in step and "service_tier" not in step
+    assert "model_reasoning_effort" not in plain  # nothing asked: the user's own setting
+    for line in (lead, step, plain):
+        assert "--disable plugins" in line and "--disable apps" in line
+        # A -c key is split on dots with quotes taken literally (Codex then rejects the config): only
+        # plain names are turned off, and a name with a space is left alone.
+        assert "mcp_servers.node_repl.enabled=false" in line and "my server" not in line and '"node_repl"' not in line
+    assert cli_channels.codex_servers() == ["node_repl", "my server"]
+    monkeypatch.setattr(settings, "codex_without_extras", False)
+    assert cli_channels.codex_settings("high") == ["-c", 'model_reasoning_effort="high"']
 
 
 async def test_a_conversation_the_cli_no_longer_has_is_reported_as_lost(tmp_path, monkeypatch):
     fake_cli(tmp_path, monkeypatch, "claude", "#!/bin/sh\necho 'No conversation found with session ID: c-1' >&2\nexit 1\n")
     with pytest.raises(SessionLost):
         await CliChannelRegistry().converse("cli:claude", "接下来？", tmp_path, "c-1")
+
+
+async def test_codex_may_delete_files_in_its_folder_and_the_rule_is_gone_after(tmp_path, monkeypatch):
+    """Codex refuses rm -f as dangerous even in its sandbox; a rule in the step's folder allows it
+    for the call. A folder of the project's own stays; a repair, outside Codex's sandbox, gets none."""
+    from super_partner.cli_channels import CODEX_ALLOW, CODEX_RULES
+    seen = tmp_path / "seen.txt"
+    fake_cli(tmp_path, monkeypatch, "codex", f'#!/bin/sh\ncat > /dev/null\ncat {CODEX_RULES} >> {seen} 2>/dev/null '
+             f'|| echo none >> {seen}\necho done\n')
+    scratch, project = tmp_path / "scratch", tmp_path / "project"
+    scratch.mkdir()
+    (project / ".codex").mkdir(parents=True)
+    (project / ".codex" / "config.toml").write_text("# the project's own")
+    cli = CliChannelRegistry()
+    await cli.complete("cli:codex", "做这一步", scratch)
+    await cli.complete("cli:codex", "做这一步", project)
+    assert seen.read_text() == CODEX_ALLOW * 2
+    assert not (scratch / ".codex").exists()
+    assert not (project / CODEX_RULES).exists() and (project / ".codex" / "config.toml").exists()
+    monkeypatch.setattr("super_partner.cli_channels.repair_command", lambda executable, args: [executable, *args])
+    await cli.complete("cli:codex", "修环境", scratch, repair=True)
+    assert seen.read_text().endswith("none\n")

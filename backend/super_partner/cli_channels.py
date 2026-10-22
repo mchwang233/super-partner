@@ -91,7 +91,9 @@ def repair_command(executable: str, args: list[str]) -> list[str]:
     bubblewrap always sets), so sudo and other setuid programs cannot raise privileges."""
     if not shutil.which("bwrap"):
         raise RuntimeError("repairing the environment needs bubblewrap (bwrap), which blocks sudo")
-    return ["bwrap", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--die-with-parent", "--", executable, *args]
+    # The real /dev: a repair checks the steps' sandbox, which needs /dev/net/tun for the internet.
+    return ["bwrap", "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc", "--die-with-parent", "--",
+            executable, *args]
 
 
 # The task's lead (supervisor.py) keeps one conversation per task. It reads files and runs
@@ -151,6 +153,77 @@ def _with_network(model_id: str, args: list[str]) -> list[str]:
     if model_id == "cli:codex":
         return [args[0], *CODEX_NETWORK, *args[1:]]
     return args
+
+
+# Codex's own features the platform's leads and steps do not use (Codex feature flags).
+CODEX_EXTRAS = ("plugins", "apps", "browser_use", "in_app_browser", "computer_use")
+# Reasoning efforts as Codex names them; the platform's scale (providers.EFFORTS) maps onto it.
+CODEX_EFFORTS = {"none": "minimal", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high",
+                 "xhigh": "xhigh", "max": "max", "ultra": "max"}
+# A server's own table in Codex's config: [mcp_servers.name] or [mcp_servers."name"].
+CODEX_SERVER = re.compile(r'^\s*\[\s*mcp_servers\.(?:"([^"]+)"|([A-Za-z0-9_-]+))\s*\]\s*$', re.MULTILINE)
+
+
+def codex_servers() -> list[str]:
+    """The MCP servers the user's Codex config starts, by name, read from $CODEX_HOME/config.toml:
+    the platform turns each off, since what they are differs from machine to machine. (Plugins'
+    servers go with ``--disable plugins``.)"""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        text = (home / "config.toml").read_text(errors="replace")
+    except OSError:
+        return []
+    return list(dict.fromkeys(quoted or bare for quoted, bare in CODEX_SERVER.findall(text)))
+
+
+def codex_settings(effort: Optional[str] = None, service_tier: str = "") -> list[str]:
+    """Options that make one Codex run the platform's rather than the user's: how hard it thinks,
+    its service tier, and none of the user's plugins, apps and MCP servers."""
+    options = []
+    if effort:
+        options += ["-c", f'model_reasoning_effort="{CODEX_EFFORTS.get(effort, effort)}"']
+    if service_tier:
+        options += ["-c", f'service_tier="{service_tier}"']
+    if settings.codex_without_extras:
+        options += [arg for name in CODEX_EXTRAS for arg in ("--disable", name)]
+        # Codex splits a -c key on dots and takes quotes literally: only plain names can be addressed.
+        options += [arg for name in codex_servers() if re.fullmatch(r"[A-Za-z0-9_-]+", name)
+                    for arg in ("-c", f"mcp_servers.{name}.enabled=false")]
+    return options
+
+
+# Codex refuses rm -f and the like as dangerous even inside its sandbox (its exec policy), which
+# stops builds and clean-ups; an allow rule in the folder it works in lifts that, and its sandbox
+# still keeps everything outside the folder read-only. rm with wildcards or $(...) stays refused,
+# since Codex cannot tell what it removes (2026-10-21); steps are told to use find -delete.
+CODEX_RULES = ".codex/rules/super-partner.rules"
+CODEX_ALLOW = 'prefix_rule(pattern=["rm"], decision="allow")\n'
+_codex_rule_users: dict[Path, int] = {}
+
+
+@contextlib.contextmanager
+def codex_rules(cwd: Path):
+    """The allow rule in ``cwd`` while Codex works there, then gone again (with any folder it made),
+    so neither a task's results nor a project keep it. Steps at once in one folder share it."""
+    rule = Path(cwd) / CODEX_RULES
+    made = [folder for folder in (rule.parent.parent, rule.parent) if not folder.exists()]
+    if not _codex_rule_users.get(rule):
+        try:
+            rule.parent.mkdir(parents=True, exist_ok=True)
+            rule.write_text(CODEX_ALLOW)
+        except OSError:
+            made = []
+    _codex_rule_users[rule] = _codex_rule_users.get(rule, 0) + 1
+    try:
+        yield
+    finally:
+        _codex_rule_users[rule] -= 1
+        if not _codex_rule_users[rule]:
+            del _codex_rule_users[rule]
+            with contextlib.suppress(OSError):
+                rule.unlink()
+                for folder in reversed(made):
+                    folder.rmdir()
 
 
 def _with_attachments(model_id: str, args: list[str], attachments: list) -> list[str]:
@@ -278,6 +351,9 @@ class CliChannelRegistry:
             sid = session_id
             args = (["exec", "resume", session_id, "--json", "--skip-git-repo-check",
                      "-c", 'sandbox_mode="read-only"', "-"] if session_id else [*SESSION_ARGS[model_id], "-"])
+            # The lead plans and decides for the whole task: it thinks hardest, in its own tier.
+            options = codex_settings(settings.lead_reasoning_effort, settings.codex_lead_service_tier)
+            args = [args[0], *options, *args[1:]]
         try:
             output = await self._run(spec, [executable, *args], cwd, prompt.encode(), timeout)
         except RuntimeError as exc:
@@ -303,7 +379,7 @@ class CliChannelRegistry:
 
     async def complete(
         self, model_id: str, prompt: str, cwd: Path, timeout: int = 900, attachments=(), repair: bool = False,
-        network: bool = False, watch: Optional[progress.Watch] = None,
+        network: bool = False, watch: Optional[progress.Watch] = None, effort: Optional[str] = None,
     ) -> str:
         """Run a CLI in ``cwd``. With ``repair`` it leaves its sandbox to fix the environment;
         with ``network`` its sandbox lets commands reach the internet. With ``watch`` it is not
@@ -316,13 +392,16 @@ class CliChannelRegistry:
         if network and not repair:
             args = _with_network(spec.id, args)
         args = _with_attachments(spec.id, args, list(attachments))
+        if spec.id == "cli:codex":
+            args = [args[0], *codex_settings(effort), *args[1:]]
         if spec.id in {"cli:gemini", "cli:qwen"}:
             args[1] = prompt
             stdin = None
         else:
             stdin = prompt.encode()
         command = repair_command(executable, args) if repair else [executable, *args]
-        stdout = await self._run(spec, command, cwd, stdin, timeout, watch)
+        with codex_rules(cwd) if spec.id == "cli:codex" and not repair else contextlib.nullcontext():
+            stdout = await self._run(spec, command, cwd, stdin, timeout, watch)
         text = stdout.strip()
         if spec.id in {"cli:claude", "cli:gemini", "cli:qwen"}:
             try:

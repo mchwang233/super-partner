@@ -84,3 +84,18 @@ def database(tmp_path, monkeypatch):
         supervisor=SupervisorSession(model_id="cli:claude", session_id="lead-1", cwd=str(tmp_path / "lead")),
         plan=TaskPlan(summary="s", nodes=[node])))
     return database
+
+
+@pytest.fixture(autouse=True)
+def own_codex_home(monkeypatch, tmp_path):
+    """Tests never read the user's Codex config (cli_channels.codex_servers), nor put leads'
+    folders in the user's cache (folders.lead_root)."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setattr(settings, "lead_root", tmp_path / "leads")
+
+
+@pytest.fixture(autouse=True)
+def no_preflight(monkeypatch):
+    """The check before a task's first step runs real sandboxes and asks the models; tests of
+    other behaviour leave it out, and tests/test_preflight.py turns it on."""
+    monkeypatch.setattr(settings, "preflight", False)

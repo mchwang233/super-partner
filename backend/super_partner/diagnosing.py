@@ -10,7 +10,7 @@ from typing import Optional
 from uuid import uuid4
 
 from . import agent as agent_tools
-from . import environment, quality
+from . import environment, quality, retrospect
 from .budget import BudgetExceeded
 from .config import settings
 from .diagnosis import interaction, repair_prompt, user_action
@@ -82,7 +82,8 @@ class Diagnosing:
                 shared = environment.prepare()
                 before = await asyncio.to_thread(quality.file_state, shared)
                 prompt = repair_prompt(run, node, str(workspace), str(shared), agent_tools.sandbox_ports(),
-                                       events, self.db.shared_repairs(limit=5), self.platform.context(), brief)
+                                       events, self.db.shared_repairs(limit=5), self.platform.context(), brief,
+                                       await asyncio.to_thread(retrospect.similar, self.db, run, node))
                 if self.platform_pending:
                     text, extra = await self._fix_platform(run, diagnosis, node, "")
                     result = None
@@ -167,7 +168,7 @@ class Diagnosing:
                 result = await self._complete(
                     run, node, model_id, prompt, workspace, cli_timeout=REPAIR_TIMEOUT if repair or edit else 600,
                     allow_api_fallback=False, act=act,
-                    repair=repair,
+                    repair=repair, effort=settings.diagnosis_reasoning_effort,
                 )
                 return result, model_id, cost + result.accounted_cost_usd
             except asyncio.CancelledError as exc:

@@ -291,6 +291,25 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .result-tabs{display:flex;gap:6px;margin:16px 0 12px;border-bottom:1px solid var(--line);padding-bottom:8px}
 .result-tabs button{background:transparent;color:var(--muted);padding:6px 12px;font-size:12px}
 .result-tabs button[aria-pressed="true"]{background:var(--accent-bg);color:var(--accent)}
+.result-tabs{flex-wrap:wrap}
+.learning-panel{display:grid;gap:14px;font-size:13px;line-height:1.65;min-width:0}
+.learning-panel p{margin:6px 0}
+.learning-panel .muted,.learning-panel small{color:var(--muted)}
+.learning-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.learning-settings,.learning-item{border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.learning-settings summary,.learning-item summary{cursor:pointer;font-weight:600}
+.learning-settings label{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:12px 0}
+.learning-settings input[type=number]{width:90px;padding:6px}
+.learning-settings small{display:block;margin:8px 0}
+.learning-items{display:grid;gap:12px}
+.learning-item details{margin:12px 0}
+.learning-panel pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto;padding:12px;background:var(--accent-bg);border-radius:8px}
+.learning-effects{overflow:auto;margin:12px 0}
+.learning-effects table{border-collapse:collapse;width:100%;font-size:12px}
+.learning-effects caption{text-align:left;color:var(--muted);padding:6px 0}
+.learning-effects td,.learning-effects th{text-align:left;border-bottom:1px solid var(--line);padding:6px 10px}
+.learning-engineer{border-left:2px solid var(--line);padding-left:12px;margin:12px 0}
+.learning-engineer textarea{width:100%;min-height:70px}
 pre.result-text,.result-file-view>pre,.result-steps pre{margin:0;padding:14px 16px;border-radius:10px;background:var(--panel-2);border:1px solid var(--line-soft);font:12.5px/1.65 ui-monospace,'PingFang SC',monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 pre.result-text{max-height:none}
 .result-files{display:grid;grid-template-columns:minmax(200px,280px) minmax(0,1fr);gap:14px;min-height:320px}
@@ -793,3 +812,6 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .tool-output summary{cursor:pointer;font-size:11px;color:var(--faint)}
 .tool-output pre{margin:4px 0 0;padding:6px 8px;max-height:200px;overflow:auto;border-radius:6px;background:var(--panel-2);font:11px/1.5 ui-monospace,monospace;white-space:pre-wrap;word-break:break-word}
 .tool-log li{flex-wrap:wrap}
+
+/* Markdown shown as plain text until its renderer has loaded (markdown.tsx). */
+.markdown-loading { white-space: pre-wrap; }

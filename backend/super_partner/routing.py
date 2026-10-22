@@ -113,12 +113,14 @@ def route_node(
         )
     pool, cli_needed = prefer_api(eligible)
     if node.difficulty == "hard":
-        # Hard tasks take the strongest model for the capability; cost only breaks ties.
+        # Hard tasks take the strongest model for the capability, or a cheaper one scoring
+        # within hard_score_margin of it; cost breaks the rest.
+        pool = close_to_best(pool, node)
         key = lambda model: (
-            -model.scores.score_for(node.capability),
-            -model.scores.reliability,
             model.execution_priority,
             node_cost(node, model),
+            -model.scores.score_for(node.capability),
+            -model.scores.reliability,
         )
     else:
         # Easy and normal tasks take the cheapest model that clears the threshold.
@@ -133,7 +135,8 @@ def route_node(
     node.estimated_cost_usd = round(node_cost(node, selected), 6)
     label = CAPABILITY_LABELS.get(node.capability, node.capability)
     fit = f"{label} {selected.scores.score_for(node.capability):g} ≥ 门槛 {node.quality_threshold:g}"
-    rule = "选分最高的" if node.difficulty == "hard" else "选最便宜的"
+    rule = (f"在比最高分低不超过 {settings.hard_score_margin:g} 分的模型中选最便宜的" if node.difficulty == "hard"
+            else "选最便宜的")
     if cli_needed:
         api = [model for model in available if model.channel != "cli"]
         best_api = max((model.scores.score_for(node.capability) for model in api), default=None)
@@ -174,6 +177,12 @@ def spread_to(
         return min(pool, key=lambda model: (-model.scores.score_for(node.capability), -model.scores.reliability,
                                             node_cost(node, model)))
     return min(pool, key=lambda model: (node_cost(node, model), -model.scores.score_for(node.capability)))
+
+
+def close_to_best(pool: list[ModelProfile], node: TaskNode) -> list[ModelProfile]:
+    """The models scoring within ``settings.hard_score_margin`` of the best for the node's capability."""
+    best = max((model.scores.score_for(node.capability) for model in pool), default=0.0)
+    return [model for model in pool if model.scores.score_for(node.capability) >= best - settings.hard_score_margin]
 
 
 def strongest_for(

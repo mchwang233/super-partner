@@ -64,7 +64,8 @@ def _tool_summary(attempt, last: bool) -> str:
     if not last:
         return head
     calls = [f"    t{call.turn} {call.tool} {call.detail}{'' if call.ok else '  [failed]'}" for call in attempt.tool_calls[-MAX_LISTED_CALLS:]]
-    return "\n".join([head, *calls])
+    trace = [f"    every call with its whole output, one JSON line each: {attempt.trace}"] if attempt.trace else []
+    return "\n".join([head, *calls, *trace])
 
 
 def _history(run: ExecutionRun, events: list[str]) -> list[str]:
@@ -153,9 +154,11 @@ def prompt(run: ExecutionRun, node_id: Optional[str], workspace: str, events: li
 
 
 def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str, ports: list[int], events: list[str],
-                  shared_repairs: tuple | list = (), platform: str = "", brief: str = "") -> str:
+                  shared_repairs: tuple | list = (), platform: str = "", brief: str = "",
+                  history: tuple | list = ()) -> str:
     """Find and repair what blocks a step from outside the task, or say what should happen.
-    ``brief`` is what the task's lead asked to be repaired."""
+    ``brief`` is what the task's lead asked to be repaired; ``history`` the same kind of problem
+    in earlier tasks (retrospect.similar)."""
     port_note = f"local ports {', '.join(map(str, ports))} only" if ports else "nothing"
     last = node.attempts[-1] if node.attempts else None
     return "\n".join([
@@ -226,6 +229,10 @@ def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str,
         *[f"- {item['id']} scope={item.get('scope', 'environment')} status={item.get('status', 'fixed')}: "
           f"files={item.get('files', [])}\n{item.get('report', '')[:2000]}\n{item.get('error') or ''}"
           for item in shared_repairs],
+        *(["", "# The same kind of problem in earlier tasks",
+           ("It has happened before. Find the cause that keeps bringing it back, not only this "
+            "occurrence; if an earlier repair did not hold, say why and repair it for good:"),
+           *history] if history else []),
         "",
         *_history(run, events),
         platform_instructions(platform),

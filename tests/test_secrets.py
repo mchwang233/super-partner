@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -136,3 +138,39 @@ def test_unavailable_keyring_on_save_does_not_leak_the_key(fake_keyring, monkeyp
     assert set_provider_key("openai", "sensitive-credential-value") == "session"
     output = capfd.readouterr()
     assert "sensitive-credential" not in caplog.text + output.out + output.err
+
+
+def test_a_slow_keyring_is_asked_again_with_more_time(monkeypatch):
+    from super_partner import secrets
+    limits = []
+
+    def run(command, timeout, **kwargs):
+        limits.append(timeout)
+        if len(limits) == 1:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return subprocess.CompletedProcess(command, 0, stdout='{"DEEPSEEK_API_KEY": "saved"}', stderr="")
+
+    monkeypatch.setattr(secrets.subprocess, "run", run)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    try:
+        secrets.hydrate_provider_keys(timeout=2)
+        assert os.environ["DEEPSEEK_API_KEY"] == "saved" and limits == [2, 4]
+    finally:
+        os.environ.pop("DEEPSEEK_API_KEY", None)
+
+
+def test_processes_read_the_keyring_one_after_another(tmp_path):
+    """Several processes starting at once (tests, workers) do not crowd the keyring."""
+    script = tmp_path / "reader.py"
+    script.write_text(
+        "import sys, time\n"
+        "from super_partner import secrets\n"
+        "with secrets._one_at_a_time(10):\n"
+        "    print(time.monotonic()); time.sleep(0.3); print(time.monotonic())\n"
+    )
+    backend = Path(__file__).resolve().parents[1] / "backend"
+    env = {**os.environ, "PYTHONPATH": str(backend)}
+    readers = [subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True, env=env)
+               for _ in range(3)]
+    spans = sorted(tuple(map(float, reader.communicate(timeout=30)[0].split())) for reader in readers)
+    assert all(earlier[1] <= later[0] for earlier, later in zip(spans, spans[1:]))

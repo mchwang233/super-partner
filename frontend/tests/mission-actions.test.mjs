@@ -98,6 +98,23 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
   state.poll = () => [...polls.values()][0]();
   window.fetch = async (url, options = {}) => {
     const path = new URL(url).pathname;
+    if (path === "/api/improvements/settings") {
+      if (options.method === "PUT") state.learningSettings = JSON.parse(options.body);
+      return json(state.learningSettings ?? { enabled: false, budget_usd: 0.5, auto_platform: true });
+    }
+    if (/^\/api\/tasks\/[^/]+\/learning$/.test(path)) {
+      if (options.method === "POST") {
+        state.learningStarts = (state.learningStarts ?? 0) + 1;
+        state.learning = { improvements: [], applied: [], ...state.learning, review: { status: "queued", conclusion: "", budget_usd: 0.5, cost_usd: 0, allocated_usd: 0 } };
+      }
+      return json(state.learning ?? { review: null, retrospective: { estimated_usd: 0.2, actual_usd: 0.3, problems: [] }, improvements: [], applied: [] });
+    }
+    if (/^\/api\/improvements\/[^/]+\/disable$/.test(path)) {
+      const id = path.split("/")[3];
+      state.disabledImprovements = [...(state.disabledImprovements ?? []), id];
+      state.learning.improvements = state.learning.improvements.map(item => item.id === id ? { ...item, status: "disabled" } : item);
+      return json({ status: "disabled" });
+    }
     if (/^\/api\/tasks\/[^/]+\/engineer$/.test(path) && options.method === "POST") {
       const body = JSON.parse(options.body || "{}");
       state.engineerActions = [...(state.engineerActions ?? []), { path, body }];
@@ -824,6 +841,45 @@ test("a failed task continues from the failed step with the budget entered there
   await click([...bar.querySelectorAll("button")].find(b => b.textContent === "从失败处继续"));
   assert.deepEqual(state.resumes, [{ id: "broken", budget_usd: 3 }]);
   assert.equal(document.querySelector(".resume-bar"), null);
+});
+
+test("retrospective settings persist and manual generation shows its progress", async t => {
+  const { state, document, button, click } = await setup(t);
+  await click(button("复盘与改进"));
+  assert.match(document.querySelector(".learning-panel").textContent, /尚未生成复盘结论/);
+  const enable = document.querySelector(".learning-settings input[type=checkbox]");
+  await click(enable);
+  await click(button("保存自动改进设置"));
+  assert.equal(state.learningSettings.enabled, true);
+  assert.equal(state.learningSettings.auto_platform, true);
+  assert.equal(state.learningSettings.budget_usd, 0.5);
+  await click(button("生成复盘与改进项"));
+  assert.equal(state.learningStarts, 1);
+  assert.equal(button("复盘进行中…").disabled, true);
+});
+
+test("retrospective shows evidence, effects and permits disabling future use", async t => {
+  const { state, document, button, click } = await setup(t);
+  const before = { steps: 1, cost_per_step: 0.2, turns_per_step: 40, failures_per_step: 1, success_rate: 1, problem_rate: 1 };
+  state.learning = {
+    review: { status: "done", conclusion: "重复准备导致浪费，复用经过验证的命令。", budget_usd: 0.5, cost_usd: 0.02, allocated_usd: 0 },
+    applied: [{ id: "prior", title: "先验证接口", node_ids: ["n"], planning: true, source_run_id: "prior-run" }],
+    improvements: [{ id: "lesson", kind: "skill", title: "编译前检查", rationale: "原任务使用了 40 轮。", content: "先检查编译环境。",
+      status: "active", tools: ["compiler"], source_nodes: ["n"], validation: { passed: true, reason: "样例编译通过", output: "PASS" },
+      effects: [{ run_id: "later", before, after: { ...before, turns_per_step: 12, cost_per_step: 0.05 }, comparable: true,
+        delta: {}, note: "观察性对比，不能认定因果。" }] }],
+  };
+  await click(button("复盘与改进"));
+  const panel = document.querySelector(".learning-panel");
+  assert.match(panel.textContent, /重复准备导致浪费/);
+  assert.match(panel.textContent, /先验证接口/);
+  assert.match(panel.querySelector("table").textContent, /40/);
+  assert.match(panel.querySelector("table").textContent, /12/);
+  assert.match(panel.textContent, /不能认定因果/);
+  await click(button("后续任务停用"));
+  assert.deepEqual(state.disabledImprovements, ["lesson"]);
+  assert.match(panel.textContent, /已停用/);
+  assert.equal(button("后续任务停用"), undefined);
 });
 
 test("a finished task opens on its result tab with files, ZIP download and GitHub upload", async t => {

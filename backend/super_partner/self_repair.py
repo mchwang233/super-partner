@@ -126,9 +126,13 @@ class SelfRepair:
             # No active model call is interrupted by our restart; usage and results drain first.
             while self.active_requests or any(not task.done() for task in set(self.tasks.values()) | set(self.diagnosing.values())):
                 await asyncio.sleep(0.2)
-            # A change the user asked the platform engineer for belongs to no task.
+            # Retrospectives improve later work, so cancellation of their source is not rejection
+            # of the separate, checked engineering job. Deleted sources still block activation.
             initiating = self.db.get_run(job["run_id"]) if job.get("run_id") else None
-            if job.get("run_id") and (not initiating or initiating.status == RunStatus.CANCELLED):
+            engineer = self.db.get_engineer_job(job.get("engineer_job_id") or "")
+            retrospective = (engineer and engineer.origin == "retrospective" and engineer.status == "applying"
+                             and engineer.run_id == job.get("run_id") and engineer.repair_id == job["id"])
+            if job.get("run_id") and (not initiating or (initiating.status == RunStatus.CANCELLED and not retrospective)):
                 job.update(status="cancelled", error="发起诊断的任务已取消或删除，未应用平台改动。")
                 self.platform.save(job)
                 self._finish_platform(job)
