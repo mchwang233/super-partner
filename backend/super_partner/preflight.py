@@ -114,6 +114,7 @@ def needed_tools(run: ExecutionRun, library: list) -> list[str]:
     text = "\n".join([run.prompt, run.plan.summary, *(f"{part.title} {part.goal} {part.provides}"
                                                      for part in run.plan.parts)])
     found += [tool for skill in library for tool in skill.tools if skills.names_tool(text, tool)]
+    found += [tool for employee in run.plan.employees for tool in employee.skill_tools]
     return [tool for tool in dict.fromkeys(item for item in found if item) if tool not in COMMON_TOOLS]
 
 

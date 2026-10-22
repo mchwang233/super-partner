@@ -5,6 +5,51 @@ import { MessageChannel } from "node:worker_threads";
 import { JSDOM } from "jsdom";
 import { build } from "vite";
 
+test("employee page groups assignments and shows delegation", async t => {
+  const run = mission("team-task", "running");
+  run.plan.team_brief = "保持公开接口；验证员工独立验收";
+  run.plan.employees = [
+    { id: "builder", name: "开发员工", role: "实现模块", model_id: "test:build", capabilities: ["coding"], skills: ["parser-guide"] },
+    { id: "tester", name: "验证员工", role: "检查边界条件", model_id: "test:verify", capabilities: ["research"], skills: [] },
+  ];
+  run.plan.nodes = [
+    { id: "parent", title: "完成解析模块", employee_id: "builder", model_id: "test:build", status: "pending", dependencies: ["child"], estimated_cost_usd: 0 },
+    { id: "child", title: "检查解析边界", employee_id: "tester", model_id: "test:verify", status: "running", delegation_parent_id: "parent", estimated_cost_usd: 0 },
+  ];
+  const { document, button, click } = await setup(t, [run], [], { openComposer: false });
+  await click(button("员工"));
+  const panel = document.querySelector('[aria-label="项目员工"]');
+  assert.ok(panel);
+  const builder = panel.querySelector('[data-employee="builder"]');
+  const tester = panel.querySelector('[data-employee="tester"]');
+  assert.match(builder.textContent, /完成解析模块/);
+  assert.match(builder.textContent, /parser-guide/);
+  assert.match(builder.textContent, /等待子任务/);
+  assert.match(tester.textContent, /检查解析边界/);
+  assert.match(tester.textContent, /开发员工.*委派/);
+  assert.match(panel.textContent, /test:build/);
+  assert.match(panel.textContent, /test:verify/);
+  assert.match(panel.textContent, /保持公开接口/);
+  await click(button("检查解析边界", tester));
+  assert.ok(document.querySelector(".node-progress"));
+  assert.match(document.querySelector(".node-progress").textContent, /检查解析边界/);
+  await click(document.querySelector('[aria-label="关闭进行情况"]'));
+  await click(button("完成解析模块", tester));
+  assert.match(document.querySelector(".node-progress").textContent, /完成解析模块/);
+});
+
+test("employee page keeps legacy assignments explicitly unassigned", async t => {
+  const run = mission("old-task", "cancelled");
+  run.plan.nodes = [{ id: "old-node", title: "历史工作", model_id: "test:old", status: "pending", estimated_cost_usd: 0 }];
+  const { document, button, click } = await setup(t, [run], [], { openComposer: false });
+  await click(button("员工"));
+  const panel = document.querySelector('[aria-label="项目员工"]');
+  assert.match(panel.textContent, /尚未配置员工/);
+  assert.match(panel.textContent, /未分配/);
+  assert.match(panel.textContent, /历史工作/);
+  assert.equal(panel.querySelectorAll('[data-employee]').length, 0);
+});
+
 let browserCode;
 before(async () => {
   const appFile = fileURLToPath(new URL("../src.tsx", import.meta.url));
@@ -1616,7 +1661,7 @@ test("the task's conversation is a tab that opens when the lead asks you, with a
     choices: ["SQLite", "JSON"], report: "两种都行", created_at: "2026-10-20T07:00:00Z" }];
   const { document, click } = await setup(t, [run], [], { openComposer: false });
   const tabs = () => [...document.querySelectorAll(".task-tabs button")];
-  assert.deepEqual(tabs().map(tab => tab.textContent), ["对话", "进度", "结果", "详情"]);
+  assert.deepEqual(tabs().map(tab => tab.textContent), ["对话", "进度", "员工", "结果", "详情"]);
   assert.equal(tabs()[0].getAttribute("aria-pressed"), "true");
   assert.ok(tabs()[0].querySelector(".tab-dot") && document.querySelector(".lead-panel"));
   await click(tabs()[1]);
@@ -1624,4 +1669,14 @@ test("the task's conversation is a tab that opens when the lead asks you, with a
   assert.match(document.querySelector(".chat-alert").textContent, /负责人在问你：用 SQLite 还是 JSON？/);
   await click(document.querySelector(".chat-alert button"));
   assert.ok(document.querySelector(".lead-panel") && !document.querySelector(".chat-alert"));
+});
+
+
+test("delegation continuations are not displayed as failed retries", async t => {
+  const run = mission("delegated-complete", "succeeded");
+  run.plan.nodes = [{ id: "parent", title: "完成模块", status: "succeeded", model_id: "test:build", dependencies: [],
+    estimated_cost_usd: 0, attempts: [{ outcome: "delegated", cost_usd: 0 }, { outcome: "passed", cost_usd: 0 }] }];
+  const { document, button, click } = await setup(t, [run], [], { openComposer: false });
+  await click(button("进度"));
+  assert.doesNotMatch(document.querySelector(".plan-summary").textContent, /重试/);
 });

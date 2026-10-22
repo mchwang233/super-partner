@@ -4,8 +4,9 @@ import re
 from typing import Optional
 from uuid import uuid4
 
-from . import contracts, supervisor
+from . import contracts, supervisor, team
 from .budget import token_cost
+from .config import settings
 from .models import (
     DIFFICULTY_THRESHOLDS,
     ModelProfile,
@@ -223,6 +224,7 @@ def task_node(raw: dict, key: str, dependencies: list[str], verifies: list[str])
         title=str(raw.get("title", key))[:120],
         instructions=str(raw.get("instructions", "")).strip(),
         capability=capability,
+        employee_id=raw.get("employee_id"),
         dependencies=dependencies,
         estimated_input_tokens=max(100, min(int(raw.get("estimated_input_tokens", 1500)), 1_000_000)),
         estimated_output_tokens=max(50, min(int(raw.get("estimated_output_tokens", 800)), 128_000)),
@@ -274,15 +276,15 @@ def scope_problems(plan: TaskPlan) -> list[str]:
 
 
 async def _plan_as_lead(request: str, models: list[ModelProfile], configured: set[str], providers,
-                        session: SupervisorSession, in_project: bool) -> Optional[TaskPlan]:
+                        session: SupervisorSession, in_project: bool, team_request: str = "") -> Optional[TaskPlan]:
     """The best lead splits the request into major parts in its own conversation (outline.py),
     which ``session`` then holds; the parts are split into tasks when the task runs. None if no
     lead can plan."""
     from . import outline
 
+    spent = [0.0]
     for model in supervisor.candidates(models, configured)[:supervisor.MAX_LEADS]:
         fresh = supervisor.new_session(model)
-        spent = [0.0]
 
         async def say(text: str, fresh=fresh, model=model, spent=spent) -> str:
             result = await providers.converse(fresh, text)
@@ -290,7 +292,9 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
             return result.text
 
         try:
-            plan = await outline.plan_outline(say, supervisor.ROLE + request)
+            roster = await team.form(say, team_request or request, models, configured) if settings.employee_teams else None
+            opening = supervisor.ROLE + request + (team.assignment_prompt(roster) if roster else "")
+            plan = await outline.plan_outline(say, opening, team_plan=roster)
         except Exception as exc:
             # The next lead tries; with none left, the usual single-call planner does.
             logger.warning("lead %s could not plan: %s", model.id, exc)
@@ -302,7 +306,11 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
         plan.planner_model_id = model.id
         plan.planning_cost_usd = round(spent[0], 6)
         plan.planning_note = f"由负责人 {model.display_name} 划分大项；执行时各大项同时细化成任务，负责人全程跟进"
+        if plan.employees:
+            plan.planning_note = f"负责人 {model.display_name} 先配置 {len(plan.employees)} 名员工，再划分和分配工作；员工可委派子任务"
         return plan
+    if settings.employee_teams and supervisor.candidates(models, configured):
+        raise contracts.ContractError("负责人未能建立有效团队和分工；请调整可用模型后重新规划。")
     return None
 
 
@@ -340,7 +348,7 @@ async def autonomous_plan(
     if session is not None:
         from .outline import OUTLINE_PROMPT
 
-        plan = await _plan_as_lead(OUTLINE_PROMPT + body, models, configured, providers, session, in_project)
+        plan = await _plan_as_lead(OUTLINE_PROMPT + body, models, configured, providers, session, in_project, team_request=body)
         if plan:
             plan.request = body
             return plan

@@ -516,7 +516,9 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
                 plan.planning_note = f"{plan.planning_note}; {note}" if plan.planning_note else note
         for part in plan.parts:
             if part.status == "planned":
-                part.estimated_cost_usd = part_estimate(part, plan.in_project, catalog, configured, needs_vision)
+                assigned = next((e for e in plan.employees if e.id == part.employee_id), None)
+                pool = [m for m in catalog if m.id == assigned.model_id] if assigned else catalog
+                part.estimated_cost_usd = part_estimate(part, plan.in_project, pool, configured, needs_vision)
     except NoEligibleModelError as exc:
         raise HTTPException(422, str(exc)) from exc
     plan.estimate = estimate(plan.nodes, body.budget_usd, plan.planning_cost_usd, plan.unsplit_cost())

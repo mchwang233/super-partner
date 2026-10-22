@@ -34,6 +34,7 @@ def isolated_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "platform_self_repair", False)
     monkeypatch.setattr(settings, "skill_reuse_first", False)
     monkeypatch.setattr(settings, "adaptive_refinement", False)
+    monkeypatch.setattr(settings, "employee_teams", False)
 
 
 @pytest.fixture

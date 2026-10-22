@@ -4,7 +4,7 @@ import { formatUsd, statusLabel } from "./mission-history";
 import { ModelCapabilityDialog, NodeProgress, PlanGraph, nodeLine, planStages, useLinks, type PlanNode } from "./plan-graph";
 
 /** A part of a plan made top-down (backend outline.py): 大项 at the top, then smaller parts, then tasks. */
-export type PlanPart = { id: string; title: string; goal?: string; acceptance?: string; parent_id?: string | null; dependencies?: string[];
+export type PlanPart = { employee_id?: string | null; id: string; title: string; goal?: string; acceptance?: string; parent_id?: string | null; dependencies?: string[];
   provides?: string; size?: number; status?: string; error?: string | null; difficulty?: string;
   refinement_effort?: string; refinement_reason?: string };
 
@@ -65,7 +65,7 @@ function PartBoard({ apiBase, runId, runStatus, parts, nodes, models, onOpenProf
   const done = nodes.filter(node => node.status === "succeeded").length;
   const unsplit = top.filter(part => SPLIT_STATE[part.status ?? "ready"]);
   const expected = unsplit.reduce((sum, part) => sum + (part.size || 0), 0);
-  const retries = nodes.reduce((sum, node) => sum + Math.max(0, (node.attempts?.length ?? 0) - 1), 0);
+  const retries = nodes.reduce((sum, node) => sum + Math.max(0, (node.attempts?.filter(a => a.outcome !== "delegated").length ?? 0) - 1), 0);
   const selected = nodes.find(node => node.id === selectedId);
 
   /** A part's own tasks and parts, in plan order. */

@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # Steps of one task running at once; 0: no limit, every step whose inputs are ready starts
     # (steps changing the same files still take turns, scopes.py).
     max_parallel_nodes: int = Field(default=0, ge=0)
+    # New projects form a durable team before planning. Existing records keep their workflow.
+    employee_teams: bool = False
+    team_max_employees: int = Field(default=8, ge=1, le=12)
+    team_max_delegation_depth: int = Field(default=3, ge=1, le=5)
+    team_max_delegations: int = Field(default=6, ge=1, le=20)
     # A hard step takes the strongest model, unless a cheaper one scores within this many points:
     # a point or two is not worth a model many times slower and dearer (GLM 5.3 against DeepSeek
     # Flash, 2026-10-21: 93.9 against 92.3 for coding, about 8 times slower and 20 times dearer).

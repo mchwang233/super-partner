@@ -111,6 +111,9 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
     """The node's prompt and a record of what it received from each upstream node."""
     by_id = {item.id: item for item in run.plan.nodes}
     sections, inputs = [f"Task: {node.instructions}"], []
+    from .team import context as employee_context
+    if shared := employee_context(node, run):
+        sections.append(shared)
     if path := run.plan.part_path(node.part_id):
         # Only where the task sits; its instructions are complete on their own.
         sections.append("Part of: " + " › ".join(part.title for part in path)
@@ -243,6 +246,10 @@ def attempt_notes(node: TaskNode) -> str:
 def continue_prompt(node: TaskNode, run: ExecutionRun) -> str:
     """The message that continues a step's conversation with its model in a new attempt."""
     attempt = node.attempts[-1]
+    if run.plan.employees:
+        prompt, _ = node_prompt(node, run, SCOPED_HANDOFF_CHARS)
+        return ("Continue your saved work. Read the current deliveries and files below; delegated work is now "
+                "available only when its status is succeeded. Inspect changed files before editing.\n" + prompt)
     from .contracts import prompt as contract_prompt
     sections = [(f"This step continues in a new attempt. Your previous attempt ended "
                  f"({attempt.outcome}): {(attempt.reason or '')[:500]}")]

@@ -5,6 +5,7 @@ import { MarkdownView } from "./markdown";
 
 export type PlanNode = {
   id: string; title: string; model_id: string; status: string; estimated_cost_usd: number;
+  employee_id?: string | null; delegation_parent_id?: string | null;
   capability?: string; dependencies?: string[]; needs_workspace?: boolean; result?: string;
   difficulty?: string; quality_threshold?: number; routing_note?: string | null; started_at?: string | null;
   acceptance_criteria?: string; verifies?: string[]; attempts?: NodeAttempt[]; failed_attempts?: number;
@@ -36,7 +37,7 @@ function ToolLog({ calls }: { calls: ToolCall[] }) {
   </details>;
 }
 
-const OUTCOME_LABELS: Record<string, string> = { passed: "通过", rejected: "验收未通过", unverified: "尚未验证", superseded: "上游返工，结果失效", budget: "预算不足", cancelled: "已中止", error: "执行出错", verify_failed: "验证发现问题", quota: "额度用完", unavailable: "模型服务暂时不可用", unable: "无法完成" };
+const OUTCOME_LABELS: Record<string, string> = { delegated: "已委派，等待子任务", passed: "通过", rejected: "验收未通过", unverified: "尚未验证", superseded: "上游返工，结果失效", budget: "预算不足", cancelled: "已中止", error: "执行出错", verify_failed: "验证发现问题", quota: "额度用完", unavailable: "模型服务暂时不可用", unable: "无法完成" };
 const INPUT_LABELS: Record<string, string> = { full: "完整结果", summary: "摘要", truncated: "截断的结果" };
 
 /** One line on the card saying where the node stands right now. */
@@ -158,7 +159,7 @@ export function PlanGraph({ apiBase, runId, runStatus, nodes, all = nodes, inPro
   const widest = Math.max(0, ...stages.map(stage => stage.length));
   const activeNode = nodes.find(node => node.id === active);
   const related = new Set(activeNode ? [activeNode.id, ...(activeNode.dependencies ?? []), ...nodes.filter(node => node.dependencies?.includes(activeNode.id)).map(node => node.id)] : []);
-  const retries = nodes.reduce((sum, node) => sum + Math.max(0, (node.attempts?.length ?? 0) - 1), 0);
+  const retries = nodes.reduce((sum, node) => sum + Math.max(0, (node.attempts?.filter(a => a.outcome !== "delegated").length ?? 0) - 1), 0);
   const selected = nodes.find(node => node.id === selectedId);
   // Dependency lines between cards, measured after layout and redrawn when the board resizes.
   const board = useRef<HTMLDivElement>(null);
@@ -239,6 +240,7 @@ function describe(event: TimelineEvent, nodeId: string, number: Map<string, stri
   switch (event.kind) {
     case "node.started": return `开始第 ${data.attempt ?? 1} 次执行${data.model_id ? `（${data.model_id}）` : ""}`;
     case "node.succeeded": return `完成${data.used_model_id && data.used_model_id !== data.selected_model_id ? `（实际由 ${data.used_model_id} 完成）` : ""} · ${formatUsd(data.cost_usd ?? 0)}`;
+    case "node.delegated": return `已委派 ${(data.children ?? []).length} 个子任务，等待验收后继续：${data.reason ?? ""}`;
     case "node.retry": return `未通过，准备第 ${data.attempt} 次尝试${data.model_id ? `（换用 ${data.model_id}）` : ""}：${data.reason ?? ""}`;
     case "node.failed": return `失败：${data.error ?? ""}`;
     default: return null;

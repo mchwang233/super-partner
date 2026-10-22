@@ -20,6 +20,7 @@ from . import (
     retrospect,
     scopes,
     supervisor,
+    team,
 )
 from . import (
     conversation as memory,
@@ -159,6 +160,10 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             )
         if not await self._preflight(run_id):
             return  # paused: something the task needs is missing (preflight.py)
+        run = self.db.get_run(run_id)
+        if run and run.plan.employees:
+            team.refresh_skills(run.plan)
+            self._save(run)
         running: dict[asyncio.Task, str] = {}
         try:
             while True:
@@ -274,7 +279,15 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             node.estimated_cost_usd for node in run.plan.nodes if node.id in in_flight
         )
         held_back = False
+        busy_employees = {n.employee_id for n in run.plan.nodes if n.id in in_flight}
+        provider_load = Counter(self.model_lookup[n.model_id].provider for n in run.plan.nodes
+                                if n.id in in_flight and n.model_id in self.model_lookup)
         for node in ready:
+            model = self.model_lookup.get(node.model_id)
+            if run.plan.employees:
+                provider_cap = settings.provider_limits.get(model.provider, {}).get("concurrency", 0) if model else 0
+                if node.employee_id in busy_employees or (provider_cap and provider_load[model.provider] >= provider_cap):
+                    continue
             # Splits at work do not count: they are the lead's conversations, not steps.
             limit = settings.max_parallel_nodes
             if limit and sum(not item.startswith(PREFIX) for item in running.values()) >= limit:
@@ -283,6 +296,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 held_back = True
                 continue
             reserved += node.estimated_cost_usd
+            busy_employees.add(node.employee_id)
+            if model:
+                provider_load[model.provider] += 1
             running[asyncio.create_task(self._execute_node(run.id, node.id))] = node.id
         return held_back
 
@@ -345,7 +361,15 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             work_accounted = result.accounted_cost_usd
             latest = self.db.get_run(run_id)
             stale = latest and next(n for n in latest.plan.nodes if n.id == node_id).generation != generation
-            verdict = quality.Verdict(False, "上游已返工，本次结果失效。") if stale else await self._check(run, node, result.text, changed, workspace)
+            if run.plan.employees and result.text.lstrip().startswith(team.DELEGATE):
+                try:
+                    payload = team.parse_delegation(result.text)
+                    await self._delegate_result(run_id, node_id, payload, result, inputs, changed, cost, generation)
+                    return
+                except (ValueError, TypeError) as exc:
+                    verdict = quality.Verdict(False, f"委派请求未通过校验：{exc}", fix=str(exc))
+            else:
+                verdict = quality.Verdict(False, "上游已返工，本次结果失效。") if stale else await self._check(run, node, result.text, changed, workspace)
             if result.turn_limit and verdict.passed and not verdict.reviewer_model_id:
                 # Nobody checked it, and a summary made at the turn limit says the work is unfinished.
                 verdict = quality.Verdict(False, f"{TURN_LIMIT_HINT}，只交了进度总结，且没有验收模型确认已完成。")
@@ -385,6 +409,46 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         finally:
             self.node_tasks.pop((run_id, node_id), None)
 
+    async def _delegate_result(self, run_id, node_id, payload, result, inputs, changed, cost, generation):
+        """Commit the child graph and parent's yielded attempt in one saved run."""
+        async with self.locks.setdefault(run_id, asyncio.Lock()):
+            run = self.db.get_run(run_id)
+            if not run:
+                return
+            node = next(n for n in run.plan.nodes if n.id == node_id)
+            stale = node.generation != generation
+            stopped = (run.status in {RunStatus.CANCELLED, RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.INCOMPLETE}
+                       or node.status != NodeStatus.RUNNING)
+            outcome = Outcome.SUPERSEDED if stale else Outcome.CANCELLED if stopped else Outcome.DELEGATED
+            children = []
+            if not stale and not stopped:
+                for governor in team.governors(run.plan, node):
+                    if reason := progress.limit_reason(governor):
+                        raise StepLimitExceeded(reason)
+                existing = [n for n in run.plan.nodes if n.delegation_parent_id == node.id
+                            and n.delegation_request_id == payload.get("request_id")]
+                if existing and all(n.status == NodeStatus.SUCCEEDED for n in existing):
+                    raise ValueError("该委派已完成，请使用已有子任务结果继续原任务，不要再次委派。")
+                children = team.delegate(run, node, payload, list(self.model_lookup.values()), self._configured(run),
+                                         any(item.kind == "image" for item in run.attachments))
+                node = next(n for n in run.plan.nodes if n.id == node_id)
+                node.status = NodeStatus.PENDING
+                node.review_passed, node.feedback = None, None
+                node.review = "等待委派任务验收：" + "、".join(n.title for n in children)
+                node.result, node.inputs = result.text, inputs
+                node.changed_files = list(dict.fromkeys([*node.changed_files, *changed]))
+            node.attempts.append(NodeAttempt(model_id=result.used_model_id or node.model_id, outcome=outcome,
+                                            reason=node.review if children else "任务已停止或上游变化，未发布子任务。",
+                                            cost_usd=cost, **self._take_log(run_id, node_id, result)))
+            run.actual_cost_usd = round(run.actual_cost_usd + max(0, cost - result.accounted_cost_usd), 6)
+            from .routing import reestimate
+            reestimate(run)
+            self._save(run)
+            if children:
+                self.emit(run_id, "node.delegated", node_id=node_id, employee_id=node.employee_id,
+                          children=[{"id": n.id, "employee_id": n.employee_id, "title": n.title} for n in children],
+                          reason=str(payload.get("reason") or "")[:2000])
+
     def _conversation(self, run: ExecutionRun, node) -> Conversation:
         """Restore within the same task generation/dependency revision; model switches receive
         an archived handoff. Long contexts are compressed by the provider, never discarded."""
@@ -413,12 +477,19 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
 
         upstream = [item.attempts[-1].finished_at for item in run.plan.nodes
                     if item.id in node.dependencies and item.attempts]
-        valid = held and (held.fence is None or held.fence == fence)
+        delegated_resume = False
+        if held and held.fence and last and last.outcome == Outcome.DELEGATED:
+            previous = held.fence
+            child_ids = {n.id for n in run.plan.nodes if n.delegation_parent_id == node.id}
+            delegated_resume = (all(previous.get(k) == fence[k] for k in ("generation", "project", "request"))
+                                and all(fence["dependencies"].get(k) == v for k, v in previous.get("dependencies", {}).items())
+                                and set(fence["dependencies"]) - set(previous.get("dependencies", {})) <= child_ids)
+        valid = held and (held.fence is None or held.fence == fence or delegated_resume)
         if (valid and held.model_id == node.model_id
                 and (last is None or (last.outcome != Outcome.SUPERSEDED
                      and (last.outcome != Outcome.CANCELLED or last.interrupted)
                      and progress.STOPPED not in (last.reason or "")
-                     and not any(finished > last.finished_at for finished in upstream)))):
+                     and (delegated_resume or not any(finished > last.finished_at for finished in upstream))))):
             bind(held)
             held.followup = quality.continue_prompt(node, run) if last else (
                 "The service restarted during this step. Continue from its saved state. "
@@ -451,6 +522,10 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
 
     def refresh_model(self, run, node):
         """Revalidate a stored selection immediately before confirming or executing it."""
+        if run.plan.employees:
+            team.route(node, run.plan, list(self.model_lookup.values()), self._configured(run),
+                       any(item.kind == "image" for item in run.attachments))
+            return
         model = self.model_lookup.get(node.model_id)
         configured = self._configured(run)
         available = eligible_for_node(node, list(self.model_lookup.values()), configured,
@@ -492,6 +567,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         """Keep one API provider from carrying all of the task's running steps, so that its
         outage or rate limit does not stop them all: past ``max_steps_per_provider`` the node
         goes to another provider's model when one fits (routing.spread_to)."""
+        if run.plan.employees:
+            return  # the lead owns employee model assignments
         cap = settings.max_steps_per_provider
         provider = (node.model_id or "").split(":", 1)[0]
         if not cap or not node.model_id or provider in ("cli", "mock"):
@@ -614,11 +691,12 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 prompt = await asyncio.to_thread(self._with_files, run, node, workspace, prompt)
             log = self.tool_logs[run.id, node.id] = []
             trace = self.tool_traces[run.id, node.id] = trace_path(run.id, node.id, len(node.attempts) + 1)
-            if node.artifact_contract:
-                if reason := progress.limit_reason(node):
+            for governor in team.governors(run.plan, node):
+                if reason := progress.limit_reason(governor):
                     raise StepLimitExceeded(reason)
                 if model_id.startswith("cli:") or not act:
                     raise contracts.ArtifactBlocked("此通道不能可靠执行声明的工具轮次上限；需要可计数的 API 工具通道。")
+            if node.artifact_contract:
                 await asyncio.to_thread(contracts.prepare, run, node)
                 async with self.locks.setdefault(run.id, asyncio.Lock()):
                     latest = self.db.get_run(run.id)
@@ -878,32 +956,35 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 if latest:
                     latest.actual_cost_usd = round(latest.actual_cost_usd + cost, 6)
                     current = next((item for item in latest.plan.nodes if node and item.id == node.id), None)
-                    if current and current.artifact_contract:
-                        current.contract_cost_usd += cost
+                    if current:
+                        for governor in team.governors(latest.plan, current):
+                            governor.contract_cost_usd += cost
                     self._save(latest)
 
         def remaining():
             latest = self.db.get_run(run.id)
             return latest.budget_usd - latest.actual_cost_usd if latest else float("-inf")
 
-        def current():
+        def current_limits():
             latest = self.db.get_run(run.id)
-            return next(item for item in latest.plan.nodes if item.id == node.id)
+            step = next(item for item in latest.plan.nodes if item.id == node.id)
+            return team.governors(latest.plan, step)
 
         async def use_turn():
             async with self.locks.setdefault(run.id, asyncio.Lock()):
                 latest = self.db.get_run(run.id)
                 step = next(item for item in latest.plan.nodes if item.id == node.id)
-                step.contract_turns += 1
+                for governor in team.governors(latest.plan, step):
+                    governor.contract_turns += 1
                 self._save(latest)
 
-        contract = node.artifact_contract if node else None
+        limits = team.governors(run.plan, node) if node else []
         budget = RequestBudget(self.model_lookup, remaining, self.reservations.setdefault(run.id, {}), charge,
                                self.budget_events.setdefault(run.id, asyncio.Event()),
-                               step_remaining=(lambda: contract.max_cost_usd - current().contract_cost_usd) if contract else None,
-                               turn_remaining=(lambda: contract.max_turns - current().contract_turns) if contract and work else None,
-                               use_turn=use_turn if contract and work else None,
-                               scope=(run.id, node.id) if contract else None, wait_for_step=work)
+                               step_remaining=(lambda: min(n.artifact_contract.max_cost_usd - n.contract_cost_usd for n in current_limits())) if limits else None,
+                               turn_remaining=(lambda: min(n.artifact_contract.max_turns - n.contract_turns for n in current_limits())) if limits and work else None,
+                               use_turn=use_turn if limits and work else None,
+                               scope=(run.id, limits[-1].id) if limits else None, wait_for_step=work)
         budget.context = {"run_id": run.id, "node_id": node.id if node else None,
                           "purpose": "work" if work else "review_or_control"}
         result = None

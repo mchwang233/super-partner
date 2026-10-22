@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from . import contracts
+from . import contracts, team
 from .models import ExecutionRun, ModelProfile, NodeStatus, TaskNode
 from .outline import MAX_TASKS
 from .planner import _difficulty, package
@@ -41,6 +41,8 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
     removed = [changeable(str(item), "remove") for item in change.get("remove") or []]
     if any(node.artifact_contract for node in removed):
         raise PlanError("artifact contract steps cannot be removed to bypass delivery or stop limits")
+    if any(node.delegation_parent_id or any(child.delegation_parent_id == node.id for child in nodes.values()) for node in removed):
+        raise PlanError("delegated work must retain its parent and audit history; update it instead of removing it")
     gone = {node.id for node in removed}
     add = change.get("add") or []
     if not isinstance(add, list):
@@ -77,7 +79,7 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
             raise PlanError(f"step {raw['key']} needs instructions")
         added.append(TaskNode(
             id=keys[str(raw["key"]).strip()], title=str(raw.get("title") or raw["key"])[:120],
-            instructions=instructions, capability=capability,
+            instructions=instructions, capability=capability, employee_id=raw.get("employee_id"),
             acceptance_criteria=str(raw.get("acceptance_criteria") or "").strip()[:1000],
             dependencies=resolve(raw.get("dependencies") or [], f"step {raw['key']} dependencies"),
             verifies=resolve(raw.get("verifies") or [], f"step {raw['key']} verifies"),
@@ -98,6 +100,9 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
                 raise PlanError("artifact acceptance criteria must be preserved")
         elif "artifact_contract" in raw:
             node.artifact_contract = contracts.declarations(raw)["artifact_contract"]
+        if "employee_id" in raw:
+            node.employee_id = raw["employee_id"]
+            node.model_id = None
         for field in ("title", "instructions", "acceptance_criteria"):
             if raw.get(field):
                 setattr(node, field, str(raw[field]).strip()[:120 if field == "title" else 20_000])
@@ -119,9 +124,14 @@ def change_plan(run: ExecutionRun, change: dict, models: list[ModelProfile], con
         contracts.validate(run.plan.model_copy(update={"nodes": remaining}), partial=True)
     except contracts.ContractError as exc:
         raise PlanError(str(exc)) from exc
-    for node in added:
+    for node in added + (updated if run.plan.employees else []):
         try:
-            route_node(node, models, configured, needs_vision)
+            if run.plan.employees:
+                if not node.employee_id:
+                    node.employee_id = next((p.employee_id for p in run.plan.parts if p.id == node.part_id), None)
+                team.route(node, run.plan, models, configured, needs_vision)
+            else:
+                route_node(node, models, configured, needs_vision)
         except NoEligibleModelError as exc:
             raise PlanError(f"no model can take step {node.title}: {exc}") from exc
     run.plan.nodes = remaining

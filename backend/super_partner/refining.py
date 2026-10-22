@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from . import outline, supervisor
+from . import outline, supervisor, team
 from .config import settings
 from .models import FINISHED, RunStatus
 from .routing import NoEligibleModelError, fit_and_route, reestimate
@@ -91,7 +91,10 @@ class Refining:
                             for node in nodes:
                                 node.needs_workspace = bool(run.parent_run_id) or (run.plan.in_project and node.needs_workspace)
                                 try:
-                                    fit_and_route(node, models, self._configured(run), vision)
+                                    if run.plan.employees:
+                                        team.route(node, run.plan, models, self._configured(run), vision)
+                                    else:
+                                        fit_and_route(node, models, self._configured(run), vision)
                                 except NoEligibleModelError as exc:
                                     raise NoEligibleModelError(f"没有模型能做「{node.title}」：{exc}") from exc
                             run.plan = outline.combine_split(run.plan, part_id, parts, nodes)

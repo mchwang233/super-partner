@@ -819,3 +819,16 @@ button.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;
 .call-insights table{width:100%;border-collapse:collapse;text-align:left;font-size:13px}
 .call-insights th,.call-insights td{padding:9px;border-bottom:1px solid var(--line)}
 .call-insights td small{display:block;color:var(--faint)}
+
+/* Project employees: stable responsibilities, assignments and delegated work. */
+.team-page{display:grid;gap:18px;padding:4px 0}
+.team-overview,.team-card-head{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.team-page h4{margin:0 0 6px}.team-overview p,.team-task-meta,.team-card-head span{color:var(--muted);font-size:12px;margin:6px 0}
+.team-overview label{display:grid;gap:5px;font-size:12px;color:var(--muted)}.team-overview input{max-width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--text)}
+.team-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,310px),1fr));gap:14px;align-items:start}
+.team-card,.team-agreement,.team-unassigned{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--panel-2);min-width:0;overflow-wrap:anywhere}
+.team-card>p{font-size:13px;line-height:1.6}.team-card dl{display:grid;grid-template-columns:64px 1fr;gap:8px;font-size:12px;margin:14px 0}.team-card dt{color:var(--muted)}.team-card dd{margin:0}
+.team-page summary{cursor:pointer;font-size:12px;color:var(--muted)}.team-card details{margin:10px 0}.team-page details p{font-size:13px;line-height:1.6}
+.team-tasks{padding:0;margin:14px 0 0;list-style:none}.team-tasks li{padding:12px 0;border-top:1px solid var(--line)}
+.team-task-line{display:flex;gap:12px;justify-content:space-between;align-items:flex-start}.team-task-line>button{font-size:13px;text-align:left;line-height:1.6}.team-task-line .state{flex-shrink:0}
+.team-agreement .markdown-body{font-size:13px}.team-agreement section{margin:12px 0}.team-unassigned .team-tasks{margin-top:6px}

@@ -136,6 +136,12 @@ def combine_split(plan: TaskPlan, part_id: str, parts: list[PlanPart], nodes: li
     try:
         if len(combined.nodes) > MAX_TASKS:
             raise contracts.ContractError(f"The combined plan exceeds {MAX_TASKS} tasks; merge tasks in your part.")
+        if combined.employees:
+            from .team import member
+            for node in combined.nodes:
+                employee = member(combined, node.employee_id)
+                if not employee or node.capability not in employee.capabilities:
+                    raise contracts.ContractError(f"{node.title}: employee_id must match a capable team member")
         contracts.validate(combined, partial=True)
     except contracts.ContractError as exc:
         raise SplitConflict(str(exc), parts, nodes) from exc
@@ -215,6 +221,7 @@ class Tree:
             if raw["kind"] == "task":
                 node = raw["node"]
                 node.part_id = parent
+                node.employee_id = node.employee_id or (self.parts[parent].employee_id if parent else None)
                 self.tasks[node.id] = node
                 item = node.id
                 self.checks[item] = [ids[key] for key in raw["verifies"]]
@@ -222,7 +229,8 @@ class Tree:
                 part = PlanPart(id=uuid4().hex[:8], title=str(raw.get("title") or raw["key"])[:120],
                                 goal=str(raw.get("goal") or "").strip()[:1000],
                                 acceptance=str(raw.get("acceptance") or "").strip()[:1000],
-                                parent_id=parent, dependencies=waits)
+                                parent_id=parent, dependencies=waits,
+                                employee_id=raw.get("employee_id") or (self.parts[parent].employee_id if parent else None))
                 self.parts[part.id] = part
                 item = part.id
                 added.append(part)
@@ -361,10 +369,16 @@ async def _ask(say: Say, message: str, read):
         return read(_extract_json(reply))
 
 
-async def plan_outline(say: Say, opening: str) -> TaskPlan:
+async def plan_outline(say: Say, opening: str, team_plan=None) -> TaskPlan:
     """The major parts of a plan, from the lead through ``say``; their tasks come later
     (``refine``). Raises ValueError if the lead's replies cannot be turned into an outline."""
     def read(payload: dict):
+        if team_plan:
+            from .team import member
+            for item in payload.get("parts") or []:
+                employee = member(team_plan, item.get("employee_id"))
+                if not employee or item.get("capability", "coding") not in employee.capabilities:
+                    raise ValueError("each part needs a capable employee_id from the existing team")
         return (str(payload.get("summary") or "").strip(), siblings(payload.get("parts"), False, parts_only=True),
                 payload.get("requires"), str(payload.get("folder") or ""))
 
@@ -394,7 +408,8 @@ async def plan_outline(say: Say, opening: str) -> TaskPlan:
     commands = [text for item in requires if isinstance(item, (str, int))
                 and 0 < len(text := str(item).strip()) <= MAX_REQUIRE_CHARS] if isinstance(requires, list) else []
     return TaskPlan(summary=(summary or "Autonomous task plan")[:240], nodes=[], parts=parts,
-                    requires=list(dict.fromkeys(commands))[:MAX_REQUIRES], folder=folder[:80])
+                    requires=list(dict.fromkeys(commands))[:MAX_REQUIRES], folder=folder[:80],
+                    employees=team_plan.employees if team_plan else [], team_brief=team_plan.team_brief if team_plan else "")
 
 
 def outline_text(plan: TaskPlan) -> str:
@@ -415,7 +430,9 @@ def part_opening(plan: TaskPlan, part: PlanPart, internet: bool = False) -> str:
     """The first message to the planner of ``part``, before it is asked to split it; ``internet``
     is whether the task allows it now (it can change after planning)."""
     request = plan.request.replace(INTERNET_NOTE, "").rstrip()
-    return (PART_ROLE + f"\nOutline of the task ({plan.summary}):\n{outline_text(plan)}\n\n"
+    from .team import assignment_prompt
+    shared = assignment_prompt(plan) if plan.employees else ""
+    return (PART_ROLE + shared + f"\nOutline of the task ({plan.summary}):\n{outline_text(plan)}\n\n"
             f"Your part: {part.title}\n\nRequest and context:\n{request}\n\n"
             + (INTERNET_NOTE if internet else "The task does not allow the internet: its steps have no network.")
             + "\n\n")

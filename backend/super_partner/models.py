@@ -144,6 +144,7 @@ class ToolCall(BaseModel):
 class Outcome:
     """How an attempt of a step ended (``NodeAttempt.outcome``)."""
     PASSED = "passed"
+    DELEGATED = "delegated"       # yielded to accepted child work; not a failure
     REJECTED = "rejected"            # the reviewer did not accept the result
     VERIFY_FAILED = "verify_failed"  # a verification step found problems
     UNVERIFIED = "unverified"        # no reviewer could give a verdict
@@ -270,6 +271,10 @@ class TaskNode(BaseModel):
     artifact_inputs: dict[str, str] = Field(default_factory=dict)
     # The innermost plan part (PlanPart) this task belongs to; None in a plan without parts.
     part_id: Optional[str] = None
+    employee_id: Optional[str] = None
+    delegation_parent_id: Optional[str] = None
+    delegation_request_id: Optional[str] = None
+    delegation_payload_hash: str = ""
     # Major parts whose finished work this task runs or tests, so it waits for them (outline.link).
     # Other tasks build against what those parts provide and start at once.
     after_parts: list[str] = Field(default_factory=list)
@@ -331,6 +336,7 @@ class PlanPart(BaseModel):
     goal: str = ""
     acceptance: str = ""
     parent_id: Optional[str] = None
+    employee_id: Optional[str] = None
     # Earlier parts or tasks under the same parent that this part waits for.
     dependencies: list[str] = Field(default_factory=list)
     # What other parts may rely on (names, signatures, endpoints, file formats): parts are split
@@ -369,10 +375,25 @@ class Preflight(BaseModel):
     skills: list[str] = Field(default_factory=list)
 
 
+class Employee(BaseModel):
+    """A project-scoped responsibility and model, chosen before work is split."""
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=80)
+    role: str = Field(min_length=1, max_length=2000)
+    model_id: str
+    capabilities: list[str] = Field(min_length=1, max_length=6)
+    skills: list[str] = Field(default_factory=list, max_length=6)
+    skill_tools: list[str] = Field(default_factory=list, max_length=12)
+    skill_context: str = ""
+    reason: str = Field(default="", max_length=1000)
+
+
 class TaskPlan(BaseModel):
     summary: str
     nodes: list[TaskNode]
     parts: list[PlanPart] = Field(default_factory=list)
+    employees: list[Employee] = Field(default_factory=list, max_length=12)
+    team_brief: str = ""
     # What the plan was made from (request, project context and brief), for splitting its parts
     # later; and whether its steps work in a project folder.
     request: str = ""

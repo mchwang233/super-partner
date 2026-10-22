@@ -4,6 +4,7 @@ import { ModelProfiles, type Model } from "./model-profiles";
 import { AttachButton, AttachmentTray, TaskAttachments, useAttachments, type Attachment } from "./attachments";
 import { type PlanNode } from "./plan-graph";
 import { PlanView, type PlanPart } from "./plan-parts";
+import { TeamPage, type Employee } from "./team";
 import { ResultPage, type ChangeOptions } from "./result-page";
 import { MarkdownView } from "./markdown";
 import { DiagnosisPanel, type Diagnosis } from "./diagnosis";
@@ -15,7 +16,7 @@ import { canCancelMission, canDeleteMission, CancelMissionDialog, DeleteMissionB
 import "./style.css";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
-type Run = {id:string;status:string;prompt?:string;created_at?:string;updated_at?:string;diagnoses?:Diagnosis[];supervisor?:{model_id?:string|null;calls?:number}|null;decisions?:Decision[];lead_messages?:LeadMessage[];lead_thinking?:LeadThinking|null;maintenance_id?:string|null;engineer_job_id?:string|null;waiting_diagnosis_id?:string|null;parent_run_id?:string|null;budget_usd:number;use_cli:boolean;allow_network?:boolean;project_dir?:string|null;attachments?:Attachment[];rework_rounds?:number;actual_cost_usd:number;final_result?:string;error?:string;plan:{summary:string;nodes:PlanNode[];parts?:PlanPart[];planning_method:string;planner_model_id?:string;planning_note?:string;planning_cost_usd:number;estimate:{low_usd:number;high_usd:number}}};
+type Run = {id:string;status:string;prompt?:string;created_at?:string;updated_at?:string;diagnoses?:Diagnosis[];supervisor?:{model_id?:string|null;calls?:number}|null;decisions?:Decision[];lead_messages?:LeadMessage[];lead_thinking?:LeadThinking|null;maintenance_id?:string|null;engineer_job_id?:string|null;waiting_diagnosis_id?:string|null;parent_run_id?:string|null;budget_usd:number;use_cli:boolean;allow_network?:boolean;project_dir?:string|null;attachments?:Attachment[];rework_rounds?:number;actual_cost_usd:number;final_result?:string;error?:string;plan:{summary:string;nodes:PlanNode[];parts?:PlanPart[];employees?:Employee[];team_brief?:string;planning_method:string;planner_model_id?:string;planning_note?:string;planning_cost_usd:number;estimate:{low_usd:number;high_usd:number}}};
 type ReplyToDiagnosis = (run:Run, diagnosisId:string, body:{text:string;choice?:string})=>Promise<string|null>;
 type Provider = {id:string;name:string;configured:boolean};
 // The task list polls often; the model catalog is large and changes rarely.
@@ -112,7 +113,7 @@ function BudgetInput({value,onChange,...rest}:{value:number;onChange:(value:numb
   return <input {...rest} type="number" min="0.01" step="any" inputMode="decimal" value={text} onChange={e=>{setText(e.target.value);onChange(e.target.value===""?0:+e.target.value)}}/>;
 }
 
-type Tab = "chat"|"progress"|"result"|"details";
+type Tab = "chat"|"progress"|"team"|"result"|"details";
 const STEPS = ["计划","确认","执行","结果"];
 /** Where the task is in plan → confirm → run → result, and whether that step went wrong. */
 function stepOf(status:string):{at:number;problem:boolean}{
@@ -166,6 +167,7 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "run.decision":(data,title)=>`负责人决定${data.node_id?`（${title(data.node_id)}）`:""}：${({retry:"按要求重试",switch_model:`换成 ${data.model_id??"其它模型"}`,accept:"接受当前结果",unable:"判定无法完成",ask_user:"需要问你",repair_environment:"修复环境",repair_platform:"修复 Super Partner",request_component:"请平台工程师添加组件",rework:`返工 ${(data.targets??[]).map(title).join("、")}`,replan:"调整计划",done:"确认任务完成",fallback:"暂时无法决策，交给诊断"} as Record<string,string>)[data.action]??data.action}${data.reason?` · ${data.reason}`:""}`,
   "run.plan_changed":data=>`负责人调整了计划：${[data.added?.length?`新增 ${data.added.join("、")}`:"",data.removed?.length?`删除 ${data.removed.join("、")}`:"",data.updated?.length?`修改 ${data.updated.join("、")}`:""].filter(Boolean).join("；")}`,
   "run.lead_thinking":(data,title)=>`负责人开始判断${data.node_id?`（${title(data.node_id)}）`:""}：${({attempt_failed:"尝试失败后怎么处理",verify_failed:"验证没通过是否返工",user_answer:"根据你的回答下一步做什么",all_done:"整体结果是否满足需求",repair_done:"修复是否真的生效",engineer_done:"平台工程师的结果如何处理",overrun:"超出预计轮数是否继续"} as Record<string,string>)[data.event]??data.event}`,
+  "node.delegated":(data,title)=>`${title(data.node_id)} 委派了 ${data.children?.length??0} 个子任务，等待验收结果`,
   "run.engineer_requested":(data,title)=>`负责人请平台工程师添加组件${data.node_id?`（${title(data.node_id)}）`:""}，等你在负责人对话里批准方案`,
   "run.lead_changed":data=>`负责人换成 ${data.model_id}${data.previous_model_id?`（原为 ${data.previous_model_id}）`:""}`,
   "node.succeeded":(data,title)=>`${title(data.node_id)}：完成`,
@@ -308,11 +310,12 @@ function MissionDetail({run,models,deletingId,cancellingId,onConfirm,onResume,on
     {error&&<div className="error" role="alert">{error}</div>}
     {run.error&&<div className="error">{run.error}</div>}
     {waiting&&tab!=="chat"&&<div className="chat-alert" role="status"><span>{waiting}</span><button type="button" className="primary" onClick={()=>pick("chat")}>去回复</button></div>}
-    <nav className="task-tabs" aria-label="任务内容">{([...(hasChat?[["chat","对话"]]:[]),["progress","进度"],["result","结果"],["details","详情"]] as [Tab,string][]).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}{id==="chat"&&waiting&&<i className="tab-dot" title="在等你回复"/>}</button>)}</nav>
+    <nav className="task-tabs" aria-label="任务内容">{([...(hasChat?[["chat","对话"]]:[]),["progress","进度"],["team","员工"],["result","结果"],["details","详情"]] as [Tab,string][]).map(([id,label])=><button key={id} type="button" aria-pressed={tab===id} onClick={()=>pick(id)}>{label}{id==="chat"&&waiting&&<i className="tab-dot" title="在等你回复"/>}</button>)}</nav>
     {tab==="chat"&&hasLead(run)&&<LeadPanel apiBase={API} run={run} models={models} onReply={(id,body)=>onReply(run,id,body)} onAsk={(text=>onAsk(run,text)) satisfies AskLead} onOpenEngineer={onOpenEngineer}/>}
     {/* Diagnoses that run when no lead decides, or that the lead sends to repair something. */}
     {tab==="chat"&&<DiagnosisPanel run={{...run,diagnoses}} models={models} onReply={(id,body)=>onReply(run,id,body)}/>}
     {tab==="progress"&&<PlanView apiBase={API} runId={run.id} runStatus={run.status} nodes={nodes} parts={run.plan.parts} inProject={!!run.project_dir} models={models} onOpenProfile={onOpenModel} reworkRounds={run.rework_rounds}/>}
+    {tab==="team"&&<TeamPage apiBase={API} runId={run.id} runStatus={run.status} employees={run.plan.employees} nodes={nodes} parts={run.plan.parts} brief={run.plan.team_brief} models={models} onOpenModel={onOpenModel}/>}
     {tab==="result"&&<ResultPage apiBase={API} run={run} embedded onChange={(prompt,budget,options)=>onChange(run,prompt,budget,options)}/>}
     {tab==="details"&&<TaskDetails run={run} onNetwork={onNetwork}/>}
   </section>

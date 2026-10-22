@@ -83,10 +83,13 @@ def handover(run: ExecutionRun) -> str:
         f"Working directory: {run.project_dir or settings.workspace_root / run.folder_id}",
         "Steps:",
     ]
+    if run.plan.employees:
+        from .team import assignment_prompt
+        lines.append(assignment_prompt(run.plan))
     for node in run.plan.nodes:
         deps = f" (after {', '.join(node.dependencies)})" if node.dependencies else ""
         lines.append(f"- [{node.id}] {node.title}{part_of(run, node)}{deps}: {node.status.value}, {len(node.attempts)} attempts, "
-                     f"model {node.model_id}")
+                     f"model {node.model_id}" + (f", employee {node.employee_id}, delegated by {node.delegation_parent_id}" if node.employee_id else ""))
         if node.status == NodeStatus.SUCCEEDED and (node.summary or node.result):
             lines.append(f"  result: {(node.summary or node.result)[:MAX_RESULT_CHARS]}")
         elif node.attempts and node.attempts[-1].outcome != "passed":
