@@ -1,11 +1,15 @@
 """No turn limit and no fixed timeout: a long attempt is checked, and stopped only if stuck."""
 import asyncio
+import contextlib
 import json
 import os
+import shlex
+import signal
+import sys
 
 import httpx
 import pytest
-from super_partner import progress
+from super_partner import activity, progress
 from super_partner.budget import ProviderError
 from super_partner.cli_channels import CliChannelRegistry
 from super_partner.config import settings
@@ -109,6 +113,61 @@ async def test_a_cli_past_its_timeout_is_checked_not_killed(tmp_path, monkeypatc
     text = await CliChannelRegistry().complete("cli:codex", "hi", tmp_path, timeout=0.1, watch=watch)
     assert text == "finished"
     assert checks and "made.txt" in checks[0] and "sleep" in checks[0]
+
+
+async def test_a_cli_child_in_a_session_of_its_own_is_still_seen_running(tmp_path, monkeypatch, often):
+    child = tmp_path / "child.pid"
+    code = ("import os,time; os.setsid(); "
+            f"open({str(child)!r},'w').write(str(os.getpid())); time.sleep(30)")
+    fake_codex(tmp_path, monkeypatch,
+               "#!/bin/sh\n"
+               f"{shlex.quote(sys.executable)} -c {shlex.quote(code)} &\n"
+               "i=0\n"
+               f"while [ ! -s {shlex.quote(str(child))} ] && [ $i -lt 200 ]; do i=$((i+1)); sleep 0.01; done\n"
+               "sleep 1\n"
+               "echo finished\n")
+    checks = []
+
+    async def watch(evidence):
+        checks.append(evidence)
+
+    try:
+        text = await CliChannelRegistry().complete("cli:codex", "hi", tmp_path, timeout=0.1, watch=watch)
+        assert text == "finished"
+        assert any("time.sleep(30)" in evidence for evidence in checks), checks
+    finally:
+        pid = child.read_text().strip() if child.exists() else ""
+        if pid.isdigit():
+            with contextlib.suppress(OSError):
+                os.kill(int(pid), signal.SIGKILL)
+
+
+async def test_a_growing_log_and_the_output_it_prints_are_shown_to_the_checker(tmp_path, monkeypatch, often):
+    # Codex prints one JSON event per line; the last agent message is its answer.
+    fake_codex(tmp_path, monkeypatch,
+               "#!/bin/sh\n"
+               "i=0\n"
+               "while [ $i -lt 30 ]; do i=$((i+1)); echo \"regression $i\" >> run.log; "
+               "printf '{\"type\":\"item.completed\",\"item\":{\"id\":\"m%s\",\"type\":\"agent_message\","
+               "\"text\":\"regression %s\"}}\\n' \"$i\" \"$i\"; sleep 0.05; done\n"
+               "sleep 1\n"
+               "printf '{\"type\":\"item.completed\",\"item\":{\"id\":\"done\","
+               "\"type\":\"agent_message\",\"text\":\"finished\"}}\\n'\n")
+    checks = []
+
+    async def watch(evidence):
+        checks.append(evidence)
+
+    with activity.recording([]):
+        text = await CliChannelRegistry().complete("cli:codex", "hi", tmp_path, timeout=0.1, watch=watch)
+    assert text == "finished"
+    assert any("run.log" in evidence and "larger" in evidence for evidence in checks), checks
+    assert any("printed" in evidence for evidence in checks), checks
+
+
+def test_the_checker_is_told_a_long_regression_with_children_is_progressing():
+    prompt = progress.check_prompt(TaskNode(id="n", title="t", instructions="i", capability="coding"), 30, "e")
+    assert "regression" in prompt and "child processes" in prompt
 
 
 async def test_a_stuck_cli_is_stopped_with_its_processes_and_does_not_fall_back(tmp_path, monkeypatch, often):

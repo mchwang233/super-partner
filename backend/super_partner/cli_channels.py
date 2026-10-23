@@ -467,28 +467,34 @@ class CliChannelRegistry:
             return CliStatus(id=spec.id, installed=True, authenticated=False, error=str(exc)[:200])
 
     @staticmethod
-    async def _watched(spec, process, talk: asyncio.Future, cwd: Path, watch: progress.Watch, started: float):
+    async def _watched(spec, process, talk: asyncio.Future, cwd: Path, watch: progress.Watch, started: float,
+                       printed: list[int]):
         """Wait for the CLI, asking ``watch`` every progress_check_minutes whether it is stuck;
-        ``started`` is when it was launched (epoch seconds)."""
-        last = started
+        ``started`` is when it was launched (epoch seconds), ``printed`` how much output it has
+        produced so far."""
+        last, seen = started, 0
+        tracker = progress.CliProgress(Path(cwd), started, process.pid)
         while True:
             done, _ = await asyncio.wait({talk}, timeout=settings.progress_check_minutes * 60)
             if done:
                 return talk.result()
-            evidence = await progress.cli_evidence(Path(cwd), started, last, process.pid)
-            last = time.time()
+            evidence = await tracker.evidence(last, log=activity.current.get(), printed=printed[0] - seen)
+            seen, last = printed[0], time.time()
             if reason := await watch(evidence):
                 raise progress.Stopped(f"{spec.executable} {progress.STOPPED}{reason}")
 
     @staticmethod
-    async def _streamed(process, stdin: Optional[bytes], last: list) -> tuple[bytes, bytes]:
-        """``process.communicate``, noting in ``last[0]`` when it last printed anything, and
-        passing each line it prints to the running step's activity (activity.note_line)."""
+    async def _streamed(process, stdin: Optional[bytes], last: list, printed: Optional[list] = None) -> tuple[bytes, bytes]:
+        """``process.communicate``, noting in ``last[0]`` when it last printed anything, in
+        ``printed[0]`` how much it has printed, and passing each line to the running step's
+        activity (activity.note_line)."""
         async def drain(stream, sink, lines=False):
             pending = b""
             while chunk := await stream.read(65536):
                 sink.append(chunk)
                 last[0] = time.monotonic()
+                if printed is not None:
+                    printed[0] += len(chunk)
                 if lines:
                     *done, pending = (pending + chunk).split(b"\n")
                     for line in done:
@@ -570,12 +576,15 @@ class CliChannelRegistry:
             # The CLI may already be running; finish spawning so its whole group can be killed.
             await _kill_process_group(await spawn)
             raise
-        last = [time.monotonic()]
-        streamed = idle or activity.current.get() is not None
-        talk = asyncio.ensure_future(self._streamed(process, stdin, last) if streamed else process.communicate(stdin))
+        last, printed = [time.monotonic()], [0]
+        # A watched CLI streams too: the checker is told how much output it printed since the
+        # last check, even when the call is not the step's own activity.
+        streamed = idle or watch is not None or activity.current.get() is not None
+        talk = asyncio.ensure_future(self._streamed(process, stdin, last, printed)
+                                     if streamed else process.communicate(stdin))
         try:
             if watch is not None:
-                stdout, stderr = await self._watched(spec, process, talk, cwd, watch, started)
+                stdout, stderr = await self._watched(spec, process, talk, cwd, watch, started, printed)
             elif idle:
                 stdout, stderr = await self._until_quiet(spec, talk, last, idle, timeout)
             else:
