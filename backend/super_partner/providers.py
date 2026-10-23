@@ -20,7 +20,7 @@ from . import conversation as memory
 from . import progress, streaming
 from .budget import BudgetExceeded, ProviderError, StepLimitExceeded
 from .call_control import ProviderGate, input_bound, retry_after
-from .cli_channels import CLI_SPECS, CliChannelRegistry, SessionLost
+from .cli_channels import CLI_SPECS, CliChannelRegistry, InputTooLarge, SessionLost, input_too_large
 from .config import settings
 from .contracts import ArtifactBlocked
 from .conversation import Conversation
@@ -222,7 +222,7 @@ class ProviderRegistry:
             raise self.quota.error(model_id)
         try:
             return await self._complete(model_id, prompt, *args, **kwargs)
-        except ModelUnavailable:
+        except (ModelUnavailable, InputTooLarge):
             raise
         except RuntimeError as exc:
             kind = self.quota.classify(model_id, str(exc))
@@ -233,7 +233,7 @@ class ProviderRegistry:
             raise
 
     @call_records.observed
-    async def converse(self, session: SupervisorSession, prompt: str, timeout: float = 600,
+    async def converse(self, session: SupervisorSession, prompt: str, timeout: Optional[float] = None,
                        spend_ok=None) -> ProviderResult:
         """One message in a conversation that lasts (the task's lead, supervisor.py): a membership
         CLI continues its own conversation; an API model is sent the whole history again, which
@@ -250,9 +250,11 @@ class ProviderRegistry:
                 text, session.session_id = await self.cli.converse(
                     model_id, prompt, Path(session.cwd), session.session_id, timeout,
                     **({"effort": session.reasoning_effort} if session.reasoning_effort else {}))
-            except SessionLost:
+            except (SessionLost, InputTooLarge):
                 raise
             except RuntimeError as exc:
+                if input_too_large(exc):
+                    raise InputTooLarge(str(exc)) from exc
                 kind = self.quota.classify(model_id, str(exc))
                 if kind:
                     raise self.quota.mark(model_id, str(exc), kind) from exc
@@ -306,7 +308,11 @@ class ProviderRegistry:
             except progress.Stopped as exc:
                 # Stuck, not unavailable: the attempt fails rather than falling back to an API model.
                 raise ProviderError(str(exc)) from exc
+            except InputTooLarge:
+                raise
             except RuntimeError as exc:
+                if input_too_large(exc):
+                    raise InputTooLarge(str(exc)) from exc
                 kind = self.quota.classify(model_id, str(exc))
                 if kind:
                     # Availability failures go through the scheduler's ordinary model/budget
@@ -337,7 +343,8 @@ class ProviderRegistry:
         if review_workspace is not None:
             agent = agent_tools.Workspace(
                 Path(review_workspace), read_only=True, readable_files=review_files,
-                max_turns=max_turns or 8, log=tool_log,
+                # More turns when it can rerun a check than when it only reads.
+                max_turns=max_turns or (12 if agent_tools.sandbox_available() else 8), log=tool_log,
             )
         else:
             agent = agent_tools.Workspace(

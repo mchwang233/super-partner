@@ -80,6 +80,27 @@ def test_employee_context_carries_whole_goal_alignment_and_accepted_own_history(
     assert "DELEGATE_TASKS" in prompt
 
 
+def test_employee_context_bounds_large_file_inventory_without_losing_pending_decisions():
+    run = run_with_team()
+    node = run.plan.nodes[0]
+    node.acceptance_criteria = "真实覆盖率达到100%，由负责人最终整体验收"
+    pending = "1,889 项候选尚未批准；APB16、AXI16/512/1024、地址12及33–64的参数范围待裁定"
+    inventory = [f"coverage/run.vdb/snps/coverage/db/test-{i:06d}-" + "x" * 70 for i in range(18000)]
+    assert len(json.dumps(inventory)) > 2_000_000
+    run.plan.nodes.append(TaskNode(
+        id="bridge", title="桥交付", instructions="bridge", capability="coding", employee_id="builder",
+        status="blocked", changed_files=inventory, files=["coverage/run.vdb", "reports/decisions.md"],
+        result="检查记录\n" * 1000 + pending, feedback=pending,
+    ))
+    before = run.model_dump_json()
+    prompt, _ = node_prompt(node, run, 1000)
+    assert len(prompt) < 40_000
+    for required in (run.prompt, run.plan.team_brief, node.instructions, node.acceptance_criteria, pending,
+                     "coverage/run.vdb", "reports/decisions.md", '"file_count": 18000', '"status": "blocked"'):
+        assert required in prompt
+    assert run.model_dump_json() == before
+
+
 def test_delegation_is_atomic_assigns_other_employee_and_waits_for_delivery():
     run = run_with_team()
     children = team.delegate(run, run.plan.nodes[0], request(), models(), {m.id for m in models()})
@@ -187,8 +208,10 @@ async def test_restart_resumes_native_parent_history_with_verified_child_result(
     assert "checked boundary evidence" in restored.followup
 
 
-@pytest.mark.parametrize("capacity,expected", [(1, ["parent"]), (3, ["parent", "other"])])
-async def test_dispatch_serializes_one_employee_and_obeys_provider_capacity(tmp_path, monkeypatch, capacity, expected):
+# An employee is a role: its tasks run at the same time, each in its own session; only the
+# provider's capacity holds them back.
+@pytest.mark.parametrize("capacity,expected", [(1, ["parent"]), (3, ["parent", "next", "other"])])
+async def test_dispatch_runs_an_employees_tasks_together_within_provider_capacity(tmp_path, monkeypatch, capacity, expected):
     monkeypatch.setattr(settings, "provider_limits", {"test": {"concurrency": capacity}})
     db = Database(tmp_path / "dispatch.db")
     run = run_with_team()
@@ -292,3 +315,4 @@ async def test_already_finished_node_cannot_publish_a_second_child_graph(tmp_pat
     restored = db.get_run(run.id)
     assert len(restored.plan.nodes) == 1
     assert restored.plan.nodes[0].status == NodeStatus.SUCCEEDED
+

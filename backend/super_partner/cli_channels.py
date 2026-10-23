@@ -14,9 +14,39 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from . import calls, environment, progress
+from . import activity, calls, environment, progress
 from .attachments import path
 from .config import settings
+from .contracts import ArtifactBlocked
+
+# Bound the full UTF-8 input conservatively, leaving room for CLI/protocol wrapping.
+CODEX_INPUT_LIMIT = 1048576
+CODEX_INPUT_RESERVE = 65536
+
+
+class InputTooLarge(ArtifactBlocked):
+    """Required context cannot fit: block for replanning, not model/availability fallback."""
+
+
+def input_too_large(error):
+    return "input_too_large" in str(error).lower()
+
+
+def codex_input(prompt, *, retry=False):
+    from .team import compact_context
+
+    limit = CODEX_INPUT_LIMIT - CODEX_INPUT_RESERVE
+    before = prompt
+    if retry or len(prompt.encode()) > limit:
+        prompt = compact_context(prompt, budget=1024 if retry else 32768)
+    calls.warning(f"Codex input: chars {len(before)} -> {len(prompt)}, "
+                  f"UTF-8 bytes {len(before.encode())} -> {len(prompt.encode())}; "
+                  f"limit {CODEX_INPUT_LIMIT}, reserve {CODEX_INPUT_RESERVE}, retry={retry}")
+    calls.save()
+    if len(prompt.encode()) > limit or (retry and prompt == before):
+        raise InputTooLarge("input_too_large: 必须保留的要求、验收标准或未决事项无法安全缩减；"
+                            "请负责人拆分上下文。禁止原样重试或切换模型绕过。")
+    return prompt
 
 
 @dataclass(frozen=True)
@@ -54,7 +84,6 @@ CLAUDE_NETWORK_SETTINGS = json.dumps({"sandbox": {
     "enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
     "network": {"allowedDomains": ["*"], "deniedDomains": ["localhost", "127.0.0.1", "::1"]},
 }})
-CODEX_NETWORK = ("-c", "sandbox_workspace_write.network_access=true")
 
 # Repairing the environment: Claude Code without its sandbox and without asking for approval.
 # The whole CLI runs under bubblewrap instead, which only blocks gaining root (see repair_command).
@@ -101,7 +130,8 @@ def repair_command(executable: str, args: list[str]) -> list[str]:
 SESSION_ARGS = {
     "cli:claude": ("-p", "--output-format", "json", "--permission-mode", "default",
                    "--settings", CLAUDE_SANDBOX_SETTINGS, "--disallowedTools", "Edit,Write,NotebookEdit"),
-    "cli:codex": ("exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never"),
+    # Its sandbox: the lead's permission profile (codex_step_permissions with lead), added per call.
+    "cli:codex": ("exec", "--json", "--skip-git-repo-check", "--color", "never"),
 }
 SESSION_CLIS = set(SESSION_ARGS)
 # How a CLI says the conversation to continue is gone.
@@ -182,11 +212,10 @@ async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
 
 
 def _with_network(model_id: str, args: list[str]) -> list[str]:
-    """Open the CLI's sandbox to the internet. Gemini and Qwen run unsandboxed already."""
+    """Open the CLI's sandbox to the internet. Gemini and Qwen run unsandboxed already; Codex
+    steps get it from their permission profile (codex_step_permissions)."""
     if model_id == "cli:claude":
         return [CLAUDE_NETWORK_SETTINGS if arg == CLAUDE_SANDBOX_SETTINGS else arg for arg in args]
-    if model_id == "cli:codex":
-        return [args[0], *CODEX_NETWORK, *args[1:]]
     return args
 
 
@@ -209,6 +238,117 @@ def codex_servers() -> list[str]:
     except OSError:
         return []
     return list(dict.fromkeys(quoted or bare for quoted, bare in CODEX_SERVER.findall(text)))
+
+
+# The permission profile a Codex step runs under (Codex's own sandbox, bubblewrap on Linux): its
+# workspace writable; this account's home (keys, Codex's login, other projects), the platform's
+# data and the other tasks' folders unreadable; the machine's shared /tmp replaced by TMPDIR.
+CODEX_STEP_PROFILE = "super-partner-step"
+# Folders denied entry by entry: Codex lifts a deny only on a whole entry, not inside one.
+MAX_DENIED = 400
+
+
+def _deny_except(base: Path, keep: list[Path], rules: dict[str, str]) -> None:
+    """Deny every entry of ``base`` that is not, or does not lead to, one of ``keep``."""
+    keep = [path for path in keep if path == base or base in path.parents]
+    if not keep:
+        rules[str(base)] = "deny"
+        return
+    if base in keep or not base.is_dir() or len(rules) > MAX_DENIED:
+        return
+    try:
+        entries = sorted(base.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_symlink():
+            continue  # what it points to is denied or kept where it is
+        _deny_except(entry, keep, rules)
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def codex_package() -> Optional[Path]:
+    """The folder Codex is installed in (its sandbox helper runs from there)."""
+    found = shutil.which(CLI_SPECS["cli:codex"].executable)
+    if not found:
+        return None
+    real = Path(found).resolve()
+    return real.parent.parent if real.parent.name == "bin" else real.parent
+
+
+CODEX_LEAD_PROFILE = "super-partner-lead"
+
+
+# /tmp entries a step's profile denies one by one; past this many it denies all of /tmp.
+MAX_TMP_ENTRIES = 2000
+
+
+def _shared_tmp(cwd: Path, rules: dict[str, str], shared: Path = Path("/tmp")) -> None:
+    """/tmp stays writable, since some tools write there whatever TMPDIR says (URG creates its
+    temporary files in /tmp and crashes when it cannot), but what is already in it stays
+    unreadable: it is denied entry by entry. A step's own temporary folder is elsewhere
+    (private_tmp)."""
+    shared = shared.resolve()
+    if shared in cwd.parents:
+        _deny_except(shared, [cwd], rules)
+        return
+    try:
+        entries = [entry for entry in shared.iterdir() if not entry.is_symlink()]
+    except OSError:
+        entries = None
+    if entries is None or len(entries) > MAX_TMP_ENTRIES:
+        rules[":slash_tmp"] = "deny"
+        return
+    rules[str(shared)] = "write"
+    for entry in sorted(entries):
+        rules[str(entry)] = "deny"
+
+
+def codex_step_permissions(cwd: Path, network: bool, lead: bool = False, tmpdir: Optional[str] = None) -> list[str]:
+    """``-c`` options defining and selecting the profile for a step working in ``cwd`` with its
+    own ``tmpdir`` (CODEX_STEP_PROFILE), or with ``lead`` for a lead's read-only conversation
+    there (CODEX_LEAD_PROFILE: the tasks' folders stay readable, so it can look at their results)."""
+    cwd = cwd.resolve()
+    keep = [cwd, codex_home().resolve() / "tmp", environment.tools_dir().resolve(),
+            *([Path(tmpdir).resolve()] if tmpdir and not lead else [])]
+    if package := codex_package():
+        keep.append(package)
+    rules: dict[str, str] = {}
+    bases = (Path.home(), settings.data_dir) if lead else (Path.home(), settings.data_dir, settings.workspace_root)
+    for base in dict.fromkeys(Path(p).resolve() for p in bases):
+        if base != Path("/") and base.is_dir():
+            _deny_except(base, keep, rules)
+    if lead:
+        rules[str(cwd)] = "read"
+    else:
+        _shared_tmp(cwd, rules)
+        rules.update({":tmpdir": "write", str(cwd): "write"})
+    table = "{ " + ", ".join(f"{json.dumps(path)} = {json.dumps(mode)}" for path, mode in rules.items()) + " }"
+    name = CODEX_LEAD_PROFILE if lead else CODEX_STEP_PROFILE
+    return ["-c", f'default_permissions="{name}"',
+            "-c", f'permissions.{name}.extends="{":read-only" if lead else ":workspace"}"',
+            "-c", f"permissions.{name}.filesystem={table}",
+            *(["-c", f"permissions.{name}.network={{ enabled = true }}"] if network else [])]
+
+
+@contextlib.contextmanager
+def private_tmp(wanted: bool = True):
+    """A temporary folder of a Codex step's own, its TMPDIR, removed afterwards (None unless ``wanted``)."""
+    if not wanted:
+        yield None
+        return
+    import tempfile
+    # Under the data folder, which every step's profile hides: steps do not see each other's.
+    parent = Path(settings.data_dir).resolve() / "tmp"
+    parent.mkdir(parents=True, exist_ok=True)
+    folder = tempfile.mkdtemp(prefix="sp-codex-tmp-", dir=str(parent))
+    try:
+        yield folder
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def codex_settings(effort: Optional[str] = None, service_tier: str = "") -> list[str]:
@@ -340,12 +480,84 @@ class CliChannelRegistry:
             if reason := await watch(evidence):
                 raise progress.Stopped(f"{spec.executable} {progress.STOPPED}{reason}")
 
+    @staticmethod
+    async def _streamed(process, stdin: Optional[bytes], last: list) -> tuple[bytes, bytes]:
+        """``process.communicate``, noting in ``last[0]`` when it last printed anything, and
+        passing each line it prints to the running step's activity (activity.note_line)."""
+        async def drain(stream, sink, lines=False):
+            pending = b""
+            while chunk := await stream.read(65536):
+                sink.append(chunk)
+                last[0] = time.monotonic()
+                if lines:
+                    *done, pending = (pending + chunk).split(b"\n")
+                    for line in done:
+                        activity.note_line(line)
+            if lines and pending:
+                activity.note_line(pending)
+
+        if stdin is not None and process.stdin:
+            process.stdin.write(stdin)
+            with contextlib.suppress(ConnectionError):
+                await process.stdin.drain()
+            process.stdin.close()
+        out, err = [], []
+        await asyncio.gather(drain(process.stdout, out, activity.current.get() is not None), drain(process.stderr, err))
+        await process.wait()
+        return b"".join(out), b"".join(err)
+
+    @staticmethod
+    async def _until_quiet(spec, talk: asyncio.Future, last: list, idle: float, timeout: float):
+        """Wait for the CLI while it keeps printing: stopped after ``idle`` seconds without any
+        output, or ``timeout`` seconds in all."""
+        started = time.monotonic()
+        while True:
+            done, _ = await asyncio.wait({talk}, timeout=min(30, idle))
+            if done:
+                return talk.result()
+            now = time.monotonic()
+            if now - last[0] > idle:
+                raise asyncio.TimeoutError(f"no output for {idle:g}s")
+            if now - started > timeout:
+                raise asyncio.TimeoutError(f"{timeout:g}s")
+
+    async def _run_input(self, spec, command, cwd, prompt, timeout, watch=None, **kwargs):
+        """Check the fully assembled input and retry only an explicitly rejected, smaller input."""
+        if watch is not None:
+            kwargs["watch"] = watch
+        if spec.id != "cli:codex":
+            return await self._run(spec, command, cwd, prompt.encode(), timeout, **kwargs)
+        prompt = codex_input(prompt)
+        for attempt in range(2):
+            try:
+                output = await self._run(spec, command, cwd, prompt.encode(), timeout, **kwargs)
+                # Some CLI versions emit a failed turn with a zero exit status.
+                for line in output.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if (isinstance(event, dict) and event.get("type") in {"turn.failed", "error"}
+                            and input_too_large(event)):
+                        raise InputTooLarge("input_too_large: Codex rejected the input")
+                return output
+            except RuntimeError as exc:
+                if not input_too_large(exc):
+                    raise
+                if attempt:
+                    raise InputTooLarge("input_too_large: 缩减后仍被拒绝，停止重试，交回负责人拆分上下文。") from exc
+                prompt = codex_input(prompt, retry=True)
+
     async def _run(self, spec, command: list[str], cwd: Path, stdin: Optional[bytes], timeout: float,
-                   watch: Optional[progress.Watch] = None) -> str:
+                   watch: Optional[progress.Watch] = None, idle: Optional[float] = None,
+                   extra_env: Optional[dict] = None) -> str:
         """Run a CLI command in its own process group and return its output; a failure raises
-        RuntimeError, and the whole group is killed when the call ends early."""
+        RuntimeError, and the whole group is killed when the call ends early. With ``idle`` it
+        runs while it keeps printing (up to ``timeout``), and is stopped after ``idle`` seconds
+        without output."""
         # Tools that environment repairs installed are on PATH for every CLI.
         env = environment.command_env(dict(os.environ))
+        env.update(extra_env or {})
         started = time.time()
         spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
             *command, cwd=str(cwd), env=env, stdin=asyncio.subprocess.PIPE if stdin else None,
@@ -358,16 +570,20 @@ class CliChannelRegistry:
             # The CLI may already be running; finish spawning so its whole group can be killed.
             await _kill_process_group(await spawn)
             raise
-        talk = asyncio.ensure_future(process.communicate(stdin))
+        last = [time.monotonic()]
+        streamed = idle or activity.current.get() is not None
+        talk = asyncio.ensure_future(self._streamed(process, stdin, last) if streamed else process.communicate(stdin))
         try:
-            if watch is None:
-                stdout, stderr = await asyncio.wait_for(asyncio.shield(talk), timeout=timeout)
-            else:
+            if watch is not None:
                 stdout, stderr = await self._watched(spec, process, talk, cwd, watch, started)
-        except asyncio.TimeoutError:
+            elif idle:
+                stdout, stderr = await self._until_quiet(spec, talk, last, idle, timeout)
+            else:
+                stdout, stderr = await asyncio.wait_for(asyncio.shield(talk), timeout=timeout)
+        except asyncio.TimeoutError as exc:
             await _kill_process_group(process)
             talk.cancel()
-            raise RuntimeError(f"{spec.executable} timed out after {timeout}s")
+            raise RuntimeError(f"{spec.executable} timed out after {str(exc) or f'{timeout}s'}") from None
         except (asyncio.CancelledError, progress.Stopped):
             await _kill_process_group(process)
             talk.cancel()
@@ -376,10 +592,40 @@ class CliChannelRegistry:
             raise RuntimeError(f"{spec.executable} failed: {_failure_detail(stdout, stderr)}")
         return stdout.decode(errors="replace")
 
+    async def sandbox_run(self, model_id: str, command: str, cwd: Path, timeout: float,
+                          network: bool = False) -> tuple[str, bool]:
+        """Run ``command`` in ``model_id``'s own sandbox exactly as its steps get it (the step's
+        permission profile, codex_step_permissions; a TMPDIR of its own; the environment the
+        platform gives every CLI), without the model: its output, and whether it exited 0. Only
+        Codex can (``codex sandbox``); RuntimeError for any other CLI."""
+        if model_id != "cli:codex" or not (executable := shutil.which(CLI_SPECS[model_id].executable)):
+            raise RuntimeError(f"{model_id} cannot run a command in its sandbox without the model")
+        with private_tmp() as tmp:
+            process = await asyncio.create_subprocess_exec(
+                executable, "sandbox", "-P", CODEX_STEP_PROFILE, "-C", str(cwd),
+                *codex_step_permissions(cwd, network, tmpdir=tmp),
+                "--", "/bin/bash", "-c", command, cwd=str(cwd),
+                env={**environment.command_env(dict(os.environ)), "TMPDIR": tmp}, stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+            try:
+                output, _ = await asyncio.wait_for(process.communicate(), timeout)
+            except asyncio.TimeoutError:
+                await _kill_process_group(process)
+                return f"Command timed out after {timeout:g}s", False
+            except asyncio.CancelledError:
+                await _kill_process_group(process)
+                raise
+        text = output.decode(errors="replace").strip() or "(the command printed no output)"
+        return (text if not process.returncode else f"Exit code {process.returncode}\n{text}"), not process.returncode
+
     async def converse(self, model_id: str, prompt: str, cwd: Path, session_id: Optional[str] = None,
-                       timeout: float = 600, effort: Optional[str] = None) -> tuple[str, str]:
+                       timeout: Optional[float] = None, effort: Optional[str] = None) -> tuple[str, str]:
         """Say ``prompt`` in the conversation ``session_id`` (a new one without it), in ``cwd``;
-        returns the reply and the conversation's id. Only SESSION_CLIS keep conversations."""
+        returns the reply and the conversation's id. Only SESSION_CLIS keep conversations.
+
+        Without ``timeout``, Codex (which prints its work as it goes) runs while it keeps printing,
+        stopped after lead_idle_minutes without output, at most lead_call_max_minutes; Claude Code
+        (which answers at the end) gets lead_call_max_minutes. With it, ``timeout`` is a hard limit."""
         spec = CLI_SPECS[model_id]
         executable = shutil.which(spec.executable)
         if not executable or model_id not in SESSION_ARGS:
@@ -393,10 +639,11 @@ class CliChannelRegistry:
                     record["effective_effort"] = effort
         else:
             sid = session_id
-            args = (["exec", "resume", session_id, "--json", "--skip-git-repo-check",
-                     "-c", 'sandbox_mode="read-only"', "-"] if session_id else [*SESSION_ARGS[model_id], "-"])
+            args = (["exec", "resume", session_id, "--json", "--skip-git-repo-check", "-"]
+                    if session_id else [*SESSION_ARGS[model_id], "-"])
             # Refinement can use the lead's per-part choice; ordinary lead calls keep their default.
-            options = codex_settings(effort or settings.lead_reasoning_effort, settings.codex_lead_service_tier)
+            options = [*codex_settings(effort or settings.lead_reasoning_effort, settings.codex_lead_service_tier),
+                       *codex_step_permissions(cwd, network=False, lead=True)]
             # `exec resume` parses its own options. Overrides on the outer `exec` are
             # discarded on resume, restoring the user's effort/tier/plugins instead.
             position = 3 if session_id else 1
@@ -406,7 +653,10 @@ class CliChannelRegistry:
                 record["effective_effort"] = CODEX_EFFORTS.get(chosen, chosen)
         calls.save()
         try:
-            output = await self._run(spec, [executable, *args], cwd, prompt.encode(), timeout)
+            idle = settings.lead_idle_minutes * 60 if timeout is None and model_id == "cli:codex" else None
+            output = await self._run_input(spec, [executable, *args], cwd, prompt,
+                                     timeout if timeout is not None else settings.lead_call_max_minutes * 60,
+                                     idle=idle)
         except RuntimeError as exc:
             if session_id and SESSION_MISSING.search(str(exc)):
                 raise SessionLost(str(exc)) from exc
@@ -440,7 +690,19 @@ class CliChannelRegistry:
         if not executable:
             raise RuntimeError(f"{spec.executable} is no longer installed")
         args = list(REPAIR_ARGS.get(spec.id, spec.invoke_args) if repair else spec.invoke_args)
-        if network and not repair:
+        step = spec.id == "cli:codex" and not repair
+        with private_tmp(step) as tmp:
+            return await self._complete(spec, executable, args, step, tmp, prompt, cwd, timeout, attachments,
+                                        repair, network, watch, effort)
+
+    async def _complete(self, spec, executable, args, step, tmp, prompt, cwd, timeout, attachments, repair,
+                        network, watch, effort):
+        if step:
+            # Codex's own sandbox with the step's permission profile instead of workspace-write.
+            at = args.index("--sandbox")
+            args = [*args[:at], *args[at + 2:]]
+            args = [args[0], *codex_step_permissions(cwd, network, tmpdir=tmp), *args[1:]]
+        elif network and not repair:
             args = _with_network(spec.id, args)
         args = _with_attachments(spec.id, args, list(attachments))
         if spec.id == "cli:codex":
@@ -453,8 +715,13 @@ class CliChannelRegistry:
         else:
             stdin = prompt.encode()
         command = repair_command(executable, args) if repair else [executable, *args]
-        with codex_rules(cwd) if spec.id == "cli:codex" and not repair else contextlib.nullcontext():
-            stdout = await self._run(spec, command, cwd, stdin, timeout, watch)
+        with codex_rules(cwd) if step else contextlib.nullcontext():
+            if spec.id == "cli:codex":
+                stdout = await self._run_input(spec, command, cwd, prompt, timeout, watch,
+                                              extra_env={"TMPDIR": tmp} if tmp else None)
+            else:
+                stdout = await self._run(spec, command, cwd, stdin, timeout, watch,
+                                         extra_env={"TMPDIR": tmp} if tmp else None)
         text = stdout.strip()
         if spec.id == "cli:codex":
             return codex_output(stdout)

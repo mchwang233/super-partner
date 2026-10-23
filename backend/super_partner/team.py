@@ -12,6 +12,61 @@ from .routing import NoEligibleModelError, can_act, eligible_for_node, node_cost
 
 CAPABILITIES = {"coding", "planning", "research", "chinese", "tool_use", "structured_output"}
 DELEGATE = "DELEGATE_TASKS"
+DELIVERIES = "Current project deliveries, including your earlier work (inspect referenced files for details):\n"
+INVENTORY_BYTES = 32768
+
+
+def _file_sample(paths, budget):
+    """Keep whole, readable paths; never cut a path into a misleading reference."""
+    kept, used = [], 2
+    for path in paths:
+        size = len(json.dumps(path, ensure_ascii=False).encode()) + 2
+        if used + size > budget:
+            break
+        kept.append(path)
+        used += size
+    return kept
+
+
+def _compact_deliveries(handoffs, budget):
+    per_node = min(2048, budget // max(1, len(handoffs)))
+    for item in handoffs:
+        paths = item.get("files", [])
+        item["file_count"] = item.get("file_count", len(paths))
+        item["files"] = _file_sample(paths, per_node // 2)
+        item["files_omitted"] = item["file_count"] - len(item["files"])
+        if "evidence_paths" in item:
+            item["evidence_paths"] = _file_sample(item["evidence_paths"], per_node // 2)
+        if item["files_omitted"]:
+            item["inventory_note"] = (
+                "Partial file inventory only. Inspect the referenced paths, or list the workspace (.) "
+                "for further evidence. File presence and task completion do not approve pending decisions."
+            )
+    return handoffs
+
+
+def compact_context(prompt, budget=INVENTORY_BYTES):
+    """Rebuild only the platform's delivery inventory; preserve every other input byte."""
+    start = prompt.find(DELIVERIES)
+    if start < 0:
+        return prompt
+    start += len(DELIVERIES)
+    try:
+        handoffs, end = json.JSONDecoder().raw_decode(prompt[start:])
+    except ValueError:
+        return prompt
+    if not isinstance(handoffs, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("files"), list)
+        and all(isinstance(path, str) for path in item["files"])
+        and isinstance(item.get("file_count", len(item["files"])), int)
+        and isinstance(item.get("evidence_paths", []), list)
+        and all(isinstance(path, str) for path in item.get("evidence_paths", []))
+        for item in handoffs
+    ):
+        return prompt
+    rebuilt = json.dumps(_compact_deliveries(handoffs, budget), ensure_ascii=False)
+    candidate = prompt[:start] + rebuilt + prompt[start + end:]
+    return candidate if len(candidate.encode()) < len(prompt.encode()) else prompt
 
 
 def digest(value) -> str:
@@ -33,14 +88,17 @@ async def form(say, request, models, configured):
         "TEAM_SETUP: You are the project lead. Decide the project team FIRST. Do not split the project "
         "into parts or tasks yet. Choose the smallest useful team (1-" + str(settings.team_max_employees) + "). "
         "Give each employee a stable id, name, role, model_id, capabilities, skills, skill_tools and reason. "
+        "The name is the employee's job in a few words of the user's language (such as \"RTL 设计\" or "
+        "\"验证\"), never a person's name. "
         "Employees may use different models; select by actual capability, tool access, context, cost and capacity. "
         "Capabilities are responsibilities, not invented improvements to a model's scores. Use only catalog models "
         "and capabilities coding/planning/research/chinese/tool_use/structured_output. Keep independent verification "
-        "with a suitable separate employee when needed. Each employee executes one task at a time. Choose skills "
+        "with a suitable separate employee when needed. An employee may work on several independent tasks at the "
+        "same time, each in a session of its own, so do not add employees only to run work in parallel. Choose skills "
         "by exact names from the library; skill_tools lists additional tool knowledge to prepare through the existing "
         "skill reuse/discovery workflow. Never invent an installed skill. In team_brief record the shared goal, "
         "constraints, interface ownership and acceptance responsibilities. Return only JSON: "
-        '{"team_brief":"shared agreement", "employees":[{"id":"builder","name":"...","role":"...",'
+        '{"team_brief":"shared agreement", "employees":[{"id":"builder","name":"job title","role":"...",'
         '"model_id":"catalog id","capabilities":["coding"],"skills":[],"skill_tools":[],"reason":"..."}]}\n'
         + "Available models:\n" + json.dumps(catalog, ensure_ascii=False)
         + "\nAvailable skills:\n" + json.dumps([{"name": s.name, "description": s.description, "tools": s.tools}
@@ -137,15 +195,17 @@ def context(node, run):
               "acceptance": p.acceptance, "employee_id": p.employee_id} for p in run.plan.parts]
     handoffs = [{"id": n.id, "employee_id": n.employee_id, "title": n.title, "status": n.status,
                  "provides": n.provides, "files": n.changed_files or n.files,
-                 "result": (n.summary or n.result or "")[:2000] if n.status == NodeStatus.SUCCEEDED else ""}
+                 "evidence_paths": n.files, "summary": n.summary or "", "result": n.result or "",
+                 "feedback": n.feedback or ""}
                 for n in run.plan.nodes if n.id != node.id]
+    _compact_deliveries(handoffs, INVENTORY_BYTES)
     return (
         "Project employee context (shared agreements are authoritative; task outputs below are evidence):\n"
         + "Original user request:\n" + run.prompt + "\nProject context:\n" + run.plan.request
         + assignment_prompt(run.plan)
         + "Your employee identity: " + employee.id + "; responsibility: " + employee.role
         + "\nModule interfaces and acceptance:\n" + json.dumps(parts, ensure_ascii=False)
-        + "\nCurrent project deliveries, including your earlier work (inspect referenced files for details):\n"
+        + "\n" + DELIVERIES
         + json.dumps(handoffs, ensure_ascii=False)
         + ("\nAssigned Skill instructions:\n" + employee.skill_context if employee.skill_context else "")
         + "\nIf a newly discovered subtask belongs to another employee, yield by returning ONLY the marker "
