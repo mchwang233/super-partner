@@ -468,3 +468,28 @@ def test_every_platform_change_is_given_the_platform_rules():
         assert not guide.startswith("---")
     # The map stays second: diagnosis prompts point to it by position.
     assert REPAIR_GUIDES[1] == "docs/ARCHITECTURE.md"
+
+
+@pytest.mark.parametrize("answer", [None, "current attempt answer"])
+def test_activation_preserves_outcomes_and_requests_evidence_recovery_before_more_work(tmp_path, source_checkout, monkeypatch, answer):
+    from super_partner.models import NodeAttempt
+
+    db = Database(tmp_path / "recovery.db")
+    one_node_run(db)
+    run = db.get_run("r")
+    run.status, run.maintenance_id = RunStatus.PAUSED, "repair"
+    node = run.plan.nodes[0]
+    node.attempts = [NodeAttempt(outcome="error", result=answer)]
+    node.result, node.feedback = "older answer", "keep the previous acceptance requirements"
+    run.diagnoses = [Diagnosis(id="d", node_id=node.id, trigger="auto", status="done", repair_id="repair")]
+    db.save_run(run)
+    executor = Executor(db, Providers(), MODELS)
+    monkeypatch.setattr(executor, "start", lambda _: None)
+    executor._finish_platform({"id": "repair", "status": "activated", "run_id": "r", "files": []})
+    saved = db.get_run("r").plan.nodes[0]
+    assert saved.attempts[0].outcome == "error"
+    assert saved.result == "older answer"
+    assert saved.feedback.startswith("keep the previous acceptance requirements")
+    assert "先核对" in saved.feedback and "不要重复整轮工作" in saved.feedback
+    assert ("本次回答已保存" if answer else "本次回答未记录") in saved.feedback
+    assert "不代表任务验收通过" in saved.feedback

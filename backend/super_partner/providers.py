@@ -303,6 +303,7 @@ class ProviderRegistry:
                     workspace or settings.workspace_root, timeout=cli_timeout,
                     attachments=attachments, repair=repair, **({"network": True} if network else {}),
                     **({"watch": watch} if watch else {}), **({"effort": effort} if effort else {}),
+                    **({"tool_trace": tool_trace} if tool_trace is not None else {}),
                 )
                 return _cli_result(text, model_id)
             except progress.Stopped as exc:

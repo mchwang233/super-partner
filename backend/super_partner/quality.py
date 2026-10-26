@@ -94,6 +94,7 @@ def scope_section(node: TaskNode) -> str:
     lines = []
     if node.files:
         lines.append("Change only these files (create them if they do not exist): " + ", ".join(node.files))
+        lines.append("Write them first, then check them; do not spend your calls on work other steps own.")
     if node.reads:
         lines.append("For reference: " + ", ".join(node.reads))
     lines.append("This is a small work package: those of the files above that exist are attached in full below, as "
@@ -182,7 +183,9 @@ def cli_environment(model_id: Optional[str], network: bool) -> str:
         return ""
     lines = [
         ("Where you are: Super Partner runs you in your own sandbox. You can write only the working "
-         "directory and /tmp; the rest of the system is read-only. You are an ordinary user, not root: sudo, "
+         "directory and $TMPDIR (put temporary files there: the shared /tmp may be unavailable); the rest of "
+         "the system is read-only, and your home folder, other tasks' folders and Super Partner's own data "
+         "may not be readable at all: do not look for files there. You are an ordinary user, not root: sudo, "
          "system packages and system files are out of reach. The tools installed on this machine for every "
          "step are on PATH."),
         ("This task allows the internet: commands may download packages (into the working directory) and "
@@ -229,8 +232,8 @@ def attempt_notes(node: TaskNode) -> str:
     # Attempts recorded before the tools followed Claude Code's used the older names.
     changed = files("Write", "Edit", "MultiEdit", "write_file", "edit_file")
     read = [path for path in files("Read", "read_file") if path not in changed]
-    commands = [f"{'ok' if call.ok else 'failed'}: {call.detail}" for call in attempt.tool_calls
-                if call.tool in {"Bash", "run_command"}][-MAX_NOTED_COMMANDS:]
+    commands = [f"{'ok' if call.ok is True else call.status}: {call.detail}" for call in attempt.tool_calls
+                if call.tool in {"Bash", "run_command", "command"}][-MAX_NOTED_COMMANDS:]
     lines = [(f"What the previous attempt did ({attempt.model_id}, {attempt.turns} turns), which ended: "
               f"{(attempt.reason or attempt.outcome)[:300]}")]
     if changed:
@@ -437,6 +440,37 @@ def _tracked(root: Path, files: list[str]) -> set[str]:
     return {name for name in output.split("\0") if name}
 
 
+def private(name: str) -> bool:
+    """Whether a file or folder of this name may hold credentials or agent state."""
+    lower = name.lower()
+    return (lower in PRIVATE_DIRS or lower in PRIVATE_NAMES
+            or lower.startswith((".env", "id_rsa.", "id_dsa.", "id_ecdsa.", "id_ed25519."))
+            or Path(lower).stem in {"credentials", "secrets", "token", "tokens"}
+            and Path(lower).suffix in {".json", ".yaml", ".yml", ".toml", ".ini", ".txt", ".log"}
+            or Path(lower).suffix in PRIVATE_SUFFIXES)
+
+
+# Folders a reviewer's commands may not need to look into for private files: too big to walk.
+UNWALKED = {"node_modules", ".venv", "venv", "__pycache__"}
+
+
+def private_paths(root: Path, limit: int = 2000) -> tuple[list[Path], list[Path]]:
+    """The private folders and files in ``root`` (``private``, and a repository's config, which
+    can hold tokens), at most ``limit``: what a reviewer's commands must not see."""
+    folders, files = [], []
+    for folder, dirs, names in os.walk(root):
+        here = Path(folder)
+        hidden = [name for name in dirs if private(name)]
+        # A link cannot be mounted over; what it points to inside the workspace is hidden itself.
+        folders += [here / name for name in hidden if not (here / name).is_symlink()]
+        dirs[:] = [name for name in dirs if name not in UNWALKED and name not in hidden]
+        files += [here / name for name in names if (private(name) or (here.name == ".git" and name == "config"))
+                  and not (here / name).is_symlink()]
+        if len(folders) + len(files) >= limit:
+            break
+    return folders, files
+
+
 def review_path(root: Path, name: str, *, allow_hidden_log: bool = False) -> Optional[Path]:
     """One access policy for inline evidence and API review tools, including symlink targets.
 
@@ -451,15 +485,9 @@ def review_path(root: Path, name: str, *, allow_hidden_log: bool = False) -> Opt
             parts = relative.parts
             for i, part in enumerate(parts):
                 lower = part.lower()
-                stem = Path(lower).stem
                 referenced_log = (allow_hidden_log and i < len(parts) - 1
                                   and relative.suffix.lower() in LOG_SUFFIXES)
-                if (lower in SKIP_DIRS and not (lower == "build" and referenced_log)
-                        or lower in PRIVATE_DIRS or lower in PRIVATE_NAMES
-                        or lower.startswith((".env", "id_rsa.", "id_dsa.", "id_ecdsa.", "id_ed25519."))
-                        or stem in {"credentials", "secrets", "token", "tokens"}
-                        and Path(lower).suffix in {".json", ".yaml", ".yml", ".toml", ".ini", ".txt", ".log"}
-                        or Path(lower).suffix in PRIVATE_SUFFIXES):
+                if lower in SKIP_DIRS and not (lower == "build" and referenced_log) or private(part):
                     return None
                 if part.startswith(".") and not (
                     referenced_log and part not in {".", ".."}

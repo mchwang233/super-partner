@@ -131,14 +131,29 @@ class ModelProfile(BaseModel):
 
 
 class ToolCall(BaseModel):
-    """One tool call of an API model at work: in which turn, which tool, on what, and whether
+    """One API or CLI tool call at work: in which turn, which tool, on what, and whether
     it went through (a command exiting 0, a tool without an error)."""
     turn: int
     tool: str
     detail: str = ""
-    ok: bool = True
+    # Missing completion evidence is not a successful tool call (including old records).
+    ok: Optional[bool] = None
+    id: Optional[str] = None
+    exit_code: Optional[int] = None
+    running: bool = False
+    status: Literal["succeeded", "failed", "running", "incomplete", "unknown"] = "unknown"
+    diagnostic: Optional[str] = None
     # The start of what the tool returned, as the model saw it.
     output: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_status(cls, value):
+        if isinstance(value, dict) and "status" not in value:
+            value = dict(value)
+            value["status"] = ("running" if value.get("running") else "succeeded" if value.get("ok") is True
+                               else "failed" if value.get("ok") is False else "unknown")
+        return value
 
 
 class Outcome:
@@ -178,6 +193,9 @@ class NodeAttempt(BaseModel):
     """One run of a node: what model did it, and whether its result was accepted."""
     # Older records have no trustworthy wall-clock duration.
     duration_seconds: Optional[float] = None
+    # Never infer an attempt's answer from TaskNode.result: it may be from an older attempt.
+    result: Optional[str] = None
+    result_source: Optional[str] = None
     interrupted: bool = False
     model_id: Optional[str] = None
     # One of Outcome.
@@ -194,6 +212,14 @@ class NodeAttempt(BaseModel):
     # of the first ones): a file under the data folder, for looking back at what happened.
     trace: Optional[str] = None
     finished_at: datetime = Field(default_factory=utcnow)
+
+    @field_validator("tool_calls")
+    @classmethod
+    def ended_calls(cls, calls):
+        # A persisted attempt has ended even when its last CLI event said "running".
+        return [call.model_copy(update={"ok": None, "running": False, "status": "incomplete",
+                                       "diagnostic": call.diagnostic or "No completion event was recorded; exit status is unknown."})
+                if call.running or call.status == "running" else call for call in calls]
 
 
 class NodeInput(BaseModel):
@@ -390,6 +416,14 @@ class Employee(BaseModel):
     reason: str = Field(default="", max_length=1000)
 
 
+class PlanChoice(BaseModel):
+    """A scope decision the request left open that changes the work a lot, decided by the lead
+    while planning and shown to the user before confirming (planner.CHOICES_RULE)."""
+    question: str
+    assumed: str
+    alternative: str = ""
+
+
 class TaskPlan(BaseModel):
     summary: str
     nodes: list[TaskNode]
@@ -410,6 +444,7 @@ class TaskPlan(BaseModel):
     planner_model_id: Optional[str] = None
     planning_cost_usd: float = 0.0
     planning_note: Optional[str] = None
+    choices: list[PlanChoice] = Field(default_factory=list)
 
     def unsplit_cost(self) -> float:
         """The estimate of major parts not yet split into tasks."""
@@ -558,8 +593,6 @@ class EngineerJob(BaseModel):
     decision_id: Optional[str] = None
     diagnosis_id: Optional[str] = None
     improvement_id: Optional[str] = None
-    # Explicitly enabled for retrospective jobs; ordinary component approvals stay unchanged.
-    auto_apply: bool = False
     # The isolated source copy (platform_repair.PlatformRepairs job id), and what it changed.
     repair_id: Optional[str] = None
     files: list[str] = Field(default_factory=list)
@@ -584,7 +617,6 @@ ENGINEER_WAITING = {"plan_ready", "ready", "needs_input"}
 class LearningSettings(BaseModel):
     enabled: bool = False
     budget_usd: float = Field(default=0.5, ge=0, le=100)
-    auto_platform: bool = True
 
 
 class LearningReview(BaseModel):
@@ -599,7 +631,6 @@ class LearningReview(BaseModel):
     cost_usd: float = 0
     # The remaining budget handed to platform jobs, counted once, even across restarts.
     allocated_usd: float = 0
-    auto_platform: bool = False
     error: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
 

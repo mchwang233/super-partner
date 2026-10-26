@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -158,6 +159,15 @@ def cli_usage(payload, codex=False):
     written = data.get("cache_creation_input_tokens", 0)
     return {"input_tokens": data["input_tokens"] + (0 if codex else cached + written),
             "output_tokens": data["output_tokens"], "cached_input_tokens": cached, "cache_write_tokens": written}
+
+
+def _trace(path: Optional[Path], kind: str, **values) -> None:
+    """Append evidence as it arrives, including output from calls that never return an answer."""
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"type": kind, **values}, ensure_ascii=False) + "\n")
 
 
 def codex_output(output):
@@ -484,13 +494,16 @@ class CliChannelRegistry:
                 raise progress.Stopped(f"{spec.executable} {progress.STOPPED}{reason}")
 
     @staticmethod
-    async def _streamed(process, stdin: Optional[bytes], last: list, printed: Optional[list] = None) -> tuple[bytes, bytes]:
+    async def _streamed(process, stdin: Optional[bytes], last: list, printed: Optional[list] = None,
+                        tool_trace: Optional[Path] = None) -> tuple[bytes, bytes]:
         """``process.communicate``, noting in ``last[0]`` when it last printed anything, in
         ``printed[0]`` how much it has printed, and passing each line to the running step's
         activity (activity.note_line)."""
-        async def drain(stream, sink, lines=False):
+        async def drain(stream, sink, channel, lines=False):
             pending = b""
             while chunk := await stream.read(65536):
+                # Base64 preserves arbitrary bytes and split UTF-8 characters exactly.
+                _trace(tool_trace, "cli." + channel, data=base64.b64encode(chunk).decode("ascii"), encoding="base64")
                 sink.append(chunk)
                 last[0] = time.monotonic()
                 if printed is not None:
@@ -508,7 +521,7 @@ class CliChannelRegistry:
                 await process.stdin.drain()
             process.stdin.close()
         out, err = [], []
-        await asyncio.gather(drain(process.stdout, out, activity.current.get() is not None), drain(process.stderr, err))
+        await asyncio.gather(drain(process.stdout, out, "stdout", activity.current.get() is not None), drain(process.stderr, err, "stderr"))
         await process.wait()
         return b"".join(out), b"".join(err)
 
@@ -556,7 +569,7 @@ class CliChannelRegistry:
 
     async def _run(self, spec, command: list[str], cwd: Path, stdin: Optional[bytes], timeout: float,
                    watch: Optional[progress.Watch] = None, idle: Optional[float] = None,
-                   extra_env: Optional[dict] = None) -> str:
+                   extra_env: Optional[dict] = None, tool_trace: Optional[Path] = None) -> str:
         """Run a CLI command in its own process group and return its output; a failure raises
         RuntimeError, and the whole group is killed when the call ends early. With ``idle`` it
         runs while it keeps printing (up to ``timeout``), and is stopped after ``idle`` seconds
@@ -579,8 +592,8 @@ class CliChannelRegistry:
         last, printed = [time.monotonic()], [0]
         # A watched CLI streams too: the checker is told how much output it printed since the
         # last check, even when the call is not the step's own activity.
-        streamed = idle or watch is not None or activity.current.get() is not None
-        talk = asyncio.ensure_future(self._streamed(process, stdin, last, printed)
+        streamed = idle or watch is not None or activity.current.get() is not None or tool_trace is not None
+        talk = asyncio.ensure_future(self._streamed(process, stdin, last, printed, tool_trace)
                                      if streamed else process.communicate(stdin))
         try:
             if watch is not None:
@@ -589,14 +602,20 @@ class CliChannelRegistry:
                 stdout, stderr = await self._until_quiet(spec, talk, last, idle, timeout)
             else:
                 stdout, stderr = await asyncio.wait_for(asyncio.shield(talk), timeout=timeout)
-        except asyncio.TimeoutError as exc:
+        except BaseException as exc:
             await _kill_process_group(process)
-            talk.cancel()
-            raise RuntimeError(f"{spec.executable} timed out after {str(exc) or f'{timeout}s'}") from None
-        except (asyncio.CancelledError, progress.Stopped):
-            await _kill_process_group(process)
-            talk.cancel()
+            # Drain the pipes after killing the group, retaining its final bytes before release.
+            try:
+                await asyncio.wait_for(asyncio.shield(talk), timeout=5)
+            except BaseException:
+                talk.cancel()
+                await asyncio.gather(talk, return_exceptions=True)
+            _trace(tool_trace, "cli.interrupted", reason=str(exc) or type(exc).__name__)
+            if isinstance(exc, asyncio.TimeoutError):
+                raise RuntimeError(f"{spec.executable} timed out after {str(exc) or f'{timeout}s'}") from None  # noqa: TRY004
             raise
+        finally:
+            _trace(tool_trace, "cli.exit", exit_code=process.returncode)
         if process.returncode:
             raise RuntimeError(f"{spec.executable} failed: {_failure_detail(stdout, stderr)}")
         return stdout.decode(errors="replace")
@@ -690,6 +709,7 @@ class CliChannelRegistry:
     async def complete(
         self, model_id: str, prompt: str, cwd: Path, timeout: int = 900, attachments=(), repair: bool = False,
         network: bool = False, watch: Optional[progress.Watch] = None, effort: Optional[str] = None,
+        tool_trace: Optional[Path] = None,
     ) -> str:
         """Run a CLI in ``cwd``. With ``repair`` it leaves its sandbox to fix the environment;
         with ``network`` its sandbox lets commands reach the internet. With ``watch`` it is not
@@ -701,11 +721,17 @@ class CliChannelRegistry:
         args = list(REPAIR_ARGS.get(spec.id, spec.invoke_args) if repair else spec.invoke_args)
         step = spec.id == "cli:codex" and not repair
         with private_tmp(step) as tmp:
-            return await self._complete(spec, executable, args, step, tmp, prompt, cwd, timeout, attachments,
-                                        repair, network, watch, effort)
+            try:
+                text = await self._complete(spec, executable, args, step, tmp, prompt, cwd, timeout, attachments,
+                                            repair, network, watch, effort, tool_trace)
+            except BaseException as exc:
+                _trace(tool_trace, "cli.error", reason=str(exc) or type(exc).__name__)
+                raise
+            _trace(tool_trace, "cli.result", text=str(text), model_id=model_id)
+            return text
 
     async def _complete(self, spec, executable, args, step, tmp, prompt, cwd, timeout, attachments, repair,
-                        network, watch, effort):
+                        network, watch, effort, tool_trace=None):
         if step:
             # Codex's own sandbox with the step's permission profile instead of workspace-write.
             at = args.index("--sandbox")
@@ -727,10 +753,12 @@ class CliChannelRegistry:
         with codex_rules(cwd) if step else contextlib.nullcontext():
             if spec.id == "cli:codex":
                 stdout = await self._run_input(spec, command, cwd, prompt, timeout, watch,
-                                              extra_env={"TMPDIR": tmp} if tmp else None)
+                                              extra_env={"TMPDIR": tmp} if tmp else None,
+                                              **({"tool_trace": tool_trace} if tool_trace is not None else {}))
             else:
                 stdout = await self._run(spec, command, cwd, stdin, timeout, watch,
-                                         extra_env={"TMPDIR": tmp} if tmp else None)
+                                         extra_env={"TMPDIR": tmp} if tmp else None,
+                                         **({"tool_trace": tool_trace} if tool_trace is not None else {}))
         text = stdout.strip()
         if spec.id == "cli:codex":
             return codex_output(stdout)

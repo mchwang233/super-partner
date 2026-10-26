@@ -293,3 +293,59 @@ def test_legacy_task_records_load_with_separate_tool_counter():
     legacy["contract_turns"] = 2
     loaded = TaskNode.model_validate(legacy)
     assert loaded.contract_turns == 2 and loaded.contract_tool_calls == 0
+
+
+async def test_attempt_save_failure_preserves_this_answer_and_unfinished_tools(tmp_path, monkeypatch):
+    from super_partner import activity
+
+    monkeypatch.setattr(settings, "review_nodes", False)
+    monkeypatch.setattr(settings, "max_node_attempts", 1)
+    database = Database(tmp_path / "save.db")
+    node = TaskNode(id="n", title="Build", instructions="build", capability="coding", model_id="x:flash")
+    database.save_run(ExecutionRun(id="r", prompt="p", status=RunStatus.QUEUED, budget_usd=1,
+                                   plan=TaskPlan(summary="s", nodes=[node])))
+    save_run = database.save_run
+    failed = []
+
+    def save(run):
+        if run.plan.nodes[0].attempts and not failed:
+            failed.append(True)
+            raise RuntimeError("simulated persistence failure")
+        save_run(run)
+
+    monkeypatch.setattr(database, "save_run", save)
+
+    class Answering(Providers):
+        async def complete(self, model_id, prompt, workspace=None, **kwargs):
+            activity.note_line(b'{"type":"item.started","item":{"id":"long","type":"command_execution","command":"check"}}')
+            kwargs["tool_trace"].parent.mkdir(parents=True, exist_ok=True)
+            kwargs["tool_trace"].write_text("raw evidence\n")
+            return ProviderResult("THIS attempt's answer", 0, 0, model_id)
+
+    executor = Executor(database, Answering(), MODELS)
+    await executor.execute("r")
+    saved = database.get_run("r").plan.nodes[0]
+    assert failed and len(saved.attempts) == 1
+    attempt = saved.attempts[0]
+    assert attempt.outcome == "error"
+    assert "simulated persistence failure" in attempt.reason
+    assert attempt.result == "THIS attempt's answer"
+    assert saved.result == attempt.result
+    assert attempt.result_source == "provider"
+    assert len(attempt.tool_calls) == 1
+    assert attempt.tool_calls[0].ok is None
+    assert attempt.tool_calls[0].status == "incomplete"
+    assert attempt.tool_calls[0].diagnostic
+    assert attempt.trace
+    assert ("r", "n") not in executor.tool_logs
+
+
+def test_log_snapshot_does_not_consume_evidence_before_successful_save(tmp_path):
+    database = Database(tmp_path / "snapshot.db")
+    executor = Executor(database, Providers(), MODELS)
+    executor.tool_logs["r", "n"] = [{"turn": 0, "tool": "command", "ok": None, "running": True}]
+    first = executor._take_log("r", "n")
+    second = executor._take_log("r", "n")
+    assert first["tool_calls"] == second["tool_calls"]
+    assert first["tool_calls"]
+    assert executor.tool_logs["r", "n"][0]["running"] is True

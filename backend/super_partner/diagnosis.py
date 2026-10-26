@@ -56,14 +56,17 @@ def _tool_summary(attempt, last: bool) -> str:
     themselves, so a diagnosis can see where the turns went."""
     counts: dict[str, list[int]] = {}
     for call in attempt.tool_calls:
-        tally = counts.setdefault(call.tool, [0, 0])
+        tally = counts.setdefault(call.tool, [0, 0, 0])
         tally[0] += 1
-        tally[1] += not call.ok
-    spread = ", ".join(f"{tool}×{n}" + (f" ({bad} failed)" if bad else "") for tool, (n, bad) in counts.items())
+        tally[1] += call.ok is False
+        tally[2] += call.ok is None
+    spread = ", ".join(f"{tool}×{n}" + (f" ({bad} failed)" if bad else "")
+                       + (f" ({unknown} unknown/incomplete)" if unknown else "")
+                       for tool, (n, bad, unknown) in counts.items())
     head = f"  tool calls: {attempt.turns} turns{' (ran out of turns)' if attempt.turn_limit else ''}: {spread}"
     if not last:
         return head
-    calls = [f"    t{call.turn} {call.tool} {call.detail}{'' if call.ok else '  [failed]'}" for call in attempt.tool_calls[-MAX_LISTED_CALLS:]]
+    calls = [f"    t{call.turn} {call.tool} {call.detail}  [{call.status}]" for call in attempt.tool_calls[-MAX_LISTED_CALLS:]]
     trace = [f"    every call with its whole output, one JSON line each: {attempt.trace}"] if attempt.trace else []
     return "\n".join([head, *calls, *trace])
 
@@ -96,13 +99,20 @@ def _history(run: ExecutionRun, events: list[str]) -> list[str]:
             )
             if attempt.tool_calls:
                 lines.append(_tool_summary(attempt, last=number == len(node.attempts)))
+            if attempt.result is not None:
+                lines.append(f"attempt {number} result (source={attempt.result_source or 'unknown'}):\n"
+                             + attempt.result[:MAX_RESULT_CHARS])
+            else:
+                lines.append(f"attempt {number} result: unknown (not recorded; do not substitute an older answer)")
+            if attempt.trace:
+                lines.append(f"attempt {number} evidence trace: {attempt.trace}")
         if node.feedback:
             lines.append(f"Pending feedback: {node.feedback}")
         if node.changed_files:
             lines.append(f"Changed files: {', '.join(node.changed_files[:40])}")
-        if node.result:
+        if node.result and not any(a.result == node.result for a in node.attempts):
             clipped = node.result[:MAX_RESULT_CHARS]
-            lines.append(f"Last result:\n{clipped}" + ("\n[...]" if len(node.result) > len(clipped) else ""))
+            lines.append(f"Historical node output (attempt/source unknown; not evidence of the latest attempt):\n{clipped}" + ("\n[...]" if len(node.result) > len(clipped) else ""))
     if events:
         lines.append("\nRecent events:\n" + "\n".join(events[-40:]))
     replied = sorted((d for d in run.diagnoses if d.messages), key=lambda d: d.messages[-1].created_at)

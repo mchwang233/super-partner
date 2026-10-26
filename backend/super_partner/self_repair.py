@@ -185,6 +185,17 @@ class SelfRepair:
                 record.error = None if success else job.get("error", "平台修复未生效。")
                 record.report = (record.report or "") + ("\n\n平台修复已生效，服务健康检查通过。" if success
                                                       else f"\n\n平台修复未生效：{record.error}")
+                node = next((n for n in run.plan.nodes if n.id == record.node_id), None)
+                if success and node and node.attempts and node.attempts[-1].outcome == "error":
+                    last = node.attempts[-1]
+                    evidence = "本次回答已保存，见本次尝试记录。" if last.result is not None else (
+                        "本次回答未记录；缺失的回答和退出状态必须标为未知，不得用旧回答补齐。")
+                    if last.trace:
+                        evidence += f" 原始证据：{last.trace}。"
+                    note = ("平台修复不代表任务验收通过。先核对本次尝试的回答、原始日志及工作目录中的有效证据，"
+                            "保留已有裁决和验收要求，仅补齐未完成部分，不要重复整轮工作。" + evidence)
+                    node.feedback = "\n".join(part for part in (node.feedback, note) if part)
+                    record.report += "\n" + note
             # A repair the lead asked for goes back to it, applied or not, before the step runs again.
             asked = next((record for record in records if record.trigger == "lead_repair" and record.node_id
                           and self._can_lead()), None)

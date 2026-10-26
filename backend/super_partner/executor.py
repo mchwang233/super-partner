@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Optional
 from uuid import uuid4
 
 from . import (
+    activity,
     briefing,
     contracts,
     learning,
@@ -55,6 +57,10 @@ from .self_repair import SelfRepair
 # How a model call that ran out of turns reads in an attempt's reason (providers.TURN_LIMIT_MARK).
 TURN_LIMIT_HINT = "轮工具调用后仍未完成"
 
+# A membership CLI cannot count its tool calls, so a contract step it runs is bounded by time
+# instead: this many minutes per declared tool call, checked with its progress checks.
+CLI_MINUTES_PER_TOOL_CALL = 1.5
+
 # Diagnosis report kept with a step that cannot be done.
 MAX_UNABLE_REPORT = 1500
 
@@ -76,6 +82,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         self.model_lookup = model_lookup
         self.tasks: dict[str, asyncio.Task] = {}
         self.learning_tasks: dict[str, asyncio.Task] = {}
+        # Naming a finished task's problems (retrospect.name_problems), one call each.
+        self.naming_tasks: dict[str, asyncio.Task] = {}
         self.closing = False
         self.diagnosing: dict[str, asyncio.Task] = {}
         self.locks: dict[str, asyncio.Lock] = {}
@@ -90,6 +98,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         self.tool_logs: dict[tuple[str, str], list[dict]] = {}
         # Where each running attempt writes its full tool trace (NodeAttempt.trace).
         self.tool_traces: dict[tuple[str, str], Path] = {}
+        self.work_results: dict[tuple[str, str], object] = {}
         # Each step's conversation with its API model, continued by its next attempt.
         self.conversations: dict[tuple[str, str], Conversation] = {}
         self.reservations: dict[str, dict] = {}
@@ -125,7 +134,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
     async def shutdown(self) -> None:
         self.closing = True
         tasks = set(self.tasks.values()) | set(self.diagnosing.values())
-        tasks |= set(self.learning_tasks.values())
+        tasks |= set(self.learning_tasks.values()) | set(self.naming_tasks.values())
         tasks |= {task for task in (self.maintenance_task, self.engineer_task) if task}
         for task in tasks:
             if not task.done():
@@ -137,7 +146,26 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         if kind in retrospect.END_EVENTS:
             # The task has ended: look back on it while its records are fresh.
             retrospect.record(self.db, run_id)
+            self._name_problems(run_id)
             self.finish_learning(run_id)
+
+    def _name_problems(self, run_id: str) -> None:
+        """Name the problems of a task that has just ended by what they are about, in the background."""
+        if not settings.problem_naming or self.closing:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        run = self.db.get_run(run_id)
+        if not run or ((current := self.naming_tasks.get(run_id)) and not current.done()):
+            return
+
+        async def complete(model_id: str, prompt: str):
+            return await self.providers.complete(model_id, prompt, allow_api_fallback=False, effort="low")
+
+        self.naming_tasks[run_id] = loop.create_task(retrospect.name_problems(
+            self.db, complete, list(self.model_lookup.values()), self._configured(run), run_id))
 
     async def execute(self, run_id: str) -> None:
         run = self.db.get_run(run_id)
@@ -279,7 +307,6 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             node.estimated_cost_usd for node in run.plan.nodes if node.id in in_flight
         )
         held_back = False
-        busy_employees = {n.employee_id for n in run.plan.nodes if n.id in in_flight}
         provider_load = Counter(self.model_lookup[n.model_id].provider for n in run.plan.nodes
                                 if n.id in in_flight and n.model_id in self.model_lookup)
         for node in ready:
@@ -288,7 +315,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             model = self.model_lookup.get(node.model_id)
             if run.plan.employees:
                 provider_cap = settings.provider_limits.get(model.provider, {}).get("concurrency", 0) if model else 0
-                if node.employee_id in busy_employees or (provider_cap and provider_load[model.provider] >= provider_cap):
+                # An employee is a role, not a worker: its independent tasks run at the same time,
+                # each in a session of its own; only a provider's capacity holds them back.
+                if provider_cap and provider_load[model.provider] >= provider_cap:
                     continue
             # Splits at work do not count: they are the lead's conversations, not steps.
             limit = settings.max_parallel_nodes
@@ -298,7 +327,6 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 held_back = True
                 continue
             reserved += node.estimated_cost_usd
-            busy_employees.add(node.employee_id)
             if model:
                 provider_load[model.provider] += 1
             running[asyncio.create_task(self._execute_node(run.id, node.id))] = node.id
@@ -342,7 +370,9 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         channels, candidates = [], []
         for model in self.model_lookup.values():
             declared = declare(model.id) if callable(declare) else {}
-            compatible = (can_act(model) and all(declared.get(k) == v for k, v in TOOL_LIMIT_REQUIREMENTS.items()))
+            # Membership CLIs cannot count tool calls; they are bounded by time instead (_timed_watch).
+            compatible = can_act(model) and (model.id.startswith("cli:") or all(
+                declared.get(k) == v for k, v in TOOL_LIMIT_REQUIREMENTS.items()))
             cost = node_cost(node, model) if model.id in eligible else None
             affordable = cost is not None and reserved + cost <= run.budget_usd and cost <= step_left
             channels.append({"model_id": model.id, "declared_capabilities": declared,
@@ -455,7 +485,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 verdict = quality.Verdict(False, "上游已返工，本次结果失效。") if stale else await self._check(run, node, result.text, changed, workspace)
             if result.turn_limit and verdict.passed and not verdict.reviewer_model_id:
                 # Nobody checked it, and a summary made at the turn limit says the work is unfinished.
-                verdict = quality.Verdict(False, f"{TURN_LIMIT_HINT}，只交了进度总结，且没有验收模型确认已完成。")
+                verdict = quality.Verdict(False, f"用完了工具调用轮次，{TURN_LIMIT_HINT}：只交了进度总结。")
             await self._finish(run_id, node_id, result, verdict, inputs, changed, cost, None, generation=generation)
         except asyncio.CancelledError as exc:
             exc.accounted_cost_usd = getattr(exc, "accounted_cost_usd", 0.0) + work_accounted
@@ -468,6 +498,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                                                         reason="上游返工或任务取消，调用已停止。", cost_usd=getattr(exc, "accounted_cost_usd", 0.0),
                                                         **self._take_log(run_id, node_id, getattr(exc, "usage", None))))
                 self._save(latest)
+                self._release_log(run_id, node_id)
                 if current.generation != generation:
                     return
             raise
@@ -527,6 +558,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             from .routing import reestimate
             reestimate(run)
             self._save(run)
+            self._release_log(run_id, node_id)
             if children:
                 self.emit(run_id, "node.delegated", node_id=node_id, employee_id=node.employee_id,
                           children=[{"id": n.id, "employee_id": n.employee_id, "title": n.title} for n in children],
@@ -637,14 +669,25 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         """What an attempt did, for its NodeAttempt, however it ended (finished, cancelled, its
         model unavailable): its tool calls, its turns (from the model's usage, else the calls),
         and its full trace if one was written."""
-        log = self.tool_logs.pop((run_id, node_id), None) or []
-        trace = self.tool_traces.pop((run_id, node_id), None)
-        turns = getattr(result, "turns", 0) or max((call["turn"] for call in log), default=0)
+        # Snapshot only. A failed model validation or DB write must leave the evidence available.
+        key = (run_id, node_id)
+        log = [dict(call) for call in self.tool_logs.get(key, [])]
+        trace = self.tool_traces.get(key)
+        answer = result if hasattr(result, "text") else self.work_results.get(key)
+        turns = getattr(result, "turns", 0) or getattr(answer, "turns", 0) or max((call["turn"] for call in log), default=0)
         latest = self.db.get_run(run_id)
         node = next((item for item in latest.plan.nodes if item.id == node_id), None) if latest else None
         elapsed = max(0, (datetime.now(timezone.utc) - node.started_at).total_seconds()) if node and node.started_at else None
         return {"tool_calls": log, "turns": turns, "trace": str(trace) if trace and trace.is_file() else None,
-                "duration_seconds": elapsed}
+                "duration_seconds": elapsed, "result": getattr(answer, "text", None),
+                "result_source": "provider" if answer is not None else None}
+
+    def _release_log(self, run_id: str, node_id: str) -> None:
+        """Release an attempt's evidence only after its record was saved successfully."""
+        key = (run_id, node_id)
+        self.tool_logs.pop(key, None)
+        self.tool_traces.pop(key, None)
+        self.work_results.pop(key, None)
 
     def _spread(self, run, node) -> None:
         """Keep one API provider from carrying all of the task's running steps, so that its
@@ -695,6 +738,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             else:
                 self._route_after_unavailable(run, node, exc)
             self._save(run)
+            self._release_log(run_id, node_id)
 
     def _route_after_unavailable(self, run: ExecutionRun, node, exc: ModelUnavailable,
                                  diagnosis_id: Optional[str] = None) -> None:
@@ -772,6 +816,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             if uses_files and before and not (conversation and conversation.followup):
                 # A continued conversation has its files already.
                 prompt = await asyncio.to_thread(self._with_files, run, node, workspace, prompt)
+            self.work_results.pop((run.id, node.id), None)
             log = self.tool_logs[run.id, node.id] = []
             trace = self.tool_traces[run.id, node.id] = trace_path(run.id, node.id, len(node.attempts) + 1)
             for governor in team.governors(run.plan, node):
@@ -785,14 +830,16 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                     for field in ("contract_generation", "artifact_inputs", "artifact_baseline", "artifact_evidence"):
                         setattr(current, field, getattr(node, field))
                     self._save(latest)
-            result = await self._complete(
-                run, node, model_id, prompt, workspace, allow_api_fallback=fallback and not in_project,
-                attachments=run.attachments, act=act, max_turns=turns_for(node), tool_log=log, tool_trace=trace,
-                watch=self._progress_watch(run, node, model_id),
-                effort=settings.reasoning_by_difficulty.get(node.difficulty),
-                **({"conversation": conversation} if conversation else {}),
-                **({"overrun": overrun} if (overrun := self._overrun_check(run, node, model_id)) else {}),
-            )
+            with activity.recording(log):
+                result = await self._complete(
+                    run, node, model_id, prompt, workspace, allow_api_fallback=fallback and not in_project,
+                    attachments=run.attachments, act=act, max_turns=turns_for(node), tool_log=log, tool_trace=trace,
+                    watch=self._timed_watch(run, node, model_id),
+                    effort=settings.reasoning_by_difficulty.get(node.difficulty),
+                    **({"conversation": conversation} if conversation else {}),
+                    **({"overrun": overrun} if (overrun := self._overrun_check(run, node, model_id)) else {}),
+                )
+            self.work_results[run.id, node.id] = result
             try:
                 after = await asyncio.to_thread(quality.file_state, workspace) if uses_files else {}
             except (Exception, asyncio.CancelledError) as exc:
@@ -802,6 +849,23 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         cost = self._actual_cost(result, node, None if model_id == node.model_id else model_id)
         return result, scope.own(quality.changed_files(before, after)), cost, workspace
 
+
+    def _timed_watch(self, run, node, model_id: str):
+        """The progress watch of an attempt; for a contract step on a membership CLI, which cannot
+        count its tool calls, it also stops the attempt past the time its declared calls allow."""
+        watch = self._progress_watch(run, node, model_id)
+        limits = team.governors(run.plan, node)
+        minutes = (min(n.artifact_contract.max_turns for n in limits) * CLI_MINUTES_PER_TOOL_CALL
+                   if model_id.startswith("cli:") and limits else None)
+        started = time.monotonic()
+
+        async def timed(evidence: str) -> Optional[str]:
+            if minutes is not None and (time.monotonic() - started) / 60 >= minutes:
+                return f"达到用时上限 {minutes:.0f} 分钟（会员 CLI 无法统计工具调用次数，按用时约束）。"
+            with activity.paused():  # the checker's and the lead's calls are not the step's work
+                return await watch(evidence)
+
+        return timed
 
     async def _finish(self, run_id: str, node_id: str, result, verdict: quality.Verdict, inputs, changed, cost: float, outcome: Optional[str],
                       generation: Optional[int] = None, accounted: float = 0.0, usage=None) -> None:
@@ -813,6 +877,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 return
             node = next(item for item in run.plan.nodes if item.id == node_id)
             stale = generation is not None and node.generation != generation
+            returned = result or self.work_results.get((run_id, node_id))
             logged = self._take_log(run_id, node_id, result or usage)
             if node.artifact_contract and not stale:
                 node.contract_turns = max(node.contract_turns, sum(a.turns for a in node.attempts) + logged["turns"])
@@ -837,23 +902,31 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 outcome = Outcome.SUPERSEDED
             spent = round(cost + verdict.cost_usd, 6)
             node.attempts.append(NodeAttempt(
-                model_id=(result.used_model_id if result else None) or node.model_id, outcome=outcome,
+                model_id=(returned.used_model_id if returned else None) or node.model_id, outcome=outcome,
                 reason=verdict.reason, reviewer_model_id=verdict.reviewer_model_id, cost_usd=spent,
-                turn_limit=bool(getattr(result, "turn_limit", False)) or TURN_LIMIT_HINT in (verdict.reason or ""),
+                turn_limit=bool(getattr(returned, "turn_limit", False)) or TURN_LIMIT_HINT in (verdict.reason or ""),
                 **logged,
             ))
             accounted += getattr(result, "accounted_cost_usd", 0.0) + verdict.accounted_cost_usd
             run.actual_cost_usd = round(run.actual_cost_usd + max(0.0, spent - accounted), 6)
             if stale:
                 self._save(run)
+                self._release_log(run_id, node_id)
                 self.emit(run_id, "node.superseded", node_id=node.id)
                 return
-            checked = verdict.verified and (settings.review_nodes or bool(node.verifies))
+            checked = verdict.verified and settings.acceptance and (settings.review_nodes or bool(node.verifies))
             node.inputs, node.review_passed, node.review = inputs, verdict.passed if checked else None, verdict.reason
-            if result is not None:
-                node.result, node.summary = result.text, verdict.summary
+            if logged["result"] is not None:
+                node.result, node.summary = logged["result"], verdict.summary
                 node.changed_files = list(dict.fromkeys([*node.changed_files, *changed]))
-            if outcome in {Outcome.BLOCKED, Outcome.STOPPED}:
+            # At a declared limit, or blocked (missing evidence, a target not reached, a platform
+            # rule), the lead decides: more calls, rework upstream, a repair, ask the user, or give up
+            # (leading.py). Without a lead it stops as declared.
+            limited = self._can_lead() and (outcome == Outcome.BLOCKED or (
+                outcome == Outcome.STOPPED and bool(self._contract_limit_reason(node))))
+            if limited:
+                node.status = NodeStatus.RUNNING
+            elif outcome in {Outcome.BLOCKED, Outcome.STOPPED}:
                 self._stop_contract(run, node, verdict.reason, outcome)
             elif outcome == Outcome.BUDGET:
                 node.status = NodeStatus.PENDING
@@ -880,13 +953,14 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 run.status = RunStatus.PAUSED
                 self.emit(run_id, "approval.required", reason="budget_exceeded", actual_cost_usd=run.actual_cost_usd)
             # A verification out of rework rounds is a failure too.
-            diagnose = settings.auto_diagnose and (
+            diagnose = settings.auto_diagnose and not limited and (
                 node.status == NodeStatus.RUNNING or (outcome == Outcome.VERIFY_FAILED and node.status == NodeStatus.FAILED)
             )
             # A failed attempt held for recovery goes to the task's lead (leading.py).
             lead = node.status == NodeStatus.RUNNING and self._can_lead() and (
-                settings.auto_diagnose or outcome == Outcome.VERIFY_FAILED)
+                settings.auto_diagnose or limited or outcome == Outcome.VERIFY_FAILED)
             self._save(run)
+            self._release_log(run_id, node_id)
         if lead:
             await self._decide(run_id, node_id, verdict, outcome)
         elif diagnose:
@@ -925,7 +999,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 self._mark_unable(run, node, verdict.unable or verdict.reason)
                 return
             node.status = NodeStatus.FAILED
-            if outcome == Outcome.ERROR:
+            if outcome == Outcome.ERROR and not (node.attempts and node.attempts[-1].result is not None):
                 node.result = verdict.reason
             self.emit(run.id, "node.failed", node_id=node.id, error=verdict.reason, attempts=len(node.attempts))
             return
@@ -1078,15 +1152,18 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 self._save(latest)
 
         limits = team.governors(run.plan, node) if node else []
+        # Turns and tool calls are counted for API models only; a membership CLI cannot report
+        # them, and is bounded by time instead (_timed_watch). Cost limits apply to both.
+        counted = bool(limits) and work and not model_id.startswith("cli:")
         budget = RequestBudget(self.model_lookup, remaining, self.reservations.setdefault(run.id, {}), charge,
                                self.budget_events.setdefault(run.id, asyncio.Event()),
                                step_remaining=(lambda: min(n.artifact_contract.max_cost_usd - n.contract_cost_usd for n in current_limits())) if limits else None,
-                               turn_remaining=(lambda: min(n.artifact_contract.max_turns - n.contract_turns for n in current_limits())) if limits and work else None,
-                               use_turn=use_turn if limits and work else None,
+                               turn_remaining=(lambda: min(n.artifact_contract.max_turns - n.contract_turns for n in current_limits())) if counted else None,
+                               use_turn=use_turn if counted else None,
                                scope=(run.id, limits[-1].id) if limits else None, wait_for_step=work)
-        budget.begin_tool = begin_tool if limits and work else None
+        budget.begin_tool = begin_tool if counted else None
         budget.tool_remaining = (lambda: min(n.artifact_contract.max_turns - n.contract_tool_calls
-                                             for n in current_limits())) if limits and work else None
+                                             for n in current_limits())) if counted else None
         budget.context = {"run_id": run.id, "node_id": node.id if node else None,
                           "purpose": "work" if work else "review_or_control"}
         result = None

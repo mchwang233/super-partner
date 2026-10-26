@@ -104,8 +104,8 @@ async def test_a_conversation_the_provider_refuses_starts_afresh(tmp_path, api):
 
 def attempt(model_id="x:api", outcome=Outcome.REJECTED, reason="缺少 --verbose", **fields):
     return NodeAttempt(model_id=model_id, outcome=outcome, reason=reason, turns=3, tool_calls=[
-        ToolCall(turn=1, tool="Read", detail="app.py (from line 1)"),
-        ToolCall(turn=2, tool="Edit", detail="app.py"),
+        ToolCall(turn=1, tool="Read", detail="app.py (from line 1)", ok=True),
+        ToolCall(turn=2, tool="Edit", detail="app.py", ok=True),
         ToolCall(turn=3, tool="Bash", detail="pytest -q", ok=False),
     ], **fields)
 

@@ -102,7 +102,7 @@ function mission(id, status) {
   };
 }
 
-async function setup(t, records = [mission("finished-task", "succeeded"), mission("running-task", "running")], models = [], { openComposer = true } = {}) {
+async function setup(t, records = [mission("finished-task", "succeeded"), mission("running-task", "running")], models = [], { openComposer = true, providers = [] } = {}) {
   const dom = new JSDOM('<div id="root"></div>', {
     url: "http://127.0.0.1:5173", runScripts: "outside-only", pretendToBeVisual: true,
   });
@@ -112,7 +112,7 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
     constructor() { super(); channels.push(this); }
   };
   const state = {
-    records, models, actions: [], resumes: [], publishes: [], uploads: [], attachmentDeletes: [], taskBodies: [], diagnosisReplies: [], leadMessages: [], followups: [], network: [],
+    records, models, providers, actions: [], resumes: [], publishes: [], uploads: [], attachmentDeletes: [], taskBodies: [], diagnosisReplies: [], leadMessages: [], followups: [], network: [],
     deletes: [], cancels: [], confirms: [], taskPosts: 0, quota: [], quotaResets: [], nativePicker: true, pickerStarts: [], nativeConfirms: 0, holdNextRead: false, releaseRead: null,
   };
   const json = value => new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
@@ -146,9 +146,18 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
     if (/^\/api\/tasks\/[^/]+\/calls$/.test(path)) {
       return json(state.calls ?? { calls: [], limit: 1000, summary: { calls: 0 } });
     }
+    if (path === "/api/retrospectives/topics") return json(state.topics ?? []);
+    if (/^\/api\/tasks\/[^/]+\/choices$/.test(path)) {
+      const id = path.split("/")[3], body = JSON.parse(options.body);
+      state.choicePicks = [...(state.choicePicks ?? []), body.picks];
+      const current = state.records.find(run => run.id === id);
+      const updated = { ...current, plan: { ...current.plan, summary: "按你的选择重新规划", choices: [] } };
+      state.records = state.records.map(run => run.id === id ? updated : run);
+      return json(updated);
+    }
     if (path === "/api/improvements/settings") {
       if (options.method === "PUT") state.learningSettings = JSON.parse(options.body);
-      return json(state.learningSettings ?? { enabled: false, budget_usd: 0.5, auto_platform: true });
+      return json(state.learningSettings ?? { enabled: false, budget_usd: 0.5 });
     }
     if (/^\/api\/tasks\/[^/]+\/learning$/.test(path)) {
       if (options.method === "POST") {
@@ -307,7 +316,7 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
       return json({ url: state.githubUrl });
     }
     if (path === "/api/models") return json(state.models);
-    if (path === "/api/providers") return json([]);
+    if (path === "/api/providers") return json(state.providers);
     if (path === "/api/engineer") return json(state.engineer ?? { available: true, jobs: [] });
     throw new Error(`Unexpected request: ${path}`);
   };
@@ -910,7 +919,7 @@ test("retrospective settings persist and manual generation shows its progress", 
   await click(enable);
   await click(button("保存自动改进设置"));
   assert.equal(state.learningSettings.enabled, true);
-  assert.equal(state.learningSettings.auto_platform, true);
+  assert.equal(state.learningSettings.auto_platform, undefined);
   assert.equal(state.learningSettings.budget_usd, 0.5);
   await click(button("生成复盘与改进项"));
   assert.equal(state.learningStarts, 1);
@@ -1184,6 +1193,18 @@ test("models out of quota are listed until they reset, and can be put back by ha
   await click([...banner.querySelectorAll("button")].find(b => b.textContent === "恢复使用"));
   assert.deepEqual(state.quotaResets, ["cli:claude"]);
   assert.equal(document.querySelector(".quota-banner"), null);
+});
+
+test("a provider whose key waits in a locked keyring says so instead of not configured", async t => {
+  const models = [{ id: "deepseek:deepseek-flash", provider: "deepseek", display_name: "DeepSeek", channel: "api", enabled: true, configured: false, scores: {} }];
+  const providers = [{ id: "deepseek", name: "DeepSeek", configured: false, keyring_locked: true }];
+  const { document, click } = await setup(t, [mission("build-task", "running")], models, { providers });
+  await click(document.querySelector(".fleet-trigger"));
+  await click(document.querySelector('[aria-label="配置 DeepSeek 的 API Key"]'));
+  const card = document.querySelector(".provider-card");
+  assert.ok(card);
+  assert.match(card.textContent, /密钥环未解锁/);
+  assert.doesNotMatch(card.textContent, /未配置/);
 });
 
 test("service failures are distinguished from quota exhaustion", async t => {
@@ -1679,4 +1700,60 @@ test("delegation continuations are not displayed as failed retries", async t => 
   const { document, button, click } = await setup(t, [run], [], { openComposer: false });
   await click(button("进度"));
   assert.doesNotMatch(document.querySelector(".plan-summary").textContent, /重试/);
+});
+
+test("recurring problems are listed by what they are about and lead back to their tasks", async t => {
+  const { state, document, button, click } = await setup(t);
+  state.topics = [{ topic: "新思 EDA 环境未加载", runs: ["missing-run"], repaired_in: ["missing-run"], members: ["environment:vcs", "platform:agent"],
+    label: "沙箱里没有加载 .edarc", recurred_after_repair: true, last_seen: "2026-10-22T10:00:00Z" }];
+  await click(button("重复问题"));
+  const page = document.querySelector(".problems-page");
+  assert.match(page.textContent, /新思 EDA 环境未加载/);
+  assert.match(page.textContent, /environment:vcs、platform:agent/);
+  assert.match(page.textContent, /修复后又出现/);
+  assert.equal(page.querySelector(".problem-runs button").disabled, true); // its task was deleted
+});
+
+test("the plan's open choices are picked on the page and the plan is made again with them", async t => {
+  const run = mission("with-choices", "awaiting_confirmation");
+  run.plan.choices = [{ question: "AXI4 还是 AXI4-Lite？", assumed: "完整 AXI4", alternative: "AXI4-Lite" },
+    { question: "apb_mux 是什么？", assumed: "一主多从", alternative: "多主一从" }];
+  const { state, document, act, click } = await setup(t, [run], [], { openComposer: false });
+  const panel = document.querySelector(".plan-choices");
+  assert.match(panel.textContent, /负责人建议/);
+  const replan = () => [...panel.querySelectorAll("button")].find(b => b.textContent.includes("按我的选择重新规划"));
+  assert.equal(replan(), undefined); // the lead's answers need no new plan
+  const radios = panel.querySelectorAll('[role="radio"]');
+  assert.equal(radios[0].getAttribute("aria-checked"), "true");
+  await click(radios[1]); // AXI4-Lite
+  assert.equal(radios[1].getAttribute("aria-checked"), "true");
+  await click(replan());
+  assert.deepEqual(state.choicePicks, [["alternative", "assumed"]]);
+  await act(async () => {});
+  assert.match(document.querySelector(".task-title h3").textContent, /按你的选择重新规划/);
+  assert.equal(document.querySelector(".plan-choices"), null);
+});
+
+
+test("attempt answers and unknown tool outcomes retain their provenance", async t => {
+  const run = mission("answer-provenance", "running");
+  run.plan.nodes = [{ id: "a", title: "Check", dependencies: [], status: "pending", estimated_cost_usd: 0,
+    result: "historical answer", attempts: [
+      { outcome: "rejected", cost_usd: 0, result: "first answer", result_source: "provider" },
+      { outcome: "error", cost_usd: 0, tool_calls: [
+        { turn: 0, tool: "command", detail: "unknown check", ok: null, status: "unknown" },
+        { turn: 0, tool: "command", detail: "unfinished check", ok: null, status: "incomplete",
+          diagnostic: "No completion event" },
+      ] },
+    ] }];
+  const { document, click } = await setup(t, [run], [], { openComposer: false });
+  await click(document.querySelector(".plan-node-title"));
+  const attempts = document.querySelectorAll(".plan-attempts > li");
+  assert.match(attempts[0].textContent, /first answer/);
+  assert.match(attempts[1].textContent, /本次回答未记录/);
+  assert.match(attempts[1].textContent, /未知/);
+  assert.match(attempts[1].textContent, /未完成/);
+  assert.match(attempts[1].textContent, /No completion event/);
+  assert.equal(attempts[1].querySelectorAll("li.bad").length, 0);
+  assert.match(document.querySelector(".node-progress-output h5").textContent, /历史输出.*来源未记录/);
 });

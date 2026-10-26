@@ -212,7 +212,10 @@ def _log_lines(log: Optional[list]) -> list[str]:
     for entry in log[-RECENT_ENTRIES:]:
         if not isinstance(entry, dict):
             continue
-        flag = " (running)" if entry.get("running") else ("" if entry.get("ok", True) else " (failed)")
+        state = entry.get("status") or ("running" if entry.get("running") else
+                                        "succeeded" if entry.get("ok") is True else
+                                        "failed" if entry.get("ok") is False else "unknown")
+        flag = "" if state == "succeeded" else f" ({state})"
         lines.append(f"- {entry.get('tool') or 'tool'}: {str(entry.get('detail') or '')[:200]}{flag}")
         output = str(entry.get("output") or "").strip()
         if output:

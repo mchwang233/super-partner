@@ -13,31 +13,34 @@ export type PlanNode = {
   changed_files?: string[]; inputs?: { node_id: string; form: string; changed_files: number }[];
   files?: string[]; reads?: string[]; provides?: string; check?: string; part_id?: string | null;
 };
-type ToolCall = { turn: number; tool: string; detail?: string; ok?: boolean; output?: string };
+type ToolCall = { turn: number; tool: string; detail?: string; ok?: boolean | null; output?: string; running?: boolean; status?: string; diagnostic?: string | null };
 type NodeAttempt = { model_id?: string | null; outcome: string; reason?: string | null; reviewer_model_id?: string | null; cost_usd: number; finished_at?: string;
-  turns?: number; turn_limit?: boolean; tool_calls?: ToolCall[] };
+  turns?: number; turn_limit?: boolean; tool_calls?: ToolCall[]; result?: string | null; result_source?: string | null };
 const TOOL_LABELS: Record<string, string> = { Bash: "运行命令", Read: "读文件", Write: "写文件", Edit: "改文件", MultiEdit: "批量改文件",
   Glob: "找文件", Grep: "搜索", LS: "列目录",
   // Attempts recorded before the tools followed Claude Code's.
-  list_dir: "列目录", read_file: "读文件", write_file: "写文件", edit_file: "改文件", run_command: "运行命令" };
+  list_dir: "列目录", read_file: "读文件", write_file: "写文件", edit_file: "改文件", run_command: "运行命令",
+  // What a membership CLI does, as it prints it (activity.py).
+  command: "运行命令", file_change: "改文件", message: "说明", plan: "计划" };
 
 /** Where an API model's turns went: calls per tool, then every call, folded by default. */
-function ToolLog({ calls }: { calls: ToolCall[] }) {
+function ToolLog({ calls, open = false, title = "工具调用" }: { calls: ToolCall[]; open?: boolean; title?: string }) {
   const counts = new Map<string, [number, number]>();
   for (const call of calls) {
     const [n, bad] = counts.get(call.tool) ?? [0, 0];
     counts.set(call.tool, [n + 1, bad + (call.ok === false ? 1 : 0)]);
   }
-  return <details className="tool-log">
-    <summary>工具调用 {calls.length} 次：{[...counts].map(([tool, [n, bad]]) => `${TOOL_LABELS[tool] ?? tool} ${n}${bad ? `（失败 ${bad}）` : ""}`).join(" · ")}</summary>
+  return <details className="tool-log" open={open}>
+    <summary>{title} {calls.length} 次：{[...counts].map(([tool, [n, bad]]) => `${TOOL_LABELS[tool] ?? tool} ${n}${bad ? `（失败 ${bad}）` : ""}`).join(" · ")}</summary>
     <ol>{calls.map((call, index) => <li key={index} className={call.ok === false ? "bad" : undefined}>
-      <span className="tool-turn">第 {call.turn} 轮</span><span className="tool-name">{TOOL_LABELS[call.tool] ?? call.tool}</span><code>{call.detail}</code>{call.ok === false && <em>失败</em>}
-      {call.output && <details className="tool-output"><summary>模型看到的输出</summary><pre>{call.output}</pre></details>}
+      {call.turn > 0 && <span className="tool-turn">第 {call.turn} 轮</span>}<span className="tool-name">{TOOL_LABELS[call.tool] ?? call.tool}</span><code title={call.detail}>{call.detail}</code>{call.running && <em className="running">运行中</em>}{call.ok === false && <em>失败</em>}{!call.running && call.ok == null && <em>{call.status === "incomplete" ? "未完成" : "未知"}</em>}
+      {call.diagnostic && <span>{call.diagnostic}</span>}
+      {call.output && <details className="tool-output"><summary>{call.running ? "到目前的输出" : "模型看到的输出"}</summary><pre>{call.output}</pre></details>}
     </li>)}</ol>
   </details>;
 }
 
-const OUTCOME_LABELS: Record<string, string> = { delegated: "已委派，等待子任务", passed: "通过", rejected: "验收未通过", unverified: "尚未验证", superseded: "上游返工，结果失效", budget: "预算不足", cancelled: "已中止", error: "执行出错", verify_failed: "验证发现问题", quota: "额度用完", unavailable: "模型服务暂时不可用", unable: "无法完成" };
+const OUTCOME_LABELS: Record<string, string> = { stopped: "达到上限", blocked: "被阻塞", delegated: "已委派，等待子任务", passed: "通过", rejected: "验收未通过", unverified: "尚未验证", superseded: "上游返工，结果失效", budget: "预算不足", cancelled: "已中止", error: "执行出错", verify_failed: "验证发现问题", quota: "额度用完", unavailable: "模型服务暂时不可用", unable: "无法完成" };
 const INPUT_LABELS: Record<string, string> = { full: "完整结果", summary: "摘要", truncated: "截断的结果" };
 
 /** One line on the card saying where the node stands right now. */
@@ -243,6 +246,10 @@ function describe(event: TimelineEvent, nodeId: string, number: Map<string, stri
     case "node.delegated": return `已委派 ${(data.children ?? []).length} 个子任务，等待验收后继续：${data.reason ?? ""}`;
     case "node.retry": return `未通过，准备第 ${data.attempt} 次尝试${data.model_id ? `（换用 ${data.model_id}）` : ""}：${data.reason ?? ""}`;
     case "node.failed": return `失败：${data.error ?? ""}`;
+    case "node.blocked": return `停止：${data.reason ?? ""}`;
+    case "node.limit_extended": return `负责人追加额度：最多 ${data.max_turns} 次工具调用、${formatUsd(data.max_cost_usd ?? 0)}`;
+    case "node.model_switched": return `换用 ${data.next_model_id ?? "其他模型"}`;
+    case "node.progress_check": return data.stop ? `进度检查：判断卡住，停止（${data.reason ?? ""}）` : `进度检查（${data.minutes ?? 0} 分钟）：仍在推进`;
     default: return null;
   }
 }
@@ -252,6 +259,17 @@ export function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, m
   const [events, setEvents] = useState<TimelineEvent[]>([]), [now, setNow] = useState(() => Date.now());
   const attempts = node.attempts ?? [], inputs = node.inputs ?? [], files = node.changed_files ?? [];
   const live = ACTIVE_RUN.has(runStatus);
+  const [activity, setActivity] = useState<{ total: number; calls: ToolCall[] } | null>(null);
+  useEffect(() => {
+    // What the step is doing right now: its tool calls, or a CLI's commands and messages.
+    if (node.status !== "running") { setActivity(null); return; }
+    let cancelled = false;
+    const load = () => fetch(`${apiBase}/api/tasks/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(node.id)}/activity`)
+      .then(r => r.ok ? r.json() : null).then(body => { if (!cancelled && body) setActivity(body); }).catch(() => {});
+    load();
+    const timer = window.setInterval(load, 3000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [apiBase, runId, node.id, node.status]);
   useEffect(() => {
     let cancelled = false;
     const load = () => fetch(`${apiBase}/api/tasks/${encodeURIComponent(runId)}/timeline`).then(r => r.ok ? r.json() : []).then(list => { if (!cancelled && Array.isArray(list)) setEvents(list); }).catch(() => {});
@@ -296,6 +314,12 @@ export function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, m
       <div><dt>花费</dt><dd>{formatUsd(attempts.reduce((sum, attempt) => sum + attempt.cost_usd, 0))} / 预估 {formatUsd(node.estimated_cost_usd)}</dd></div>
     </dl>
     <p className="node-progress-reason">{selectionReason(node, model)}</p>
+    {node.status === "running" && <section className="node-activity" aria-live="polite"><h5>正在做</h5>
+      {activity?.calls.length ? <>
+        <ToolLog calls={activity.calls} open title={activity.total > activity.calls.length ? `最近的动作（共 ${activity.total} 次）` : "本次尝试的动作"} />
+        <p className="muted">每 3 秒刷新。{activity.calls[activity.calls.length - 1].running ? "最后一条命令还在运行。" : ""}</p>
+      </> : <p className="muted">{(node.model_id ?? "").startsWith("cli:") && node.model_id !== "cli:codex" ? "这个会员 CLI 只在结束时汇报，执行中看不到具体动作；可以看下面的时间线和改动的文件。" : "还没有动作，模型正在思考或等待回复。"}</p>}
+    </section>}
     <div className="node-progress-body">
       <section className="node-progress-timeline"><h5>时间线</h5>
         {lines.length ? <ol>{lines.map(({ event, text }) => <li key={event.id} className={event.kind.replace(".", "-")}><time>{clock(event.created_at)}</time><span>{text}</span></li>)}</ol> : <p className="muted">还没有执行记录。</p>}
@@ -320,9 +344,13 @@ export function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, m
       <small>{attempt.model_id ?? "未知模型"}{attempt.reviewer_model_id ? ` · 验收：${attempt.reviewer_model_id}` : ""} · {formatUsd(attempt.cost_usd)}{attempt.finished_at ? ` · ${clock(attempt.finished_at)}` : ""}
         {!!attempt.turns && <span className={`attempt-turns${attempt.turn_limit ? " limit" : ""}`}>{attempt.turns} 轮{attempt.turn_limit ? " · 轮次用完" : ""}</span>}</small>
       {attempt.reason && <p>{attempt.reason}</p>}
+      {attempt.result != null ? <details><summary>第 {index + 1} 次回答 · {attempt.result_source === "provider" ? "模型返回" : "来源未知"}</summary><MarkdownView text={attempt.result} /></details>
+        : <p className="muted">本次回答未记录，不能用历史输出代替。</p>}
       {!!attempt.tool_calls?.length && <ToolLog calls={attempt.tool_calls} />}
     </li>)}</ol></section>}
-    {node.result && <section className="node-progress-output"><h5>{node.status === "failed" ? "错误信息" : "输出"}</h5><MarkdownView text={node.result} markdown={node.status !== "failed"} /></section>}
+    {node.result && <section className="node-progress-output"><h5>{attempts.some(attempt => attempt.result === node.result)
+      ? "已保存的输出（各次回答见尝试记录）"
+      : "历史输出（尝试及来源未记录）"}</h5><MarkdownView text={node.result} markdown={node.status !== "failed"} /></section>}
   </section>;
 }
 
