@@ -215,6 +215,31 @@ async def test_the_executor_asks_another_model_and_records_the_check(tmp_path, m
     assert event.data["stop"] is True and event.data["reason"] == reason
 
 
+async def test_a_long_attempt_goes_on_when_no_model_can_check_it(tmp_path, monkeypatch):
+    """The producing model has no peer able to check it: a check that cannot be made must let the
+    attempt go on (the task's budget still bounds it), never stop work that keeps producing evidence."""
+    monkeypatch.setattr(settings, "workspace_root", tmp_path / "workspaces")
+    database = Database(tmp_path / "test.db")
+    one_node_run(database)
+
+    class NoChecker:
+        def configured_models(self, ids):
+            return set()
+
+        async def complete(self, *args, **kwargs):
+            raise AssertionError("no model can check this attempt")
+
+    executor = Executor(database, NoChecker(), {})
+    run = database.get_run("r")
+    watch = executor._progress_watch(run, run.plan.nodes[0], "cli:codex")
+    for _ in range(3):
+        assert await watch("回归日志仍在增长，子进程还在运行") is None
+    checks = [event for event in database.events("r") if event.kind == "node.progress_check"]
+    assert len(checks) == 3
+    assert all(event.data["stop"] is False and event.data["checked"] is False
+               and event.data["checker_model_id"] is None for event in checks)
+
+
 async def test_a_request_the_model_never_answers_is_checked_while_it_waits(tmp_path, monkeypatch, often):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
 

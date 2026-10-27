@@ -140,6 +140,9 @@ class Settings(BaseSettings):
     # Let the lead's per-part difficulty/effort assessment control refinement conversations.
     adaptive_refinement: bool = False
     diagnosis_reasoning_effort: str = "high"
+    # A diagnosis, environment repair or platform repair call may run this long. A long
+    # regression or a tool install can outlast half an hour, and the call must still finish.
+    repair_call_minutes: float = Field(default=60, gt=0)
     # Codex's service tier for the lead ("fast", "flex", ...); empty keeps the user's Codex config.
     codex_lead_service_tier: str = ""
     # Codex as the platform runs it leaves out the user's plugins, apps and MCP servers, which its

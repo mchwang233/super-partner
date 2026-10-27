@@ -185,6 +185,7 @@ class Reviewing:
             checker = pick_reviewer(list(self.model_lookup.values()), self._configured(run), model_id,
                                     len(prompt) // 3 + 1000)
             reason = None
+            checked = checker is not None
             if checker:
                 folder = settings.workspace_root / run.folder_id / ".review"
                 folder.mkdir(parents=True, exist_ok=True)
@@ -202,11 +203,12 @@ class Reviewing:
                     missed[0] += 1
                     if missed[0] >= 2:
                         reason = "连续两次无法完成进度检查，停止本次尝试并保留记录。"
-            else:
-                reason = "没有能力不低于执行者的可用进度检查模型，停止本次尝试。"
+            # Without a model able to judge this attempt the check cannot be made, which lets it
+            # go on: the task's budget and the lead's checks still bound it. Never stop a long
+            # attempt that is still producing evidence only because no peer model is available.
             self.emit(run.id, "node.progress_check", node_id=node.id, model_id=model_id,
                       checker_model_id=checker.id if checker else None, minutes=round(minutes),
-                      stop=bool(reason), reason=reason)
+                      checked=checked, stop=bool(reason), reason=reason)
             return reason or await self._critical_check(run.id, node, model_id, minutes, evidence, asked)
 
         return watch

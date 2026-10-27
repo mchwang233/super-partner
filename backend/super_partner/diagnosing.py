@@ -32,8 +32,6 @@ from .routing import NoEligibleModelError, can_act, diagnosers, pick_diagnoser
 
 # Models tried in turn for one repair when the previous one fails.
 MAX_DIAGNOSERS = 3
-# A membership CLI installing software can take a while.
-REPAIR_TIMEOUT = 1800
 
 
 class Diagnosing:
@@ -166,7 +164,8 @@ class Diagnosing:
             run = self.db.get_run(run_id)
             try:
                 result = await self._complete(
-                    run, node, model_id, prompt, workspace, cli_timeout=REPAIR_TIMEOUT if repair or edit else 600,
+                    run, node, model_id, prompt, workspace,
+                    cli_timeout=settings.repair_call_minutes * 60 if repair or edit else 600,
                     allow_api_fallback=False, act=act,
                     repair=repair, effort=settings.diagnosis_reasoning_effort,
                 )

@@ -31,7 +31,6 @@ from .models import (
 from .platform_repair import COMPONENT_GUIDES, REPAIR_GUIDES, RepairError, repair_guide
 from .routing import can_act, diagnosers
 
-ENGINEER_TIMEOUT = 1800
 # Models tried in turn when one fails (its usage ran out, say).
 MAX_ENGINEERS = 3
 STATUS = re.compile(r"^\s*STATUS:\s*(PLAN|FIXED|NEEDS_INPUT)\b", re.IGNORECASE | re.MULTILINE)
@@ -365,7 +364,8 @@ class Engineering:
             self._engineer_save(job)
             try:
                 result = await self._engineer_charged(job, model.id, lambda budget, model=model: self.providers.complete(
-                    model.id, prompt, workspace, spend_ok=budget, cli_timeout=ENGINEER_TIMEOUT,
+                    model.id, prompt, workspace, spend_ok=budget,
+                    cli_timeout=settings.repair_call_minutes * 60,
                     allow_api_fallback=False, act=model.channel != "cli", repair=False))
                 return result.text
             except asyncio.CancelledError:

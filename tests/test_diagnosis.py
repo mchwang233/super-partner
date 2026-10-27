@@ -399,6 +399,20 @@ async def test_continuing_a_task_paused_by_a_diagnosis_reruns_the_failed_step_wi
     assert stored.plan.nodes[0].feedback == "node missing\n诊断建议：先安装 node"
 
 
+def test_the_repair_call_budget_outlasts_a_long_regression():
+    # The URG probe of task 72e1d53b exited normally after 2143.923 seconds; a 30-minute call
+    # limit could not cover that long regression and cut the platform repair short.
+    assert settings.repair_call_minutes * 60 > 2143.923
+
+
+async def test_a_repair_call_uses_the_long_regression_budget(tmp_path, monkeypatch):
+    providers = Repairer(FIXED)
+    await run_repair(tmp_path, monkeypatch, providers)
+    _prompt, kwargs = providers.repairs[0]
+    assert kwargs["cli_timeout"] == 3600
+    assert kwargs["cli_timeout"] > 2143.923
+
+
 def test_a_diagnosis_is_told_where_the_full_trace_is():
     from super_partner import diagnosis
     from super_partner.models import NodeAttempt, ToolCall

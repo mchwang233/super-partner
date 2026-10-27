@@ -23,13 +23,14 @@ class Engineer:
     """Plans with PLAN; builds by editing the copy (edit_candidate)."""
 
     def __init__(self, plan=PLAN):
-        self.plan, self.prompts = plan, []
+        self.plan, self.prompts, self.kwargs = plan, [], []
 
     def configured_models(self, ids):
         return set(ids)
 
     async def complete(self, model_id, prompt, workspace=None, **kwargs):
         self.prompts.append((prompt, workspace))
+        self.kwargs.append(kwargs)
         assert kwargs["repair"] is False
         if prompt.startswith("[[super-partner:platform-engineer:plan]]"):
             return ProviderResult(self.plan, 0, 0, model_id)
@@ -110,6 +111,17 @@ async def test_an_applied_change_is_committed_and_the_job_ends(setup, monkeypatc
     assert job.status == "applied" and job.commit == "abc12345ff" and job.finished_at
     assert commits[0][0] == job.files and "platform engineer" in commits[0][1]
     assert executor.platform_pending is None
+
+
+async def test_an_engineer_call_gets_the_long_regression_budget(setup):
+    build, _, _ = setup
+    providers = Engineer()
+    executor = build(providers)
+    executor.engineer_request("修复：状态显示错误", kind="repair")
+    await idle(executor)
+    assert providers.kwargs
+    assert all(item["cli_timeout"] == settings.repair_call_minutes * 60 for item in providers.kwargs)
+    assert settings.repair_call_minutes * 60 > 2143.923
 
 
 async def test_the_user_can_send_a_plan_back_and_give_a_job_up(setup):
