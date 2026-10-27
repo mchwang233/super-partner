@@ -149,3 +149,105 @@ async def test_api_keeps_employee_model_at_creation_and_confirmation(task_api, m
                                  headers={"origin": "http://localhost:5173"})
     assert rejected.status_code == 422, rejected.text
     assert api.db.get_run(body["id"]).status == RunStatus.AWAITING_CONFIRMATION
+
+
+def test_open_scope_choices_are_kept_for_the_user_and_independent_deliverables_run_alongside():
+    from super_partner.planner import plan_choices
+    from super_partner.task_planning import PROMPT
+
+    payload = {"choices": [{"question": "AXI4 还是 AXI4-Lite？", "assumed": "完整 AXI4", "alternative": "AXI4-Lite"},
+                           {"question": "", "assumed": "x"}, "bad", *[{"question": f"q{i}", "assumed": "a"} for i in range(9)]]}
+    choices = plan_choices(payload)
+    assert choices[0].assumed == "完整 AXI4" and choices[0].alternative == "AXI4-Lite" and len(choices) == 5
+    assert "own line of" in PROMPT and '"choices"' in PROMPT
+
+
+def test_employees_are_named_by_their_job():
+    import inspect
+
+    from super_partner import team
+    assert "never a person's name" in inspect.getsource(team.form)
+
+
+async def test_the_user_answers_the_plans_choices_and_it_is_planned_again_in_place(task_api, monkeypatch):
+    from super_partner.models import ExecutionRun, PlanChoice, RunStatus, TaskNode, TaskPlan
+    api, client = task_api
+    choices = [PlanChoice(question="AXI4 还是 AXI4-Lite？", assumed="完整 AXI4", alternative="AXI4-Lite"),
+               PlanChoice(question="apb_mux 是什么？", assumed="一主多从", alternative="多主一从")]
+    node = TaskNode(id="n", title="old", instructions="i", capability="coding")
+    api.db.save_run(ExecutionRun(id="r", prompt="交付 axi to apb", status=RunStatus.AWAITING_CONFIRMATION,
+                                 budget_usd=5, plan=TaskPlan(summary="old", nodes=[node], choices=choices)))
+    asked = []
+
+    async def make_plan(body, parent=None, decided=""):
+        asked.append((body.prompt, decided))
+        new = TaskPlan(summary="lite", nodes=[node.model_copy(update={"title": "new"})])
+        return new, api.SupervisorSession(), [], None, None, []
+
+    monkeypatch.setattr(api, "_make_plan", make_plan)
+    same = await client.post("/api/tasks/r/choices", json={"picks": ["assumed", "assumed"]})
+    assert same.json()["plan"]["summary"] == "old" and asked == []  # nothing changed: no new plan
+    assert (await client.post("/api/tasks/r/choices", json={"picks": ["assumed"]})).status_code == 422
+    changed = await client.post("/api/tasks/r/choices", json={"picks": ["alternative", "两主两从，固定优先级"]})
+    assert changed.status_code == 200 and changed.json()["plan"]["summary"] == "lite" and changed.json()["id"] == "r"
+    [(prompt, decided)] = asked
+    assert prompt == "交付 axi to apb" and "→ AXI4-Lite" in decided and "→ 两主两从，固定优先级" in decided
+    assert any(e.kind == "plan.replanned" for e in api.db.events("r"))
+
+
+CHAIN = {"summary": "交付 Mesh", "nodes": [
+    {"key": "rtl", "title": "实现 RTL", "instructions": "实现全部 RTL", "capability": "coding", "difficulty": "hard",
+     "employee_id": "builder", "acceptance_criteria": "编译通过"},
+    {"key": "verify", "title": "验证并闭合覆盖率", "instructions": "搭建环境、回归、闭合", "capability": "coding",
+     "difficulty": "hard", "employee_id": "builder", "dependencies": ["rtl"], "acceptance_criteria": "覆盖率 100%"},
+    {"key": "report", "title": "生成报告", "instructions": "生成报告", "capability": "coding",
+     "employee_id": "builder", "dependencies": ["verify"], "acceptance_criteria": "报告完整"}]}
+OVERLAPPED = {**CHAIN, "nodes": [
+    CHAIN["nodes"][0],
+    {**CHAIN["nodes"][1], "key": "env", "title": "按接口契约搭建验证环境", "dependencies": []},
+    {**CHAIN["nodes"][1], "key": "close", "title": "回归并闭合覆盖率", "dependencies": ["rtl", "env"]},
+    {**CHAIN["nodes"][2], "dependencies": ["close"]}]}
+
+
+class Replies(Planner):
+    def __init__(self, *payloads):
+        super().__init__()
+        self.payloads = list(payloads)
+
+    async def converse(self, session, text, **kwargs):
+        self.messages.append(text)
+        if "TEAM_SETUP" in text:
+            return ProviderResult(json.dumps(ROSTER), 10, 10, session.model_id)
+        return ProviderResult(json.dumps(self.payloads.pop(0)), 10, 10, session.model_id)
+
+
+async def test_a_single_line_of_hard_tasks_is_sent_back_once_to_run_work_side_by_side():
+    from super_partner.task_planning import PROMPT
+
+    assert "Plan for concurrency" in PROMPT and "serial_reason" in PROMPT
+    provider = Replies(CHAIN, OVERLAPPED)
+    plan = await planned(provider)
+    assert len(provider.messages) == 3  # team, tasks, one correction
+    assert "no two run at the same time" in provider.messages[2]
+    assert [n.title for n in plan.nodes][:2] == ["实现 RTL", "按接口契约搭建验证环境"]
+    assert "最多 2 个任务可同时进行" in plan.planning_note
+
+
+async def test_a_plan_that_truly_cannot_overlap_says_why_and_is_never_lost():
+    provider = Replies({**CHAIN, "serial_reason": "每一步都需要上一步的真实结果"})
+    plan = await planned(provider)
+    assert len(provider.messages) == 2 and len(plan.nodes) == 3
+    assert "任务依次进行（每一步都需要上一步的真实结果）" in plan.planning_note
+
+    provider = Replies(CHAIN, CHAIN)  # asked once; the same answer again is kept
+    plan = await planned(provider)
+    assert len(provider.messages) == 3 and len(plan.nodes) == 3
+    assert "任务依次进行" in plan.planning_note
+
+
+async def test_short_or_easy_lines_are_not_questioned():
+    easy = {**CHAIN, "nodes": [{**node, "difficulty": "normal"} for node in CHAIN["nodes"]]}
+    for payload in (easy, {**CHAIN, "nodes": CHAIN["nodes"][:2]}):
+        provider = Replies(payload)
+        await planned(provider)
+        assert len(provider.messages) == 2

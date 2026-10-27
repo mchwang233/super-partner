@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { MarkdownView } from "./markdown";
 import { ENGINEER_STATUS, type EngineerJob } from "./engineer";
 
-type Preferences = { enabled: boolean; budget_usd: number; auto_platform: boolean };
+type Preferences = { enabled: boolean; budget_usd: number };
 type Metrics = { steps: number; cost_per_step: number; turns_per_step: number; failures_per_step: number; success_rate: number; problem_rate: number };
 type Effect = { run_id: string; before: Metrics; after: Metrics; delta: Partial<Metrics>; comparable: boolean; note: string };
 type Improvement = {
@@ -13,7 +13,7 @@ type Improvement = {
 type LearningData = {
   automatic_skip_reason?: string | null;
   review?: { status: string; conclusion: string; budget_usd: number; cost_usd: number; allocated_usd: number; error?: string } | null;
-  retrospective?: { estimated_usd: number; actual_usd: number; problems: { label: string; kind: string; key: string }[] } | null;
+  retrospective?: { estimated_usd: number; actual_usd: number; problems: { label: string; kind: string; key: string; topic?: string }[] } | null;
   improvements: Improvement[];
   applied: { id: string; title: string; node_ids: string[]; planning: boolean; source_run_id: string }[];
 };
@@ -93,8 +93,7 @@ export function RetrospectivePanel({ apiBase, runId }: { apiBase: string; runId:
       <label><input type="checkbox" checked={options.enabled} onChange={e => setOptions({ ...options, enabled: e.target.checked })} />任务自然成功或失败后自动复盘并验证改进（手动取消不触发）</label>
       <label>每次复盘与改进的额外预算上限（美元）<input type="number" min="0" max="100" step="0.1" value={options.budget_usd}
         onChange={e => setOptions({ ...options, budget_usd: Number(e.target.value) })} /></label>
-      <label><input type="checkbox" checked={options.auto_platform} onChange={e => setOptions({ ...options, auto_platform: e.target.checked })} />平台改进通过独立测试后自动应用</label>
-      <small>预算包括结论生成、改进验证和分配给平台工程师的额度。Skill 与执行规则验证后自动用于匹配的后续任务。</small>
+      <small>预算包括结论生成、改进验证和分配给平台工程师的额度。Skill 与执行规则验证后自动用于匹配的后续任务；平台代码改动只写成方案，要你在平台工程师页批准后才改，改好后再批准才生效。</small>
       <button onClick={saveOptions} disabled={busy || !Number.isFinite(options.budget_usd) || options.budget_usd < 0 || options.budget_usd > 100}>保存自动改进设置</button>
     </details>}
     {error && <p className="error" role="alert">{error}</p>}
@@ -107,6 +106,8 @@ export function RetrospectivePanel({ apiBase, runId }: { apiBase: string; runId:
           {working ? "复盘进行中…" : data.automatic_skip_reason ? "手动生成复盘与改进项" : data.review ? "继续复盘" : "生成复盘与改进项"}</button>
       </div>
       {data.retrospective && <p className="muted">任务估算 {money(data.retrospective.estimated_usd)} · 实际 {money(data.retrospective.actual_usd)} · 记录问题 {data.retrospective.problems.length} 项</p>}
+      {data.retrospective && data.retrospective.problems.some(p => p.topic) && <ul className="problem-list">{data.retrospective.problems.map((p, i) =>
+        <li key={i}><b>{p.topic ?? "未归类"}</b> <small>{p.kind}:{p.key}</small>{p.label && <> · {p.label}</>}</li>)}</ul>}
       {data.review && <>
         <p className="muted">复盘与验证已花 {money(data.review.cost_usd)} · 平台工程师已分配额度 {money(data.review.allocated_usd)} · 合计预算上限 {money(data.review.budget_usd)}</p>
         {data.review.error && <p className="error">{data.review.error}</p>}

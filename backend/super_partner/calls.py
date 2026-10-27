@@ -39,6 +39,8 @@ def usage(model, input_tokens, output_tokens, cached=0, cache_write=0, known=Tru
                         ("cached_input_tokens", cached), ("cache_write_tokens", cache_write)):
         record[name] += count or 0
     record["cost_usd"] += token_cost(model, input_tokens or 0, output_tokens or 0, cached or 0)
+    from .cli_quota import record as membership_usage
+    membership_usage(record["model_id"], input_tokens or 0, output_tokens or 0, cached or 0)
     save()
 
 

@@ -45,11 +45,10 @@ async def test_discovery_reuses_public_skill_with_provenance_and_no_execution(tm
     saved = skills.save_discovered(result.skill)
     assert saved.is_file()
     assert saved.read_text() == TEXT  # retain upstream metadata/content verbatim
-    [cached] = [s for s in skills.library() if s.source_url]
+    [cached] = skills.discovered(["demo-tool"])
     assert cached.source_revision == SHA and not cached.machine
-    section = skills.section([cached])
-    assert cached.source_url in section and "not verified on this machine" in section
-    assert "checked on this machine" not in section
+    # Never one of the skills a step is given; only a reference for writing this machine's one.
+    assert not [s for s in skills.library() if s.source_url] and skills.discovered(["other"]) == []
 
 
 @pytest.mark.parametrize("content", ["not a skill", TEXT.replace("demo-tool", "unrelated-tool")])
@@ -134,7 +133,7 @@ async def test_modified_cached_text_is_not_silently_reused():
         result = await skill_discovery.discover(["demo-tool"], client=client)
     path = skills.save_discovered(result.skill)
     path.write_text(path.read_text() + "unrecorded modification")
-    assert not [s for s in skills.library() if s.path == path]
+    assert not [s for s in skills.discovered() if s.path == path]
 
 
 def test_invalid_cached_provenance_cannot_break_skill_loading(tmp_path):
@@ -142,4 +141,4 @@ def test_invalid_cached_provenance_cannot_break_skill_loading(tmp_path):
     root.mkdir(parents=True)
     (root / "SKILL.md").write_text(TEXT)
     (root / "source.json").write_text(json.dumps({"source_url": ["bad"]}))
-    assert not [s for s in skills.library() if s.path == root / "SKILL.md"]
+    assert not [s for s in skills.discovered() if s.path == root / "SKILL.md"]

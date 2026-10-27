@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-from . import contracts, progress, quality, replan, supervisor
+from . import contracts, quality, replan, supervisor
 from .budget import BudgetExceeded
 from .config import settings
 from .models import (
@@ -68,13 +68,30 @@ class Leading:
             return
         choices = self._choices(run, node)
         verifying = outcome == Outcome.VERIFY_FAILED
-        targets = self._targets(run, node) if verifying else None
+        blocked = outcome == Outcome.BLOCKED
+        # A blocked step may need work it builds on redone (a coverage gap, a missing output).
+        targets = (self._targets(run, node) if verifying
+                   else self._upstream(run, node) if blocked else None)
         prompt = (supervisor.verification_message(run, node, verdict, choices, left) if verifying
-                  else supervisor.failure_message(run, node, node.attempts[-1], verdict, choices, left))
+                  else supervisor.failure_message(run, node, node.attempts[-1], verdict, choices, left,
+                                                  upstream=targets))
+        limited = outcome == Outcome.STOPPED and node.artifact_contract is not None
+        if limited:
+            prompt += "\n" + supervisor.limit_note(node, contracts.extension(node))
+        if blocked:
+            prompt += "\n" + supervisor.BLOCKED_NOTE
+        limited = limited or blocked
         event = "verify_failed" if verifying else "attempt_failed"
         decision = await self._ask_for_decision(run_id, node_id, prompt, {item.id for item in choices}, targets,
                                                 event=event)
-        if decision is None:
+        if decision is None and limited:
+            # Nobody decided to give it more: it stops at its limit as declared.
+            async with self.locks.setdefault(run_id, asyncio.Lock()):
+                latest = self.db.get_run(run_id)
+                step = next(item for item in latest.plan.nodes if item.id == node_id)
+                self._stop_contract(latest, step, verdict.reason, Outcome.STOPPED)
+                self._save(latest)
+        elif decision is None:
             await self._record_fallback(run_id, node_id)
             if verifying:
                 # As before the lead: the findings send the verified work back, within the usual rounds.
@@ -86,6 +103,11 @@ class Leading:
                 await self._repair(run_id, node_id, verdict, outcome)
         elif decision != "budget":
             await self._apply_decision(run_id, node_id, decision, verdict, outcome, event)
+
+    @staticmethod
+    def _upstream(run, node) -> set[str]:
+        """The finished steps ``node`` builds on, which the lead may send back."""
+        return {item.id for item in contracts.ancestors(node, run.plan.nodes) if item.status == NodeStatus.SUCCEEDED}
 
     @staticmethod
     def _targets(run, node) -> set[str]:
@@ -175,7 +197,8 @@ class Leading:
 
     async def _final_review(self, run_id: str) -> bool:
         """Every step has finished: the lead checks the whole result against the request. True if
-        it sent work back or changed the plan, so the task goes on; False to finish it."""
+        it sent work back or changed the plan, so the task goes on; False to finish it. It is
+        the one acceptance kept when steps are not accepted one by one (settings.acceptance)."""
         run = self.db.get_run(run_id)
         for node in run.plan.nodes:
             try:
@@ -236,14 +259,14 @@ class Leading:
             node = next(item for item in run.plan.nodes if item.id == node_id)
             if run.status == RunStatus.CANCELLED or node.status not in {NodeStatus.RUNNING, NodeStatus.PENDING}:
                 return
-            if node.artifact_contract and action in {"accept", "retry", "switch_model"}:
+            if node.artifact_contract and action in {"accept", "retry", "switch_model", "replan"}:
                 try:
                     if action == "accept":
                         contracts.accepted(run, node)
-                    elif reason_to_stop := progress.limit_reason(node):
-                        raise contracts.ArtifactBlocked(reason_to_stop)
-                    elif node.attempts and node.attempts[-1].outcome in {Outcome.BLOCKED, Outcome.STOPPED}:
-                        raise contracts.ArtifactBlocked(node.attempts[-1].reason or "产物契约已阻塞")
+                    elif self._contract_limit_reason(node):
+                        # Running it again is the lead granting it more calls (supervisor.limit_note).
+                        granted = contracts.extend(node)
+                        self.emit(run_id, "node.limit_extended", node_id=node_id, **granted)
                 except contracts.ArtifactBlocked as exc:
                     self._stop_contract(run, node, str(exc))
                     self._save(run)
@@ -263,6 +286,12 @@ class Leading:
                 node.status = NodeStatus.PENDING
                 self.emit(run_id, "node.retry", node_id=node_id, reason="lead", model_id=node.model_id,
                           attempt=len(node.attempts) + 1)
+            elif action == "rework" and not node.verifies:
+                # A blocked step: what it builds on is redone, then it and everything after it.
+                run.rework_rounds += 1
+                reopened = self._reopen(run, set(decision["targets"]), instructions or reason)
+                self.emit(run_id, "run.rework", verifier=node_id, round=run.rework_rounds, reopened=reopened,
+                          problems=instructions or reason)
             elif action == "rework":
                 self._send_back(run, node, verdict, set(decision["targets"]), instructions, limited=False)
             elif action == "replan":

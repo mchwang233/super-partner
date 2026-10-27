@@ -83,6 +83,7 @@ async def form(say, request, models, configured):
     catalog = [{"id": m.id, "scores": m.scores.model_dump(), "tools": m.supports_tools or m.channel == "cli",
                 "context_window": m.context_window, "input_per_million": m.input_per_million,
                 "output_per_million": m.output_per_million,
+                **({"membership_usage": m.usage_note} if m.usage_note else {}),
                 "concurrency": settings.provider_limits.get(m.provider, {}).get("concurrency", 0)} for m in available]
     prompt = (
         "TEAM_SETUP: You are the project lead. Decide the project team FIRST. Do not split the project "
@@ -91,6 +92,8 @@ async def form(say, request, models, configured):
         "The name is the employee's job in a few words of the user's language (such as \"RTL 设计\" or "
         "\"验证\"), never a person's name. "
         "Employees may use different models; select by actual capability, tool access, context, cost and capacity. "
+        "A membership CLI with membership_usage is paid for by its subscription and limited by its quota: its price "
+        "is its share of the subscription, and when its quota is tight give the work to other suitable models. "
         "Capabilities are responsibilities, not invented improvements to a model's scores. Use only catalog models "
         "and capabilities coding/planning/research/chinese/tool_use/structured_output. Keep independent verification "
         "with a suitable separate employee when needed. An employee may work on several independent tasks at the "

@@ -10,6 +10,9 @@ Two opt-in settings change preparation without changing worker or retrospective 
   source URL, immutable blob revision and cached text hash. Only Markdown instructions are
   imported; linked scripts/assets are not installed or executed by discovery. Public text is
   advisory, not proof that commands were tested here, and cannot change task permissions.
+  A public skill is therefore never given to a step: it is only shown, marked unchecked, to the
+  model that writes this machine's skill in the steps' sandbox, which keeps only what it ran
+  successfully. If that generation fails, the steps get no skill for those tools.
 - `SUPER_PARTNER_ADAPTIVE_REFINEMENT=true`: the lead's existing outline call assesses each
   part in the context of the project and records difficulty, refinement effort and a short
   rationale. Simple well-specified work normally uses low, routine work medium, complex
@@ -23,7 +26,7 @@ Both settings default off for existing installations. Tasks that disallow networ
 discovery. Public repository search uses no credentials and sends only tool names, not task text
 or local paths. Search stops after 30 seconds, 12 requests or 6 candidate documents; redirects
 are not followed and response/document sizes are bounded. Rate limits produce a recorded miss
-instead of a long retry loop. A search miss falls back to local sandbox generation, bounded by
+instead of a long retry loop. Generation follows a search, found or not, bounded by
 `SUPER_PARTNER_SKILL_PREPARATION_TIMEOUT` and `SUPER_PARTNER_SKILL_GENERATION_MAX_TURNS` (6 by
 default in reuse-first mode); an invalid result or timeout leaves a warning and lets the task
 start. Previously cached skills can be reused offline.

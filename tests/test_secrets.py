@@ -1,3 +1,4 @@
+import asyncio
 import os
 import subprocess
 import sys
@@ -19,6 +20,7 @@ def fake_keyring(tmp_path: Path, monkeypatch):
     for env_name in PROVIDER_ENV.values():
         monkeypatch.delenv(env_name, raising=False)
     (tmp_path / "fake_keyring.py").write_text('''
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -174,3 +176,26 @@ def test_processes_read_the_keyring_one_after_another(tmp_path):
                for _ in range(3)]
     spans = sorted(tuple(map(float, reader.communicate(timeout=30)[0].split())) for reader in readers)
     assert all(earlier[1] <= later[0] for earlier, later in zip(spans, spans[1:]))
+
+
+async def test_keys_load_once_a_keyring_locked_at_startup_is_unlocked(fake_keyring, monkeypatch, caplog):
+    monkeypatch.setenv("TEST_KEYRING_MODE", "unavailable")
+    assert hydrate_provider_keys() == []
+    assert secrets.keyring_unavailable()
+    assert "DEEPSEEK_API_KEY" not in os.environ
+
+    monkeypatch.delenv("TEST_KEYRING_MODE")
+    arrived = []
+    await asyncio.wait_for(secrets.keep_loading_keys(arrived.extend, interval=0), 30)
+
+    assert not secrets.keyring_unavailable()
+    assert os.environ["DEEPSEEK_API_KEY"] == "saved-deepseek"
+    assert {"deepseek", "minimax"} <= set(arrived)
+    assert caplog.text.count("keyring unavailable or timed out") == 1
+
+
+async def test_no_retry_while_the_keyring_was_read(fake_keyring, monkeypatch):
+    hydrate_provider_keys()
+    assert not secrets.keyring_unavailable()
+    monkeypatch.setattr(secrets, "hydrate_provider_keys", lambda *a: pytest.fail("read again"))
+    await asyncio.wait_for(secrets.keep_loading_keys(interval=0), 5)

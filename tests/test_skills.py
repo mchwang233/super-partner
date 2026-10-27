@@ -125,7 +125,7 @@ async def test_search_precedes_bounded_generation_only_when_network_allowed(libr
     assert actions == (["search", "generate"] if network else ["generate"])
 
 
-async def test_online_skill_is_cached_and_reused_without_generation(library, tmp_path, monkeypatch):
+async def test_a_public_skill_is_only_a_reference_for_this_machines_skill(library, tmp_path, monkeypatch):
     from super_partner import skill_discovery
     monkeypatch.setattr(settings, "skill_reuse_first", True)
     monkeypatch.setattr(skills, "SOURCE", tmp_path / "empty")
@@ -134,25 +134,35 @@ async def test_online_skill_is_cached_and_reused_without_generation(library, tmp
     run = database.get_run("online")
     run.allow_network = True
     database.save_run(run)
-    machine = Machine()
-    executor = Executor(database, machine, {m.id: m for m in [model("x:flash", 90)]})
-    searched = []
+    executor = Executor(database, Machine(), {m.id: m for m in [model("x:flash", 90)]})
+    searched, prompts = [], []
 
     async def available(*args):
         return ["fakesim"]
 
     async def discover(tools):
         searched.append(tools)
-        skill = skills.parse(GENERAL)
+        skill = skills.parse(GENERAL.replace("Compile with", "Public: compile with"))
         skill.source_url = "https://github.com/example/skills/blob/main/SKILL.md"
         skill.source_revision = "b" * 40
         return skill_discovery.Discovery(skill=skill)
 
+    async def complete(run, node, model_id, prompt, *args, **kwargs):
+        prompts.append(prompt)
+        return ProviderResult("---\nname: fakesim\ndescription: here\ntools: [fakesim]\n---\n# Here\n", 1, 1, model_id)
+
     monkeypatch.setattr(executor, "_available", available)
     monkeypatch.setattr(skill_discovery, "discover", discover)
-    assert await executor._prepare_skills("online", tmp_path, []) == ["fake-sim"]
-    assert await executor._prepare_skills("online", tmp_path, []) == ["fake-sim"]
-    assert len(searched) == 1 and machine.skill_prompts == []
+    monkeypatch.setattr(executor, "_complete", complete)
+    assert await executor._prepare_skills("online", tmp_path, []) == ["fakesim"]
+    assert "Public: compile with" in prompts[0] and "not checked on this machine" in prompts[0]
+    # The step is given this machine's skill, never the public one.
+    assert [s.machine for s in skills.for_step("fakesim -c a.sv")] == [True]
+    # The cached public skill is the reference next time, without another search.
+    for path in skills.machine_dir().glob("*/SKILL.md"):
+        path.unlink()
+    assert await executor._prepare_skills("online", tmp_path, []) == ["fakesim"]
+    assert len(searched) == 1 and "Public: compile with" in prompts[1]
 
 
 async def test_generation_deadline_does_not_block_task_start(library, tmp_path, monkeypatch):
@@ -213,3 +223,47 @@ async def test_the_skill_is_prepared_once_and_given_to_the_steps(library, tmp_pa
     await executor.execute("second")
     assert len(machine.skill_prompts) == 1 and database.get_run("second").preflight.skills == ["fake-sim"]
     assert not list((settings.workspace_root).glob("*/.skill-*"))  # the scratch folder is gone
+
+
+LESSON = "---\nname: fake-sim-lesson\ndescription: seeds\ntools: [fakesim]\n---\nPass `+seed=N` or runs repeat.\n"
+
+
+def test_a_lesson_is_written_into_this_machines_skill_and_taken_out_again(library):
+    original = GENERAL.replace("# Fake simulator", "# Here: source env.sh first")
+    path = skills.save_machine("fake-sim", original)
+    assert skills.add_lesson("l1", "Seeds", LESSON, ["fakesim"]) == [path]
+    skills.add_lesson("l2", "Licence", LESSON.replace("Pass `+seed=N` or runs repeat.", "Wait for the licence."),
+                      ["fakesim"])
+    [mine, _general] = skills.for_step("fakesim -c a.sv")
+    assert mine.body.index("Wait for the licence") < mine.body.index("+seed=N") < mine.body.index("source env.sh")
+    assert "Pass `+seed=N`" in skills.section([mine])
+    skills.remove_lesson("l2")
+    skills.remove_lesson("l1")
+    assert path.read_text() == original
+
+
+def test_a_skill_made_of_a_lesson_alone_goes_with_it(library):
+    [path] = skills.add_lesson("l1", "Seeds", LESSON, ["fakesim"])
+    assert skills.for_step("fakesim")[0].machine and "+seed=N" in path.read_text()
+    skills.remove_lesson("l1")
+    assert not path.exists() and not [s for s in skills.library() if s.machine]
+
+
+def test_the_github_reference_skill_reaches_steps_and_employees_that_look_on_github(tmp_path, monkeypatch):
+    from super_partner import team
+    from super_partner.models import Employee
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path / "data")  # the platform's own skills only
+    [guide] = [skill for skill in skills.library() if skill.name == "github-reference"]
+    assert set(guide.tools) == {"github", "gh"} and not guide.machine
+    assert len(guide.body) <= skills.MAX_SKILL_CHARS  # given whole, not cut off
+    for rule in ("gh_rank.py", "never run its scripts", "REFERENCE: OWNER/REPO@SHA", "license"):
+        assert rule in guide.body
+    assert guide in skills.for_step("在 GitHub 上找一个成熟的 JSON 解析库作为参考实现")
+    assert guide not in skills.for_step("写 README 并整理目录")
+
+    plan = TaskPlan(summary="s", nodes=[], employees=[Employee(
+        id="dev", name="开发", role="实现解析器", model_id="test:m", capabilities=["coding"],
+        skills=["github-reference"])])
+    team.refresh_skills(plan)
+    assert "Skill: github-reference" in plan.employees[0].skill_context

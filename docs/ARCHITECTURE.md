@@ -81,6 +81,11 @@ part-based plans remain unchanged, and explicit worker delegation remains availa
 If a verification task names an existing transitive prerequisite, direct planning adds the
 redundant direct dependency locally rather than regenerating the plan. Unknown or unrelated
 targets still fail; artifact validation runs again after normalization.
+The prompt's `PARALLEL_RULE` asks for concurrent work: verification built from the interface contract
+alongside the implementation, and hard items over about an hour split by module, configuration, metric or
+target family. A plan of three or more tasks with a hard one, all in a single line (`width` 1) and no
+`serial_reason`, is sent back once in the existing correction round; the second answer is kept as is, so
+planning never fails on it. `planning_note` states how many tasks can run at once, or the serial reason.
 
 `LearningReview.automatic` distinguishes automatic work from an explicit manual request and
 defaults to true for legacy records. Cancellation stops pending automatic work through
@@ -126,6 +131,7 @@ history, active lessons and already submitted independent platform jobs remain i
 | API model calls, output caps, tool loop | `providers.py` | `ProviderRegistry.complete`, `_send`, `output_ceiling`, `_loop`, `_answer`, `_cache_point`, `reasoning_fields`; rejected effort is visibly recorded, or rejected outright with `reasoning_fallback=strict`; complete tool traces remain in `NodeAttempt.trace` |
 | Durable conversations and structured memory | `conversation.py`, `providers.py`, `executor.py` | `Conversation`, `flush`, `reopen`, `handoff`, `_compact_context`, `Executor._conversation`; OpenAI-compatible/Anthropic/Gemini checkpoints at tool intent and each completion; generation/dependency/request fences; original archives accessible only through task-step-scoped `RecallHistory` |
 | API keys: saved in the OS keyring, read at startup by a killable child process; a keyring that is locked, missing or slow is marked unavailable and read again every 30 s until it answers, then those providers' quota marks are cleared; `/api/providers` reports `keyring_locked`, the provider card shows 密钥环未解锁 | `secrets.py`, `api.py` (lifespan) | `hydrate_provider_keys`, `keep_loading_keys`, `keyring_unavailable`, `set_provider_key`, `delete_provider_key`; `/health` `keyring_unavailable` |
+| Membership CLIs priced by their subscription (`cli_plans`, e.g. Codex $200/month): Codex's quota from its session files (`$CODEX_HOME/sessions`, `token_count` rate limits), the platform's own Codex calls from a ledger kept apart from tasks (`<data_dir>/cli_usage.jsonl`, written by `calls.usage`; sessions in the leads' folders are left out as already counted); from a baseline reading, tokens over quota used give the price (until then the plan's optional `input_per_million`/`output_per_million`, also used when usage cannot be read), set as the CLI's catalog price so charging, budgets, routing and team choice use it; from `cli_quota_soft_percent` it loses first place in routing and the lead is told, from `cli_quota_stop_percent` it is marked out of quota until the window resets; refreshed every minute | `cli_quota.py`, `calls.py`, `api.py` (lifespan), `team.py` | `CodexReader.read`, `record`, `recorded`, `price_per_million`, `starting_price`, `apply`, `keep_applying`; `ModelProfile.usage_note`; `QuotaTracker.mark(until=)` |
 | Call telemetry and admission | `calls.py`, `call_control.py` | `observed`, `ProviderGate`; request/retry counts, requested/sent effort, observed tokens/cache writes/reads, unknown usage, duration and queue time; configured provider-wide concurrency/RPM/TPM, shared Retry-After cooldown; `/api/tasks/{id}/calls` |
 | Historical delivery cost | `routing_feedback.py`, `routing.py` | `collect`, `expected_cost`; minimum eight distinct steps per model/capability/difficulty, smoothed success probability and observed rework cost, bounded latency weight; applied before an automatically routed step's first attempt |
 | Optional tool extensions and hooks | `extensions.py`, `agent.py` | `api_tool_extensions`, `api_tool_hooks`: JSON-schema-checked command tools and before/after hooks through the existing Workspace sandbox; empty by default; excluded from read-only review and host repair modes |
@@ -265,6 +271,7 @@ activation itself never accepts a task or fabricates missing historical answers.
 | The check before the first step | `test_preflight.py` |
 | Skills | `test_skills.py` |
 | API keys and the keyring | `test_secrets.py` |
+| Membership CLI pricing and quota | `test_cli_quota.py` |
 | Spreading steps over providers | `test_spread.py` |
 | Progress checks | `test_progress.py` |
 | The lead's conversation | `test_supervisor.py` |

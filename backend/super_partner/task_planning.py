@@ -2,7 +2,49 @@
 from . import contracts, team
 from .models import TaskPlan
 from .outline import MAX_REQUIRE_CHARS, MAX_REQUIRES, _ask
-from .planner import MAX_NODES, _validate_plan
+from .planner import (
+    CHOICES_RULE,
+    CHOICES_SHAPE,
+    INDEPENDENT_RULE,
+    MAX_NODES,
+    _validate_plan,
+    plan_choices,
+)
+
+# Employees, and each employee's sessions, work at the same time; a plan whose tasks wait for one
+# another in a single line leaves them idle and makes every retry redo a large item.
+PARALLEL_RULE = (
+    "Plan for concurrency: every employee, and each employee's sessions, can work at the same time. "
+    "Start dependent work as soon as an agreed interface allows; for example a verification environment "
+    "(testbench, agents, checkers, reference model, coverage model) is built from the interface contract "
+    "alongside the implementation, and only running it against the implementation waits for it. Split a "
+    "hard item that would take more than about an hour into items that need not share one working "
+    "session, by module, configuration, metric or target family, joined by a task that combines their "
+    "results. If no two tasks can truly run at the same time, give serial_reason.\n")
+SERIAL_CHECK_MIN_NODES = 3
+
+
+def width(nodes) -> int:
+    """How many tasks can run at once, at least: the most tasks at one depth of the graph."""
+    by_id, depth = {node.id: node for node in nodes}, {}
+
+    def level(node, seen=()):
+        if node.id not in depth:
+            depth[node.id] = 1 + max((level(by_id[key], (*seen, node.id)) for key in node.dependencies
+                                      if key in by_id and key not in seen), default=-1)
+        return depth[node.id]
+    counts = {}
+    for node in nodes:
+        counts[level(node)] = counts.get(level(node), 0) + 1
+    return max(counts.values(), default=0)
+
+
+def concurrency_note(plan, serial_reason: str = "") -> str:
+    at_once = width(plan.nodes)
+    if at_once > 1:
+        return f"最多 {at_once} 个任务可同时进行"
+    return "任务依次进行" + (f"（{serial_reason}）" if serial_reason else "")
+
 
 PROMPT = """DIRECT_TASK_PLAN: Produce the executable task list now. There is NO later refinement stage.
 Use a small number of complete work items, each with a clear owner, matters to handle, deliverable,
@@ -14,7 +56,7 @@ to that employee. If facts are missing, name them as things to establish during 
 Do not solve the project or inspect the environment during this planning response.
 
 List tasks in dependency order. A task waits only for results it actually needs. Independent work may
-run together. Describe concrete handoffs in provides. Use an independent verification task when needed;
+run together. """ + INDEPENDENT_RULE + PARALLEL_RULE + """Describe concrete handoffs in provides. Use an independent verification task when needed;
 its verifies are keys it checks, and every such key must also be listed in its dependencies, including
 transitive prerequisites. Assign employee_id from the team when a team is supplied.
 Choose difficulty easy/normal/hard for execution, and estimate the complete work item's token use.
@@ -23,9 +65,9 @@ paths or split work solely to meet a file/turn count. If the scope is unknown, l
 the existing workspace lock will serialize such work. Set needs_workspace=true when accessing the
 target project. Workers can edit files and run sandboxed commands; internet requires task permission,
 and root/system installation is unavailable. requires contains only commands checking essential tools.
-
+""" + CHOICES_RULE + """
 Return JSON only with 1-""" + str(MAX_NODES) + """ nodes (usually far fewer), no parts or children:
-{"summary":"objective","folder":"short-english-name","requires":["essential tool check"],"nodes":[
+{"summary":"objective","serial_reason":"only if no two tasks can run at the same time: why","folder":"short-english-name","requires":["essential tool check"],""" + CHOICES_SHAPE + ""","nodes":[
 {"key":"build","title":"short title","employee_id":"chosen employee","instructions":"matters to handle",
 "capability":"coding|planning|research|chinese|tool_use|structured_output","difficulty":"normal",
 "dependencies":[],"acceptance_criteria":"checkable result","provides":"handoff to dependent tasks",
@@ -36,7 +78,10 @@ Retain explicit artifact evidence and limits when applicable:
 
 
 async def plan_tasks(say, opening: str, roster: TaskPlan = None, artifact_work: bool = False) -> TaskPlan:
+    asked = []
+
     def read(payload):
+        asked.append(True)
         if payload.get("parts") or payload.get("children"):
             raise ValueError("return executable nodes, not parts needing refinement")
         plan = _validate_plan(payload, minimum_nodes=1)
@@ -71,7 +116,16 @@ async def plan_tasks(say, opening: str, roster: TaskPlan = None, artifact_work: 
             raise ValueError(f"requires allows at most {MAX_REQUIRES} commands")
         plan.requires = list(dict.fromkeys(cmd.strip() for cmd in requires))
         plan.folder = str(payload.get("folder") or "")[:80]
+        plan.choices = plan_choices(payload)
         contracts.validate(plan)  # expanded verification still needs all original evidence/limits
+        serial_reason = str(payload.get("serial_reason") or "").strip()[:300]
+        # Asked once, in the correction round: a plan that truly cannot overlap is then kept as is.
+        if (len(asked) == 1 and not serial_reason and len(plan.nodes) >= SERIAL_CHECK_MIN_NODES
+                and width(plan.nodes) == 1 and any(node.difficulty == "hard" for node in plan.nodes)):
+            raise ValueError("every task waits for the previous one, so no two run at the same time; start "
+                             "work from agreed interfaces in parallel and split large hard items by module, "
+                             "configuration, metric or target family, or give serial_reason")
+        plan.planning_note = concurrency_note(plan, serial_reason)
         return plan
 
     return await _ask(say, opening, read)

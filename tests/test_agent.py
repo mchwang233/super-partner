@@ -461,8 +461,9 @@ def test_cli_sandboxes_open_to_the_internet_only_for_a_task_allowing_it():
     assert settings_arg["sandbox"]["network"]["allowedDomains"] == ["*"]
     assert "127.0.0.1" in settings_arg["sandbox"]["network"]["deniedDomains"]
     assert settings_arg["sandbox"]["allowUnsandboxedCommands"] is False
-    codex = cli_channels._with_network("cli:codex", list(cli_channels.CLI_SPECS["cli:codex"].invoke_args))
-    assert codex[:3] == ["exec", "-c", "sandbox_workspace_write.network_access=true"] and "workspace-write" in codex
+    opened = " ".join(cli_channels.codex_step_permissions(Path.cwd(), network=True))
+    assert "network={ enabled = true }" in opened
+    assert not any(arg.endswith("network={ enabled = true }") for arg in cli_channels.codex_step_permissions(Path.cwd(), network=False))
 
 
 @needs_bwrap

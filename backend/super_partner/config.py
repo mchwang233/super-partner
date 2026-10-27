@@ -49,7 +49,6 @@ class Settings(BaseSettings):
     # Optional post-task learning; the UI can persist overrides. Its budget is separate and shown.
     learning_enabled: bool = False
     learning_budget_usd: float = Field(default=0.5, ge=0, le=100)
-    learning_auto_platform: bool = True
     skill_preparation_timeout: float = Field(default=900, gt=0)
     # A public address that shows the internet can be reached from a step's sandbox.
     preflight_network_url: str = "https://pypi.org/simple/"
@@ -67,6 +66,13 @@ class Settings(BaseSettings):
     api_agent_max_turns: int = Field(default=0, ge=0, le=1000)
     # Per provider: concurrency, rpm, tpm. Zero/absent means unconfigured; never guess API quotas.
     provider_limits: dict[str, dict[str, int]] = Field(default_factory=dict)
+    # Membership CLIs priced by their subscription, e.g. {"cli:codex": {"monthly_usd": 200}}: each call
+    # costs its share of the quota (cli_quota.py) and counts against task budgets. Empty: CLIs cost nothing.
+    cli_plans: dict[str, dict[str, float]] = Field(default_factory=dict)
+    # Share of a priced CLI's quota window used from which it no longer goes first in routing, and
+    # from which it takes no new work until the window resets.
+    cli_quota_soft_percent: float = Field(default=70, ge=0, le=100)
+    cli_quota_stop_percent: float = Field(default=90, ge=0, le=100)
     # Compatibility mode records an explicit warning; strict mode rejects effort downgrades.
     reasoning_fallback: Literal["report", "strict"] = "report"
     # Configured tools receive one JSON argv argument inside the ordinary task sandbox.
@@ -92,6 +98,11 @@ class Settings(BaseSettings):
     # is still making progress; only a stuck attempt is stopped. CLIs are checked the same way
     # instead of being killed at a fixed timeout.
     progress_check_minutes: float = Field(default=10, gt=0)
+    # A lead's conversation call through Codex (splitting a part, a decision) runs while Codex
+    # keeps printing its work, and is stopped after this long without any output, at most
+    # lead_call_max_minutes in all (also the limit for Claude Code, which answers only at the end).
+    lead_idle_minutes: float = Field(default=10, gt=0)
+    lead_call_max_minutes: float = Field(default=60, gt=0)
     # A failed attempt goes to the task's lead to decide what next (supervisor.py), instead of a
     # new diagnosis each time. Past these many decisions for one step, or for the whole task, the
     # task pauses for the user.
@@ -118,8 +129,13 @@ class Settings(BaseSettings):
     lead_reasoning_effort: str = "max"
     # Initial staffing and outline generation can use their own effort, without changing the
     # retained lead, refinement or retrospective. Empty/zero preserve the existing policy.
-    team_reasoning_effort: Literal["", "low", "medium", "high", "max"] = ""
-    planning_reasoning_effort: Literal["", "low", "medium", "high", "max"] = ""
+    # "auto": staffing at the planning effort for the request's difficulty (planner.PLANNING_EFFORT).
+    team_reasoning_effort: Literal["", "auto", "low", "medium", "high", "max"] = "auto"
+    # "auto": the lead first judges how hard the request is to plan (one quick call at medium effort)
+    # and plans it at the effort for that difficulty (planner.PLANNING_EFFORT).
+    planning_reasoning_effort: Literal["", "auto", "low", "medium", "high", "max"] = "auto"
+    # Seconds a planning call may take at low or medium effort; longer at high and max
+    # (planner.PLANNING_TIME). 0: no limit.
     planning_call_timeout: float = Field(default=0, ge=0)
     # Let the lead's per-part difficulty/effort assessment control refinement conversations.
     adaptive_refinement: bool = False
@@ -157,6 +173,9 @@ class Settings(BaseSettings):
     # Handle a failed attempt instead of only retrying it: the task's lead decides (lead_decisions),
     # or, without a lead able to, a diagnosis looks for what blocks it.
     auto_diagnose: bool = True
+    # When a task ends, the cheapest API model names its problems by what they are about, so one
+    # cause recorded under several names is counted as one (retrospect.name_problems).
+    problem_naming: bool = True
     # Diagnose and repair this application's source, separately from task workspaces.
     platform_self_repair: bool = True
     platform_root: Optional[Path] = None
@@ -168,6 +187,15 @@ class Settings(BaseSettings):
     engineer_commit: bool = True
     # Have another model check each node's result against its acceptance criteria.
     review_nodes: bool = True
+    # Accepting each step's result: off, a step that finishes has passed. No reviewer, no declared
+    # check or artifact acceptance command, no verification steps sending work back. The lead's
+    # final check of the whole result stays (leading._final_review). A step saying it cannot do
+    # its work (UNABLE/BLOCKED) still fails, and progress checks, artifact contracts' turn and
+    # cost limits and the budget still apply.
+    acceptance: bool = False
+    # Contract steps get at least contracts.MIN_TOOL_CALLS tool calls by difficulty, whatever
+    # tighter limit the lead declared.
+    contract_call_floors: bool = True
     # Without a lead deciding (the fallback): runs per node (first try plus retries) before it
     # fails, retries going to the strongest model, and times verification nodes may send work back
     # within one task. With a lead, max_node_decisions and max_run_decisions bound it instead.

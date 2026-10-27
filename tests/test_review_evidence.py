@@ -119,9 +119,16 @@ async def test_review_rejects_mutations_and_private_or_outside_reads(tmp_path):
     for name, args in [
         ("Write", {"file_path": "created.txt", "content": "changed"}),
         ("Edit", {"file_path": "db.py", "old_string": "original", "new_string": "changed"}),
-        ("Bash", {"command": "touch created.txt"}),
     ]:
         assert "read-only" in await ws.call(name, args)
+    if agent.sandbox_available():
+        # Its commands cannot change the workspace or see its credentials either, nor reach the network.
+        assert "read-only" in (await ws.call("Bash", {"command": "touch created.txt; echo x >> db.py"})).lower()
+        # (An uncited log in a hidden folder is not private: only the file tools leave it out.)
+        private = [name for name in blocked if name != ".tmp-verify/unreferenced.log"]
+        seen = await ws.call("Bash", {"command": "cat db.py " + " ".join(private) + " secret-link; ls -a .ssh"})
+        assert "original" in seen and "private-value" not in seen
+        assert ws.network is False
     assert (root / "db.py").read_text() == "original\n"
     assert not (root / "created.txt").exists()
 
@@ -177,7 +184,7 @@ async def test_api_review_exposes_only_read_tools_and_returns_the_log_tail(tmp_p
         offered = [tool["name"] for tool in sent[0]["tools"]]
     else:
         offered = [tool["name"] for tool in sent[0]["tools"][0]["functionDeclarations"]]
-    assert set(offered) == {"Read", "Glob", "Grep", "LS"}
+    assert set(offered) == {"Read", "Glob", "Grep", "LS"} | ({"Bash"} if agent.sandbox_available() else set())
     assert "\\tRan 155 tests\\n  5002\\tOK" in json.dumps(sent[1])
     assert "Error:" in json.dumps(sent[1]) and "read-only" in json.dumps(sent[1])
     assert not (project / "bad.txt").exists() and not (review_folder / "bad.txt").exists()
@@ -246,11 +253,16 @@ async def test_explicit_build_log_is_reviewable_without_entering_source_inventor
     assert "SIMULATION_PASS" in await ws.call("Read", {"file_path": name, "offset": -2})
     assert (await ws.call("Read", {"file_path": str(log.parent / "unreferenced.log")})).startswith("Error:")
     for tool, args in [
-        ("Bash", {"command": "echo changed"}),
         ("Write", {"file_path": name, "content": "changed"}),
         ("Edit", {"file_path": name, "old_string": "RC=0", "new_string": "RC=1"}),
     ]:
         assert "read-only" in await ws.call(tool, args)
+    if agent.sandbox_available():
+        assert "read-only" in (await ws.call("Bash", {"command": f"echo RC=1 > {name}"})).lower()
+        # A check is rerun on a copy in its own /tmp.
+        copied = await ws.call("Bash", {"command": f"mkdir -p /tmp/check && cp {name} /tmp/check/ && "
+                                                   "echo RC=1 >> /tmp/check/*.log && tail -1 /tmp/check/*.log"})
+        assert copied.strip() == "RC=1"
     assert log.read_text().endswith("SIMULATION_PASS\nRC=0\n")
 
 

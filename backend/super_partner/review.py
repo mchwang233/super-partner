@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import agent, contracts, progress, quality, supervisor
+from . import activity, agent, contracts, progress, quality, supervisor
 from .budget import BudgetExceeded, StepLimitExceeded, StepReservationBusy
 from .config import settings
 from .models import ArtifactEvidence, ExecutionRun, NodeStatus
@@ -27,6 +27,12 @@ class Reviewing:
     async def _check(self, run: ExecutionRun, node, text: str, changed: list[str], workspace: Optional[Path]) -> quality.Verdict:
         if blocked := quality.blocked_claim(text):
             return quality.Verdict(False, blocked, blocked=blocked)
+        if not settings.acceptance:
+            # Nothing is accepted or rejected: a step that finished has passed, unless it says
+            # itself that part of its work cannot be done here.
+            if claim := quality.unable_claim(text):
+                return quality.Verdict(False, f"无法完成：{claim}", fix=claim, unable=claim)
+            return quality.Verdict(True, "平台未开启验收。")
         evidence = None
         if node.artifact_contract:
             evidence, problem = await self._artifact_check(run, node)
@@ -244,7 +250,8 @@ class Reviewing:
             turns = int(evidence.split(" ", 1)[0]) if evidence[:1].isdigit() else 0
             try:
                 async with self._thinking(run.id, "overrun", node.id):
-                    reply = await self.ask_lead(run.id, supervisor.overrun_message(node, turns, expected, evidence))
+                    with activity.paused():  # the lead's call is not the step's work
+                        reply = await self.ask_lead(run.id, supervisor.overrun_message(node, turns, expected, evidence))
                 reason = progress.parse(reply)
             except (asyncio.CancelledError, BudgetExceeded, StepLimitExceeded):
                 raise

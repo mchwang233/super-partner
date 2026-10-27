@@ -159,7 +159,7 @@ class Engineering:
     def engineer_request(self, request: str, kind: str = "component", origin: str = "user", *,
                          run_id: Optional[str] = None, node_id: Optional[str] = None,
                          decision_id: Optional[str] = None, budget_usd: Optional[float] = None,
-                         improvement_id: Optional[str] = None, auto_apply: bool = False) -> EngineerJob:
+                         improvement_id: Optional[str] = None) -> EngineerJob:
         """A new job: a component is planned first, a repair is made at once. It waits its turn."""
         if not self.engineer_available():
             raise EngineerError("平台工程师不可用：平台自修复未启用，或当前安装没有可编辑的 Super Partner 源码。")
@@ -172,7 +172,7 @@ class Engineering:
             kind=kind, origin=origin, request=request, title=title_of(request),
             phase="plan" if kind == "component" else "edit", run_id=run_id, node_id=node_id,
             decision_id=decision_id,
-            improvement_id=improvement_id, auto_apply=auto_apply,
+            improvement_id=improvement_id,
             budget_usd=settings.engineer_budget_usd if budget_usd is None else budget_usd,
             messages=[EngineerMessage(role="lead" if origin == "lead" else "user", text=request)],
         )
@@ -295,14 +295,9 @@ class Engineering:
         if status == "needs_input" and question:
             self._engineer_ask(job, report, question, choices)
             return
+        # Every component change, a retrospective's too, waits for the user's approval of its plan
+        # and again before it is applied.
         job.plan, job.status = report, "plan_ready"
-        if job.origin == "retrospective" and job.auto_apply:
-            if status != "plan" or not report.strip():
-                raise EngineerError("自动改进没有得到有效的实施方案。")
-            job.status, job.phase = "queued", "edit"
-            job.messages.append(EngineerMessage(role="system", text="按自动改进设置执行方案；改动仍须通过独立检查。"))
-            self._engineer_save(job)
-            return
         job.messages.append(EngineerMessage(role="engineer", text="方案写好了，请看过后批准，或回复要改的地方。"))
         self._engineer_save(job)
 
@@ -346,7 +341,7 @@ class Engineering:
         job.files, job.checks = copy["files"], [item["name"] for item in checks]
         job.diff, job.report, job.error = self.platform.diff(copy), report, None
         job.messages.append(EngineerMessage(role="engineer", text=report or "改好了，检查全部通过。"))
-        if job.kind == "component" and not (job.origin == "retrospective" and job.auto_apply):
+        if job.kind == "component":
             job.status = "ready"
             self._engineer_save(job)
             return

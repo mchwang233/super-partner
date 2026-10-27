@@ -105,6 +105,27 @@ def test_artifact_directory_does_not_follow_symlinks(tmp_path):
         fingerprint(root, Artifact(path="coverage.vdb", kind="directory"))
 
 
+
+def test_artifact_directory_records_links_within_itself_without_following_them(tmp_path):
+    # VCS links shared files across the tests of a coverage database.
+    from super_partner.contracts import ArtifactBlocked, fingerprint
+    from super_partner.models import Artifact
+
+    root = tmp_path / "work"
+    common, test = root / "fifo.vdb" / "common", root / "fifo.vdb" / "testdata" / "seed1"
+    common.mkdir(parents=True)
+    test.mkdir(parents=True)
+    (common / "shape.xml").write_text("<shape/>")
+    (test / "shape.xml").symlink_to("../../common/shape.xml")
+    vdb = Artifact(path="fifo.vdb", kind="directory")
+    before = fingerprint(root, vdb)
+    (test / "shape.xml").unlink()
+    (test / "shape.xml").symlink_to("../../common/other.xml")
+    assert fingerprint(root, vdb) != before  # where a link points is part of the evidence
+    (test / "escape").symlink_to("../../../")
+    with pytest.raises(ArtifactBlocked, match="符号链接"):
+        fingerprint(root, vdb)
+
 def test_artifact_host_checks_cannot_read_custom_platform_data_names(tmp_path, monkeypatch):
     from super_partner.config import settings
     from super_partner.contracts import ArtifactBlocked, fingerprint
@@ -211,3 +232,19 @@ async def test_artifact_progress_check_cannot_deadlock_waiting_on_its_worker():
         await asyncio.wait_for(checker.reserve(model.id, {"input": "check"}, 1000), 1)
     worker.release()
 
+
+
+def test_a_key_file_is_refused_for_holding_a_key_not_for_its_name(tmp_path):
+    # VCS writes ucli.key, a log of simulator commands, into every run directory.
+    from super_partner.contracts import ArtifactBlocked, fingerprint
+    from super_partner.models import Artifact
+
+    run = tmp_path / "artifacts" / "run1"
+    run.mkdir(parents=True)
+    (run / "sim.log").write_text("PASS")
+    (run / "ucli.key").write_text("run\nquit\n")
+    folder = Artifact(path="artifacts", kind="directory")
+    assert fingerprint(tmp_path, folder)
+    (run / "server.key").write_text("-----BEGIN RSA PRIVATE KEY-----\nMIIE\n")
+    with pytest.raises(ArtifactBlocked, match="私钥"):
+        fingerprint(tmp_path, folder)

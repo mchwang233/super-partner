@@ -17,6 +17,19 @@ fi
 
 mkdir -p "$RUNTIME_DIR" "$LOG_DIR"
 
+# A setting from the environment, else this machine's .env, else the default given.
+setting() {
+  local name="$1" fallback="$2" value="${!1:-}"
+  if [[ -z "$value" && -f "$PROJECT_DIR/.env" ]]; then
+    value="$(sed -n "s/^${name}=//p" "$PROJECT_DIR/.env" | tail -n 1)"
+  fi
+  echo "${value:-$fallback}"
+}
+
+# Where tasks' folders are: set SUPER_PARTNER_WORKSPACE_ROOT in .env to keep them outside the
+# platform's repository (CLI agents there would read its AGENTS.md and CLAUDE.md).
+WORKSPACE_ROOT="$(setting SUPER_PARTNER_WORKSPACE_ROOT "$PROJECT_DIR/workspaces")"
+
 unit_for() {
   if [[ "$1" == "$API_PID_FILE" ]]; then
     echo "$UNIT_PREFIX-api.service"
@@ -104,7 +117,7 @@ start() {
     echo "[start] Starting API..."
     launch_service "$API_PID_FILE" "$LOG_DIR/api.log" /usr/bin/env \
       SUPER_PARTNER_DATA_DIR="$PROJECT_DIR/.super-partner" \
-      SUPER_PARTNER_WORKSPACE_ROOT="$PROJECT_DIR/workspaces" \
+      SUPER_PARTNER_WORKSPACE_ROOT="$WORKSPACE_ROOT" \
       "$PROJECT_DIR/.venv/bin/uvicorn" super_partner.api:app \
       --app-dir "$PROJECT_DIR" --host 127.0.0.1 --port 8000
     api_started=1

@@ -97,15 +97,21 @@ def _change_keyring(action: str) -> int:
 
 
 def _read_provider_keys() -> dict[str, str]:
-    values = {}
+    """Saved keys; raises KeyringError if no read worked (a locked or missing keyring), so it is
+    not mistaken for a keyring holding no keys."""
+    values, asked, failed = {}, 0, 0
     for provider, env_name in SECRET_ENV.items():
         if env_name not in os.environ:
+            asked += 1
             try:
                 value = keyring.get_password(SERVICE, provider)
             except KeyringError:
+                failed += 1
                 value = None
             if value:
                 values[env_name] = value
+    if asked and failed == asked:
+        raise KeyringError("keyring unavailable")
     return values
 
 
@@ -160,23 +166,58 @@ def _read_in_child(timeout: float) -> dict:
     raise subprocess.TimeoutExpired("keyring", timeout * 3)
 
 
-def hydrate_provider_keys(timeout: float = 10.0) -> None:
-    """Load saved keys without letting a locked desktop keyring block startup."""
+# Set when the last read of the keyring failed (locked, missing or too slow): saved keys may
+# exist that are not loaded yet. `keep_loading_keys` tries again until a read succeeds.
+_keyring_unavailable = False
+KEYRING_RETRY_SECONDS = 30.0
+
+
+def keyring_unavailable() -> bool:
+    return _keyring_unavailable
+
+
+def hydrate_provider_keys(timeout: float = 10.0) -> list[str]:
+    """Load saved keys without letting a locked desktop keyring block startup. Returns the
+    providers whose key was loaded by this call."""
+    global _keyring_unavailable
     if all(env_name in os.environ for env_name in SECRET_ENV.values()):
-        return
+        _keyring_unavailable = False
+        return []
     try:
         values = _read_in_child(timeout)
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         # Exception output may contain credentials, so only log a fixed message.
-        logger.warning(
-            "OS keyring unavailable or timed out; continuing with environment credentials. "
-            "Unlock the keyring and restart to load saved API keys."
-        )
-        return
-    for env_name in SECRET_ENV.values():
+        if not _keyring_unavailable:
+            logger.warning(
+                "OS keyring unavailable or timed out; continuing with environment credentials. "
+                "Unlock the keyring: saved API keys are loaded on the next retry (every %d s).",
+                KEYRING_RETRY_SECONDS,
+            )
+        _keyring_unavailable = True
+        return []
+    _keyring_unavailable = False
+    loaded = []
+    for provider, env_name in SECRET_ENV.items():
         value = values.get(env_name)
-        if isinstance(value, str) and value:
-            os.environ.setdefault(env_name, value)
+        if isinstance(value, str) and value and env_name not in os.environ:
+            os.environ[env_name] = value
+            loaded.append(provider)
+    return loaded
+
+
+async def keep_loading_keys(on_loaded=None, interval: Optional[float] = None, timeout: float = 5.0) -> None:
+    """While the keyring is unavailable, read it again every ``interval`` seconds, so keys
+    saved there work once it is unlocked, without a restart. ``on_loaded(providers)`` is told
+    which keys arrived."""
+    import asyncio
+
+    while _keyring_unavailable:
+        await asyncio.sleep(KEYRING_RETRY_SECONDS if interval is None else interval)
+        loaded = await asyncio.to_thread(hydrate_provider_keys, timeout)
+        if loaded:
+            logger.info("Loaded saved API keys from the OS keyring: %s", ", ".join(loaded))
+            if on_loaded:
+                on_loaded(loaded)
 
 
 def configured_providers() -> list[str]:
@@ -186,4 +227,7 @@ def configured_providers() -> list[str]:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in {"set", "delete"}:
         sys.exit(_change_keyring(sys.argv[1]))
-    print(json.dumps(_read_provider_keys()))
+    try:
+        print(json.dumps(_read_provider_keys()))
+    except KeyringError:
+        sys.exit(3)

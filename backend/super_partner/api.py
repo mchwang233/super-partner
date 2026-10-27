@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field
 
 from . import attachments as files
-from . import briefing, folders, learning, publish, retrospect, team
+from . import briefing, cli_quota, folders, learning, publish, retrospect, skills, team
 from . import diagnosis as diagnosis_module
 from .benchmarks import BenchmarkCatalog
 from .catalog_sync import CatalogSync, seed_catalog
@@ -66,6 +66,8 @@ from .secrets import (
     configured_providers,
     delete_provider_key,
     hydrate_provider_keys,
+    keep_loading_keys,
+    keyring_unavailable,
     set_provider_key,
 )
 
@@ -146,9 +148,16 @@ async def lifespan(_: FastAPI):
     executor.restore_platform()
     executor.restore_engineer()
     executor.restore_learning()
+    # Keys saved in a keyring that was locked at startup: load them once it is unlocked.
+    keys = asyncio.create_task(keep_loading_keys(
+        lambda loaded: [providers.quota.clear_provider(item) for item in loaded]))
+    # Membership CLIs priced by their subscription: refresh their price and quota pressure.
+    usage = asyncio.create_task(cli_quota.keep_applying(models, providers.quota))
     try:
         yield
     finally:
+        keys.cancel()
+        usage.cancel()
         await executor.shutdown()
         await catalog_sync.close()
         await providers.client.aclose()
@@ -194,6 +203,7 @@ async def local_only(request: Request, call_next):
 def health():
     return {
         "status": "ok", "pid": os.getpid(), "configured_providers": configured_providers() + ["mock"],
+        "keyring_unavailable": keyring_unavailable(),
         "available_cli_channels": sorted(providers.cli.available_model_ids()),
         "exhausted_models": providers.quota.public(),
     }
@@ -352,13 +362,16 @@ def store_provider_key(provider: str, body: ProviderKey):
 @app.get("/api/providers")
 def list_providers():
     configured = set(configured_providers())
+    locked = keyring_unavailable()
     labels = {
         "openai": "OpenAI", "anthropic": "Anthropic Claude", "google": "Google Gemini",
         "deepseek": "DeepSeek", "qwen": "通义千问", "doubao": "豆包",
         "glm": "智谱 GLM", "minimax": "MiniMax", "kimi": "Kimi（月之暗面）",
     }
     return [
-        {"id": provider, "name": labels[provider], "configured": provider in configured}
+        {"id": provider, "name": labels[provider], "configured": provider in configured,
+         # Its key may be saved in the keyring, which is locked: it loads once unlocked.
+         "keyring_locked": provider not in configured and locked}
         for provider in PROVIDER_ENV
     ]
 
@@ -466,6 +479,37 @@ async def create_task(body: CreateTask):
 async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> ExecutionRun:
     """Plan, route and save a task awaiting confirmation. With ``parent`` it is a requirement
     change that continues that task in its folder (see follow_up_task)."""
+    plan, session, attached, project_dir, background, lessons = await _make_plan(body, parent)
+    run = ExecutionRun(
+        id=str(uuid4()), prompt=body.prompt, status=RunStatus.AWAITING_CONFIRMATION,
+        plan=plan, budget_usd=body.budget_usd, use_cli=body.use_cli, allow_network=body.allow_network,
+        project_dir=str(project_dir) if project_dir else None, attachments=attached,
+        actual_cost_usd=plan.planning_cost_usd, background=background,
+        parent_run_id=parent.id if parent else None, workspace_id=parent.folder_id if parent else None,
+        supervisor=session if session.model_id else None,
+        improvement_uses=lessons,
+    )
+    if not parent and not project_dir:
+        # A readable folder, not the task's id: 20261021-1441-async-fifo-uvm.
+        run.folder_name = await asyncio.to_thread(folders.task_folder, plan.folder or plan.summary or body.prompt)
+    db.save_run(run)
+    db.add_event(Event(
+        run_id=run.id, kind="plan.created",
+        data={
+            "estimate": plan.estimate.model_dump(), "use_cli": body.use_cli, "allow_network": body.allow_network,
+            "project_dir": run.project_dir, "parent_run_id": run.parent_run_id,
+            "planning_method": plan.planning_method,
+            "planner_model_id": plan.planner_model_id,
+            "planning_note": plan.planning_note,
+        },
+    ))
+    return run
+
+
+async def _make_plan(body: CreateTask, parent: Optional[ExecutionRun] = None, decided: str = ""):
+    """The routed and estimated plan of ``body`` (see _new_task), and what it was made with:
+    (plan, lead session, attachments, project folder, background, lessons). ``decided``: the
+    user's answers to an earlier plan's open choices (replan_with_choices)."""
     configured = providers.configured_models(list(models))
     if not body.use_cli:
         configured = {model_id for model_id in configured if not model_id.startswith("cli:")}
@@ -482,6 +526,8 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
     needs_vision = any(item.kind == "image" for item in attached)
     background = change_background(parent) if parent else None
     request = body.prompt + files.describe(attached, with_paths=False)
+    if decided:
+        request += "\n\n" + decided
     if body.allow_network:
         # The lead plans within what the steps' sandbox allows (planner.WORK_RULES).
         request += "\n\n" + INTERNET_NOTE
@@ -524,30 +570,71 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
     except NoEligibleModelError as exc:
         raise HTTPException(422, str(exc)) from exc
     plan.estimate = estimate(plan.nodes, body.budget_usd, plan.planning_cost_usd, plan.unsplit_cost())
-    run = ExecutionRun(
-        id=str(uuid4()), prompt=body.prompt, status=RunStatus.AWAITING_CONFIRMATION,
-        plan=plan, budget_usd=body.budget_usd, use_cli=body.use_cli, allow_network=body.allow_network,
-        project_dir=str(project_dir) if project_dir else None, attachments=attached,
-        actual_cost_usd=plan.planning_cost_usd, background=background,
-        parent_run_id=parent.id if parent else None, workspace_id=parent.folder_id if parent else None,
-        supervisor=session if session.model_id else None,
-        improvement_uses=lessons,
-    )
-    if not parent and not project_dir:
-        # A readable folder, not the task's id: 20261021-1441-async-fifo-uvm.
-        run.folder_name = await asyncio.to_thread(folders.task_folder, plan.folder or plan.summary or body.prompt)
-    db.save_run(run)
-    db.add_event(Event(
-        run_id=run.id, kind="plan.created",
-        data={
-            "estimate": plan.estimate.model_dump(), "use_cli": body.use_cli, "allow_network": body.allow_network,
-            "project_dir": run.project_dir, "parent_run_id": run.parent_run_id,
-            "planning_method": plan.planning_method,
-            "planner_model_id": plan.planner_model_id,
-            "planning_note": plan.planning_note,
-        },
-    ))
-    return run
+    return plan, session, attached, project_dir, background, lessons
+
+
+class ChoiceAnswers(BaseModel):
+    # One per choice of the plan, in order: "assumed", "alternative", or the user's own answer.
+    picks: list[str] = Field(min_length=1, max_length=5)
+
+
+# Tasks being planned again with the user's choices (one replanning at a time per task).
+REPLANNING: set[str] = set()
+
+
+def decided_choices(choices, picks: list[str]) -> str:
+    """The user's answers to a plan's open choices, said to the lead; "" when every answer is
+    what the lead had assumed (nothing to plan again)."""
+    lines, changed = [], False
+    for choice, pick in zip(choices, picks):
+        pick = pick.strip()
+        if pick == "alternative" and choice.alternative:
+            answer, changed = choice.alternative, True
+        elif pick and pick not in {"assumed", "alternative"}:
+            answer, changed = pick[:1000], True
+        else:
+            answer = choice.assumed
+        lines.append(f"- {choice.question} → {answer}")
+    if not changed:
+        return ""
+    return ("The user has decided these scope questions; plan exactly by these answers and do not list "
+            "them as choices again:\n" + "\n".join(lines))
+
+
+@app.post("/api/tasks/{run_id}/choices", response_model=ExecutionRun)
+async def replan_with_choices(run_id: str, body: ChoiceAnswers):
+    """The user answered the plan's open choices (TaskPlan.choices) before confirming: when an
+    answer differs from what the lead assumed, the task is planned again with the answers, in
+    place. Its id, folder, budget and settings stay."""
+    run = get_task(run_id)
+    if run.status != RunStatus.AWAITING_CONFIRMATION:
+        raise HTTPException(409, "只有待确认的任务可以按选择重新规划。")
+    if len(body.picks) != len(run.plan.choices):
+        raise HTTPException(422, "每条取舍都要有一个选择。")
+    decided = decided_choices(run.plan.choices, body.picks)
+    if not decided:
+        return run
+    if run_id in REPLANNING:
+        raise HTTPException(409, "正在按你的选择重新规划，请稍候。")
+    REPLANNING.add(run_id)
+    try:
+        parent = db.get_run(run.parent_run_id) if run.parent_run_id else None
+        request = CreateTask(prompt=run.prompt, attachments=[item.id for item in run.attachments],
+                             budget_usd=run.budget_usd, use_cli=run.use_cli, project_dir=run.project_dir,
+                             allow_network=run.allow_network)
+        plan, session, _, _, _, lessons = await _make_plan(request, parent, decided)
+    finally:
+        REPLANNING.discard(run_id)
+    latest = get_task(run_id)
+    if latest.status != RunStatus.AWAITING_CONFIRMATION:
+        raise HTTPException(409, "任务在重新规划期间已改变状态，新计划未采用。")
+    latest.plan, latest.improvement_uses = plan, lessons
+    latest.supervisor = session if session.model_id else latest.supervisor
+    latest.actual_cost_usd = round(latest.actual_cost_usd + plan.planning_cost_usd, 6)
+    db.save_run(latest)
+    db.add_event(Event(run_id=run_id, kind="plan.replanned",
+                       data={"decided": decided, "estimate": plan.estimate.model_dump() if plan.estimate else None}))
+    return latest
 
 
 class FollowUp(BaseModel):
@@ -607,6 +694,12 @@ def list_tasks():
 async def recurring_problems(min_runs: int = 2):
     """Problems that came up in at least ``min_runs`` finished tasks, most frequent first."""
     return await asyncio.to_thread(retrospect.recurring, db, max(1, min_runs))
+
+
+@app.get("/api/retrospectives/topics")
+async def problem_topics(min_runs: int = 1):
+    """Problems across tasks grouped by what they are about (retrospect.topics)."""
+    return await asyncio.to_thread(retrospect.topics, db, max(1, min_runs))
 
 
 @app.get("/api/tasks/{run_id}/retrospective")
@@ -690,6 +783,8 @@ def disable_improvement(item_id: str):
     if item.status != "active":
         raise HTTPException(409, "只能停用已生效的 Skill 或执行规则。")
     item.status = "disabled"
+    if item.kind == "skill":
+        skills.remove_lesson(item.id)
     db.save_improvement(item)
     return item
 
@@ -711,7 +806,6 @@ async def delete_task(run_id: str):
     if any(job.run_id == run_id and job.improvement_id and job.status not in {"applied", "failed", "rejected", "cancelled"}
            for job in db.engineer_jobs(1000)):
         raise HTTPException(409, "该任务的改进仍由平台工程师处理，请完成或放弃后再删除。")
-    learned_skills = [item.id for item in db.improvements(run_id) if item.kind == "skill"]
     deleted_attachments = existing.attachments if existing else []
     try:
         deleted = db.delete_run(run_id)
@@ -720,8 +814,6 @@ async def delete_task(run_id: str):
     if not deleted:
         raise HTTPException(404, "Task not found")
     shutil.rmtree(Path(settings.data_dir) / "traces" / run_id, ignore_errors=True)
-    for item_id in learned_skills:
-        shutil.rmtree(Path(settings.data_dir) / "learned-skills" / item_id, ignore_errors=True)
     executor.tasks.pop(run_id, None)
     executor.learning_tasks.pop(run_id, None)
     executor.locks.pop(run_id, None)
@@ -1070,6 +1162,18 @@ def task_timeline(run_id: str, after: int = 0):
     if not db.get_run(run_id):
         raise HTTPException(404, "Task not found")
     return [event.model_dump(mode="json") for event in db.events(run_id, after)]
+
+
+@app.get("/api/tasks/{run_id}/nodes/{node_id}/activity")
+def node_activity(run_id: str, node_id: str, limit: int = 200):
+    """What a running step has done so far in this attempt (activity.py): an API model's tool
+    calls, or a CLI's commands, file changes and messages; empty when it is not running."""
+    run = db.get_run(run_id)
+    if not run or not any(node.id == node_id for node in run.plan.nodes):
+        raise HTTPException(404, "Step not found")
+    calls = list(executor.tool_logs.get((run_id, node_id)) or [])
+    return {"running": (run_id, node_id) in executor.tool_logs, "total": len(calls),
+            "calls": calls[-max(1, min(limit, 400)):]}
 
 
 @app.get("/api/tasks/{run_id}/events")

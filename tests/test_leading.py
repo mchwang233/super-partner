@@ -257,8 +257,7 @@ async def test_a_repair_that_did_not_work_goes_back_to_the_lead_before_the_step_
     # The step was not sent back to meet the same wall: the lead ended it.
     assert len(team.work) == 1 and result.plan.nodes[0].status == NodeStatus.UNABLE
     assert [item.event for item in result.decisions] == ["attempt_failed", "repair_done"]
-@pytest.mark.parametrize("action", ["accept", "retry", "switch_model"])
-async def test_artifact_lead_cannot_accept_missing_evidence_or_restart_exhausted_work(tmp_path, monkeypatch, action):
+async def test_artifact_lead_cannot_accept_missing_evidence(tmp_path, monkeypatch):
     from artifact_helpers import contract_node, setup_executor
     from super_partner.models import NodeStatus, RunStatus
     from super_partner.quality import Verdict
@@ -270,9 +269,108 @@ async def test_artifact_lead_cannot_accept_missing_evidence_or_restart_exhausted
     run = db.get_run("artifacts")
     run.status = RunStatus.RUNNING
     db.save_run(run)
-    await executor._apply_decision("artifacts", "vdb", {"action": action, "model_id": "test:worker"},
+    await executor._apply_decision("artifacts", "vdb", {"action": "accept"},
                                    Verdict(False, "not delivered"), "rejected", "attempt_failed")
     node = db.get_run("artifacts").plan.nodes[0]
     assert node.status == NodeStatus.BLOCKED and providers.calls == []
-    assert node.contract_turns == node.artifact_contract.max_turns
 
+
+@pytest.mark.parametrize("action", ["retry", "switch_model"])
+async def test_running_a_step_at_its_limit_again_grants_it_more_calls(tmp_path, monkeypatch, action):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.models import NodeStatus, RunStatus
+    from super_partner.quality import Verdict
+
+    node = contract_node()
+    node.contract_turns = node.contract_tool_calls = node.artifact_contract.max_turns
+    node.contract_cost_usd = 0.2
+    node.status = NodeStatus.RUNNING
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [node])
+    run = db.get_run("artifacts")
+    run.status = RunStatus.RUNNING
+    db.save_run(run)
+    await executor._apply_decision("artifacts", "vdb", {"action": action, "model_id": "test:worker"},
+                                   Verdict(False, "limit"), "stopped", "attempt_failed")
+    node = db.get_run("artifacts").plan.nodes[0]
+    # contract_node is "normal": 3 used + 40 more; the cost limit ($1 for 3 calls) grows with them.
+    assert node.status == NodeStatus.PENDING and node.artifact_contract.max_turns == 43
+    assert node.artifact_contract.max_cost_usd == pytest.approx(1 + 40 / 3, rel=1e-4)
+    assert any(e.kind == "node.limit_extended" for e in db.events("artifacts"))
+
+
+async def test_a_step_at_its_limit_goes_to_the_lead_and_stops_without_a_decision(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.models import NodeStatus, Outcome, RunStatus
+    from super_partner.quality import Verdict
+
+    node = contract_node()
+    node.contract_tool_calls = node.artifact_contract.max_turns
+    node.status = NodeStatus.RUNNING
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [node])
+    run = db.get_run("artifacts")
+    run.status = RunStatus.RUNNING
+    db.save_run(run)
+    monkeypatch.setattr(executor, "_can_lead", lambda: True)
+    asked = []
+
+    async def no_decision(run_id, node_id, prompt, *args, **kwargs):
+        asked.append(prompt)
+
+    monkeypatch.setattr(executor, "_ask_for_decision", no_decision)
+    await executor._finish("artifacts", "vdb", None, Verdict(False, "limit"), [], [], 0.0, Outcome.STOPPED)
+    node = db.get_run("artifacts").plan.nodes[0]
+    assert len(asked) == 1 and "declared limit" in asked[0] and "coverage.vdb" in asked[0]
+    assert node.status == NodeStatus.BLOCKED
+
+
+
+def blocked_run(tmp_path, monkeypatch, decision):
+    """A report step blocked by a coverage gap, after the step that produced the coverage."""
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.models import NodeStatus, RunStatus
+
+    vdb = contract_node()
+    vdb.status = NodeStatus.SUCCEEDED
+    report = contract_node("report", None, [{"path": "coverage.vdb", "kind": "directory", "source": "dependency"}],
+                           "report.txt", dependencies=["vdb"])
+    report.status = NodeStatus.RUNNING
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [vdb, report])
+    run = db.get_run("artifacts")
+    run.status = RunStatus.RUNNING
+    db.save_run(run)
+    monkeypatch.setattr(executor, "_can_lead", lambda: True)
+    asked = []
+
+    async def decide(run_id, node_id, prompt, model_ids, targets=None, **kwargs):
+        asked.append((prompt, targets))
+        return decision
+
+    monkeypatch.setattr(executor, "_ask_for_decision", decide)
+    return executor, db, asked
+
+
+async def test_a_blocked_step_goes_to_the_lead_who_can_send_back_what_it_builds_on(tmp_path, monkeypatch):
+    from super_partner.models import NodeStatus, Outcome
+    from super_partner.quality import Verdict
+
+    decision = {"action": "rework", "reason": "覆盖率差两个条件", "targets": ["vdb"],
+                "instructions": "补两个定向 case 覆盖 77、78 行"}
+    executor, db, asked = blocked_run(tmp_path, monkeypatch, decision)
+    await executor._finish("artifacts", "report", None, Verdict(False, "BLOCKED: 条件覆盖 16/18，未到 100%"),
+                           [], [], 0.0, Outcome.BLOCKED)
+    [(prompt, targets)] = asked
+    assert targets == {"vdb"} and "BLOCKED" in prompt and "rework" in prompt
+    run = db.get_run("artifacts")
+    vdb, report = run.plan.nodes
+    assert vdb.status == report.status == NodeStatus.PENDING and "77、78" in vdb.feedback
+    assert run.rework_rounds == 1 and any(e.kind == "run.rework" for e in db.events("artifacts"))
+
+
+async def test_a_blocked_step_without_a_decision_stops_as_declared(tmp_path, monkeypatch):
+    from super_partner.models import NodeStatus, Outcome
+    from super_partner.quality import Verdict
+
+    executor, db, asked = blocked_run(tmp_path, monkeypatch, None)
+    await executor._finish("artifacts", "report", None, Verdict(False, "BLOCKED: 缺少 VDB"), [], [], 0.0, Outcome.BLOCKED)
+    assert len(asked) == 1
+    assert db.get_run("artifacts").plan.nodes[1].status == NodeStatus.BLOCKED

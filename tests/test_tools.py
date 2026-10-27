@@ -26,7 +26,8 @@ def ws(tmp_path):
 async def test_the_tools_offered_are_claude_codes():
     names = [tool["name"] for tool in agent.tools_for(sandboxed=True)]
     assert names == ["Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS"]
-    assert [tool["name"] for tool in agent.tools_for(sandboxed=True, read_only=True)] == ["Read", "Glob", "Grep", "LS"]
+    assert [tool["name"] for tool in agent.tools_for(sandboxed=True, read_only=True)] == ["Bash", "Read", "Glob", "Grep", "LS"]
+    assert [tool["name"] for tool in agent.tools_for(sandboxed=False, read_only=True)] == ["Read", "Glob", "Grep", "LS"]
     assert "Bash" not in [tool["name"] for tool in agent.tools_for(sandboxed=False)]
     edit = next(tool for tool in agent.TOOLS if tool["name"] == "Edit")["parameters"]
     assert edit["required"] == ["file_path", "old_string", "new_string"] and "replace_all" in edit["properties"]
@@ -123,7 +124,6 @@ async def test_a_review_searches_only_what_it_may_read(tmp_path):
     review = Workspace(root, read_only=True)
     found = await review.call("Grep", {"pattern": "SECRET_KEY"})
     assert found == "src/app.py"
-    assert (await review.call("Bash", {"command": "ls"})).startswith("Error: review workspace is read-only")
     assert asyncio.iscoroutinefunction(review.run_all)
 
 

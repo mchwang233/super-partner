@@ -148,7 +148,7 @@ ACTIONS = ("retry", "switch_model", "accept", "unable", "ask_user", "repair_envi
 # What the lead may answer when every step has finished.
 FINAL_ACTIONS = ("done", "rework", "replan")
 ACTION_RULES = {
-    "rework": "- rework: send the verified steps listed in targets back to be redone, with instructions "
+    "rework": "- rework: send the steps listed in targets back to be redone, with instructions "
               "saying exactly what to change. Only for real problems the task needs fixed; not for new "
               "requirements the task never asked for, and not when the verification itself is wrong.\n",
     "retry": "- retry: the same model again. Only if the next attempt will do something materially different.\n",
@@ -233,9 +233,19 @@ def _models(choices: list[ModelProfile], node) -> list[str]:
             f"reliability {model.scores.reliability:g})" for model in choices]
 
 
+BLOCKED_NOTE = (
+    "This step stopped as BLOCKED: something it needs is missing or a target it must meet was not "
+    "reached (see why above). Decide what unblocks it: rework the steps it builds on (targets) with "
+    "instructions saying exactly what to add or fix, which redoes them and then this step; "
+    "repair_environment or repair_platform when the machine or Super Partner is at fault; retry when "
+    "something has changed; accept when what it delivered is enough for the request; ask_user when "
+    "only the user can decide (for example whether a target can be relaxed); unable to stop.")
+
+
 def failure_message(run: ExecutionRun, node, attempt, verdict, choices: list[ModelProfile],
-                    left: tuple[int, int]) -> str:
-    """Tell the lead an attempt of ``node`` failed, with the evidence, and ask what to do."""
+                    left: tuple[int, int], upstream: Optional[set[str]] = None) -> str:
+    """Tell the lead an attempt of ``node`` failed, with the evidence, and ask what to do;
+    ``upstream``: the finished steps it builds on, which rework may send back."""
     from .diagnosis import NETWORK_CHOICE, _tool_summary
 
     earlier = [f"- {item.model_id}: {item.outcome}: {(item.reason or '')[:200]}" for item in node.attempts[:-1][-6:]]
@@ -250,6 +260,7 @@ def failure_message(run: ExecutionRun, node, attempt, verdict, choices: list[Mod
         *(["Earlier attempts of this step:", *earlier] if earlier else []),
         "Where the steps stand:", *_steps(run),
         "Models that can take this step:", *_models(choices, node),
+        *([f"Steps it builds on, which rework may send back: {', '.join(sorted(upstream))}"] if upstream else []),
         f"Decisions left: {left[0]} for this step, {left[1]} for the task; after that the task pauses for the user.",
         ("This task allows the internet." if run.allow_network else
          "This task does not allow the internet. If the step itself must reach it while it runs, "
@@ -257,9 +268,22 @@ def failure_message(run: ExecutionRun, node, attempt, verdict, choices: list[Mod
         "",
         ("Decide what to do with this step. You may look at the files in the working directory "
          f"({run.project_dir or settings.workspace_root / run.folder_id}) first."),
-        DECISION_FORMAT,
+        decision_format(rework=bool(upstream)),
     ]
     return "\n".join(lines)
+
+
+def limit_note(node, granted: dict) -> str:
+    """Added to a failure at a contract step's declared limit: what deciding to go on grants."""
+    contract = node.artifact_contract
+    outputs = ", ".join(item.path for item in contract.outputs)
+    return (f"This step stopped at its declared limit ({contract.max_turns} tool calls, "
+            f"${contract.max_cost_usd:g}); it has used {max(node.contract_turns, node.contract_tool_calls)} calls "
+            f"and ${node.contract_cost_usd:.4f}. Its declared outputs: {outputs}. Deciding retry, "
+            f"switch_model or replan grants it more: up to {granted['max_turns']} tool calls and "
+            f"${granted['max_cost_usd']:g} in all, keeping what it has written. Say in instructions what "
+            "it must finish first. To make the work smaller, replan into smaller steps; to stop, "
+            "decide unable.")
 
 
 def verification_message(run: ExecutionRun, verifier, verdict, choices: list[ModelProfile],

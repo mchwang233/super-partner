@@ -49,19 +49,44 @@ async def test_artifact_missing_external_input_blocks_without_model_calls_or_dow
     assert run.actual_cost_usd == 0
 
 
-async def test_artifact_cli_cannot_silently_ignore_declared_limits(tmp_path, monkeypatch):
-    from artifact_helpers import contract_node, setup_executor
+async def test_a_membership_cli_runs_a_contract_step_bounded_by_time(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, mock_acceptance, setup_executor
 
     node = contract_node()
     node.model_id = "cli:codex"
-    executor, db, providers = setup_executor(tmp_path, monkeypatch, [node])
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [node])
     executor.model_lookup[node.model_id] = executor.model_lookup["test:worker"].model_copy(
-        update={"id": node.model_id, "channel": "cli"})
+        update={"id": node.model_id, "provider": "cli", "channel": "cli"})
+    run = db.get_run("artifacts")
+    run.use_cli = True
+    db.save_run(run)
+    mock_acceptance(monkeypatch, [])
     await executor.execute("artifacts")
     node = db.get_run("artifacts").plan.nodes[0]
-    assert providers.calls == [] and node.status == NodeStatus.BLOCKED
-    assert "通道" in node.review and node.attempts == [] and node.started_at is None
-    assert not [e for e in db.events("artifacts") if e.kind == "node.started"]
+    # The lead's assignment holds: no switch to an API model that can count tool calls.
+    assert [a.model_id for a in node.attempts] == ["cli:codex"]
+    assert not [e for e in db.events("artifacts") if e.kind == "node.model_switched"]
+
+
+async def test_a_cli_contract_step_stops_past_the_time_its_calls_allow(tmp_path, monkeypatch):
+    import super_partner.executor as module
+    from artifact_helpers import contract_node, setup_executor
+
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [contract_node()])
+    run = db.get_run("artifacts")
+    checked = []
+
+    async def fine(evidence):
+        checked.append(evidence)
+
+    monkeypatch.setattr(executor, "_progress_watch", lambda *a: fine)
+    watch = executor._timed_watch(run, run.plan.nodes[0], "cli:codex")
+    assert await watch("busy") is None and checked == ["busy"]
+    monkeypatch.setattr(module, "CLI_MINUTES_PER_TOOL_CALL", 0)
+    watch = executor._timed_watch(run, run.plan.nodes[0], "cli:codex")
+    assert "用时上限" in await watch("busy")
+    # An API model counts its calls: no time limit.
+    assert await executor._timed_watch(run, run.plan.nodes[0], "test:worker")("busy") is None
 
 
 @pytest.mark.parametrize("declaration", [{}, {"counting_unit": "request", "hard_limit": True},
@@ -90,52 +115,6 @@ async def test_tool_limit_admission_blocks_before_dispatch_with_structured_evide
     assert data["actual_counts"]["vdb"] == {"requests": 0, "tool_calls": 0, "cost_usd": 0, "limit": 3}
     assert data["affected_dependencies"] == ["audit", "report"]
     assert run.actual_cost_usd == 0
-
-
-@pytest.mark.parametrize("denial", [None, "unauthorized", "disabled", "budget", "step_budget", "quality", "context"])
-async def test_tool_limit_replacement_preserves_authorization_capability_and_budgets(tmp_path, monkeypatch, denial):
-    from artifact_helpers import contract_node, mock_acceptance, setup_executor
-
-    node = contract_node()
-    node.model_id = "cli:codex"
-    executor, db, providers = setup_executor(tmp_path, monkeypatch, [node])
-    api = executor.model_lookup["test:worker"]
-    executor.model_lookup[node.model_id] = api.model_copy(update={"id": node.model_id, "provider": "cli", "channel": "cli"})
-    if denial != "unauthorized":
-        providers.authorized.add(api.id)
-    if denial == "disabled":
-        api.enabled = False
-    if denial == "quality":
-        api.scores.coding = node.quality_threshold - 1
-    if denial == "context":
-        api.context_window = 1
-    run = db.get_run("artifacts")
-    run.use_cli = True
-    if denial == "budget":
-        run.budget_usd = 0.0001
-    if denial == "step_budget":
-        run.plan.nodes[0].artifact_contract.max_cost_usd = 0.0001
-    before = run.model_copy(deep=True)
-    db.save_run(run)
-    checks = []
-    mock_acceptance(monkeypatch, checks)
-    await executor.execute(run.id)
-    saved = db.get_run(run.id)
-    node = saved.plan.nodes[0]
-    assert saved.budget_usd == before.budget_usd and saved.allow_network == before.allow_network
-    assert saved.use_cli == before.use_cli and node.artifact_contract == before.plan.nodes[0].artifact_contract
-    assert node.acceptance_criteria == before.plan.nodes[0].acceptance_criteria
-    if denial:
-        assert node.status == NodeStatus.BLOCKED and node.attempts == []
-        assert providers.calls == providers.actual_calls == [] and not checks
-    else:
-        assert saved.status == RunStatus.SUCCEEDED
-        assert node.model_id == "test:worker" and [a.model_id for a in node.attempts] == ["test:worker"]
-        assert providers.actual_calls == [("vdb", "test:worker")]
-        assert node.contract_tool_calls == node.contract_turns == 1
-        assert node.artifact_evidence.accepted and checks == [("validate coverage.vdb", False, False)]
-        assert any(e.kind == "node.model_switched" and e.data.get("reason") == "tool_limit_compatibility"
-                   for e in db.events(run.id))
 
 
 async def test_tool_limit_admission_rechecks_after_final_channel_changes(tmp_path, monkeypatch):
@@ -509,3 +488,24 @@ async def test_finished_work_is_kept_when_used_model_left_the_catalog(tmp_path: 
     assert result.status == RunStatus.SUCCEEDED
     assert result.plan.nodes[0].result == "out only"
     assert result.actual_cost_usd == 0.25
+
+
+async def test_a_cli_contract_call_gets_cost_limits_but_no_call_counting(tmp_path, monkeypatch):
+    # The provider refuses a call that must count tool calls on a channel that cannot.
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.providers import ProviderResult
+
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [contract_node()])
+    run = db.get_run("artifacts")
+    seen = {}
+
+    async def call(budget):
+        seen[budget.context["purpose"]] = budget
+        return ProviderResult("ok", 1, 1, "x")
+
+    await executor._charged(run, run.plan.nodes[0], "cli:codex", call, work=True)
+    cli = seen.pop("work")
+    assert cli.turn_remaining is None and cli.begin_tool is None and cli.tool_remaining is None
+    assert cli.step_remaining is not None
+    await executor._charged(run, run.plan.nodes[0], "test:worker", call, work=True)
+    assert seen["work"].turn_remaining is not None and seen["work"].begin_tool is not None

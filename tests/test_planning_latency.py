@@ -44,7 +44,8 @@ async def test_planning_uses_stage_effort_without_changing_later_lead_policy(sta
     provider, session = Planner(), SupervisorSession()
     await autonomous_plan("实现模块", MODELS, CONFIGURED, provider, session=session)
     assert [(team, effort) for _, team, effort, _ in provider.calls] == [(True, "medium"), (False, "high")]
-    assert all(kwargs["timeout"] == 1.0 for *_, kwargs in provider.calls)
+    # The deadline grows with the effort: 1 s at medium, twice that at high.
+    assert [kwargs["timeout"] for *_, kwargs in provider.calls] == [1.0, 2.0]
     assert session.reasoning_effort is None
     assert all(s.reasoning_effort is None for s in provider.sessions)
 
@@ -129,3 +130,42 @@ async def test_unset_policy_keeps_existing_lead_defaults(monkeypatch):
     provider = Planner()
     await autonomous_plan("实现模块", MODELS, CONFIGURED, provider, session=SupervisorSession())
     assert all(effort is None and kwargs == {} for _, _, effort, kwargs in provider.calls)
+
+
+class Judged(Planner):
+    """A lead that rates the request ``difficulty`` before it plans."""
+
+    def __init__(self, difficulty):
+        super().__init__()
+        self.difficulty = difficulty
+
+    async def converse(self, session, text, **kwargs):
+        if "rate how hard it is to PLAN" in text:
+            self.calls.append((session.model_id, "difficulty", session.reasoning_effort, kwargs))
+            self.sessions.append(session)
+            return ProviderResult(json.dumps({"difficulty": self.difficulty, "reason": "接口简单"}), 1, 1,
+                                  session.model_id)
+        return await super().converse(session, text, **kwargs)
+
+
+@pytest.mark.parametrize("difficulty, effort", [("easy", "low"), ("hard", "high"), ("exceptional", "max"),
+                                                ("unreadable", "high")])
+async def test_auto_plans_at_the_effort_for_the_requests_difficulty(stage_settings, monkeypatch, difficulty, effort):
+    monkeypatch.setitem(settings.__dict__, "planning_reasoning_effort", "auto")
+    provider = Judged(difficulty)
+    plan = await autonomous_plan("实现模块", MODELS, CONFIGURED, provider, session=SupervisorSession())
+    judge, team, outline = provider.calls
+    assert judge[1:3] == ("difficulty", "medium") and team[1:3] == (True, "medium") and outline[2] == effort
+    # The judgement has a conversation of its own; the plan's conversation starts with the plan.
+    assert provider.sessions[0] is not provider.sessions[2]
+    assert f"用 {effort} 强度规划" in plan.planning_note
+
+
+@pytest.mark.parametrize("difficulty, effort", [("easy", "low"), ("exceptional", "max")])
+async def test_auto_staffing_thinks_as_hard_as_the_plan(stage_settings, monkeypatch, difficulty, effort):
+    monkeypatch.setitem(settings.__dict__, "planning_reasoning_effort", "auto")
+    monkeypatch.setitem(settings.__dict__, "team_reasoning_effort", "auto")
+    provider = Judged(difficulty)
+    await autonomous_plan("实现模块", MODELS, CONFIGURED, provider, session=SupervisorSession())
+    _judge, team, outline = provider.calls
+    assert team[1:3] == (True, effort) and outline[2] == effort

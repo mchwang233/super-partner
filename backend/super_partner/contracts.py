@@ -43,19 +43,53 @@ production: do not label it urg_report or make real VDBs prerequisites for fixtu
 Only the step that actually produces reports uses urg_report. Helper code/docs or intermediate
 verification can use stage: null when they need bounded artifact contracts. A verification step
 of contracted artifact work must also declare its inputs, output evidence and limits.
-Limits accumulate across automatic retries/model switches; at a limit stop with diagnosis and
-logs, without scope expansion or automatic continuation. Missing upstream evidence returns
-BLOCKED: <reason>. CLI channels without reliable turn accounting cannot execute these limits.
+max_turns counts tool calls; give real work room (at least {floors}
+by difficulty; lower values are raised to these). Limits accumulate across automatic
+retries/model switches; at a limit the step stops with its logs and the task's lead decides
+whether to grant more calls, split the work or give up. Missing upstream evidence returns
+BLOCKED: <reason>. Membership CLIs cannot count tool calls; a contract step they run is bounded
+by time instead (about 1.5 minutes per declared tool call) and by progress checks.
 """
+
+
+# The fewest tool calls a contract step gets, by its difficulty: a lead's tighter guess stopped
+# hard work before it had written its outputs.
+MIN_TOOL_CALLS = {"easy": 20, "normal": 40, "hard": 80}
+RULES = RULES.replace("{floors}", ", ".join(f"{n} for {d}" for d, n in MIN_TOOL_CALLS.items()))
 
 
 def declarations(raw: dict) -> dict:
     if "artifact_contract" not in raw:
         return {}
     try:
-        return {"artifact_contract": ArtifactContract.model_validate(raw["artifact_contract"])}
+        contract = ArtifactContract.model_validate(raw["artifact_contract"])
     except ValueError as exc:
         raise ContractError(f"artifact_contract: {exc}") from exc
+    floor = MIN_TOOL_CALLS.get(str(raw.get("difficulty") or "normal"), MIN_TOOL_CALLS["normal"])
+    from .config import settings
+    if settings.contract_call_floors and contract.max_turns < floor:
+        # The cost limit grows with the calls, so the raised limit is not cut short by it.
+        contract.max_cost_usd = round(contract.max_cost_usd * floor / contract.max_turns, 6)
+        contract.max_turns = floor
+    return {"artifact_contract": contract}
+
+
+def extension(node: TaskNode) -> dict:
+    """What the lead grants a contract step at its limit by running it again: one more
+    difficulty's worth of tool calls past what it has used, and cost in proportion."""
+    contract = node.artifact_contract
+    more = MIN_TOOL_CALLS.get(node.difficulty, MIN_TOOL_CALLS["normal"])
+    used = max(node.contract_turns, node.contract_tool_calls)
+    per_call = contract.max_cost_usd / contract.max_turns
+    return {"max_turns": used + more,
+            "max_cost_usd": round(max(contract.max_cost_usd, node.contract_cost_usd) + per_call * more, 6)}
+
+
+def extend(node: TaskNode) -> dict:
+    granted = extension(node)
+    node.artifact_contract.max_turns = granted["max_turns"]
+    node.artifact_contract.max_cost_usd = granted["max_cost_usd"]
+    return granted
 
 
 def safe_name(name: str) -> bool:
@@ -68,7 +102,7 @@ def safe_name(name: str) -> bool:
                             or part.lower() in PRIVATE_DIRS | PRIVATE_NAMES
                             or part.lower().startswith(".env")
                             or Path(part).stem.lower() in PRIVATE_NAMES
-                            or Path(part).suffix.lower() in {".key", ".pem", ".p12", ".pfx"}
+                            or Path(part).suffix.lower() in {".pem", ".p12", ".pfx"}
                             for part in path.parts)
                 and not any(char in name for char in "*?[]\\\n\r\0"))
 
@@ -225,6 +259,19 @@ def _path(root: Path, name: str) -> Path:
     return path
 
 
+# Tools write .key files that are not keys (VCS's ucli.key logs simulator commands): a .key
+# file is refused for what it holds, not for its name.
+KEY_MARKS = (b"PRIVATE KEY", b"BEGIN OPENSSH", b"BEGIN PGP PRIVATE")
+
+
+def _not_a_key(file: Path, name: str) -> None:
+    if file.suffix.lower() == ".key":
+        with file.open("rb") as stream:
+            head = stream.read(65536)
+        if any(mark in head for mark in KEY_MARKS):
+            raise ArtifactBlocked(f"产物像是私钥，不能读取：{name}")
+
+
 def fingerprint(root: Path, item: Artifact) -> str:
     """Hash bytes and freshness metadata; an empty/missing artifact is never evidence."""
     try:
@@ -232,19 +279,28 @@ def fingerprint(root: Path, item: Artifact) -> str:
         if item.kind == "directory":
             if not path.is_dir():
                 raise ArtifactBlocked(f"缺少目录产物：{item.path}")
-            files = []
+            files, links = [], []
             for folder, dirs, names in os.walk(path, followlinks=False):
                 for name in dirs + names:
-                    _path(root, (Path(folder) / name).relative_to(root.resolve()).as_posix())
-                files += [Path(folder) / name for name in names]
+                    entry = Path(folder) / name
+                    if entry.is_symlink() and path.resolve() in entry.resolve().parents:
+                        # Tools link within their own outputs (a VCS database shares files across
+                        # tests): such a link is recorded as a link, never followed.
+                        links.append(entry)
+                        continue
+                    _path(root, entry.relative_to(root.resolve()).as_posix())
+                files += [Path(folder) / name for name in names if Path(folder) / name not in links]
                 if len(files) > 20_000:
                     raise ArtifactBlocked(f"目录产物过大，无法完整核验：{item.path}")
         else:
-            files = [path]
+            files, links = [path], []
         digest, size = hashlib.sha256(), 0
+        for link in sorted(links):
+            digest.update(f"{link.relative_to(path)}->{os.readlink(link)}".encode())
         for file in sorted(files):
             if not file.is_file():
                 raise ArtifactBlocked(f"不是普通文件：{item.path}")
+            _not_a_key(file, item.path)
             stat = file.stat()
             digest.update(f"{file.relative_to(path) if file != path else file.name}:{stat.st_size}:{stat.st_mtime_ns}".encode())
             with file.open("rb") as stream:
@@ -265,9 +321,11 @@ def output_snapshot(root: Path, node: TaskNode) -> dict[str, str]:
 
 
 def accepted(run, node: TaskNode, seen=None) -> None:
-    """Revalidate a saved acceptance before a consumer or lead can rely on it."""
+    """Revalidate a saved acceptance before a consumer or lead can rely on it; nothing to
+    revalidate when the platform does not accept steps (settings.acceptance off)."""
+    from .config import settings
     evidence, contract = node.artifact_evidence, node.artifact_contract
-    if not contract:
+    if not contract or not settings.acceptance:
         return
     if (not evidence or not evidence.accepted or evidence.generation != node.generation
             or [check.get("command") for check in evidence.checks] != contract.acceptance_commands
@@ -285,6 +343,9 @@ def accepted(run, node: TaskNode, seen=None) -> None:
 
 
 def input_snapshot(run, node: TaskNode, seen=None) -> dict[str, str]:
+    """Each input's fingerprint; a dependency's must match what its producer had accepted. With
+    acceptance off (settings.acceptance) nothing was accepted: a finished producer is enough."""
+    from .config import settings
     before, found = ancestors(node, run.plan.nodes), {}
     for item in node.artifact_contract.inputs:
         value = fingerprint(workspace(run, node), item)
@@ -294,7 +355,7 @@ def input_snapshot(run, node: TaskNode, seen=None) -> dict[str, str]:
                 raise ArtifactBlocked(f"{item.path} 缺少已完成且已验收的上游步骤")
             producer = owners[0]
             accepted(run, producer, seen)
-            if producer.artifact_evidence.outputs.get(item.path) != value:
+            if settings.acceptance and producer.artifact_evidence.outputs.get(item.path) != value:
                 raise ArtifactBlocked(f"{item.path} 与上游验收的产物不一致")
         found[item.path] = value
     return found
@@ -337,9 +398,15 @@ def delivery_snapshot(run, node: TaskNode) -> dict[str, str]:
 def prompt(node: TaskNode) -> str:
     if not node.artifact_contract:
         return ""
+    contract = node.artifact_contract
+    outputs = ", ".join(item.path for item in contract.outputs)
+    used = max(node.contract_turns, node.contract_tool_calls)
     return ("Artifact contract (additional to the original acceptance criteria):\n"
-            + node.artifact_contract.model_dump_json(indent=2)
-            + f"\nAlready used: {node.contract_turns} turns, ${node.contract_cost_usd:.6f}."
-            "\nCreate your own outputs; they need not exist before you start. Do not expand scope. "
+            + contract.model_dump_json(indent=2)
+            + f"\nAlready used: {used} of {contract.max_turns} tool calls, ${node.contract_cost_usd:.6f}."
+            f"\nWrite every declared output first ({outputs}), then check them with the acceptance "
+            "commands. Check only your own outputs: work that other steps own (their testbenches, "
+            "simulations, synthesis, reports) is not yours, however useful it looks. "
+            "Create your own outputs; they need not exist before you start. Do not expand scope. "
             "Missing prerequisite evidence: preserve logs and end with BLOCKED: <why>. "
             "At a declared limit stop with diagnostic evidence. Audit only accepted artifacts.")

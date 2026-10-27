@@ -273,7 +273,9 @@ class Database:
         return [ExecutionRun.model_validate_json(row["body"]) for row in rows]
 
     def delete_run(self, run_id: str) -> bool:
-        """Delete a finished run and its events atomically, leaving workspace files alone."""
+        """Delete a finished run and its events atomically, leaving workspace files alone. What was
+        learned from it stays: its retrospective, learning review, improvements and their effects
+        are what later tasks are planned with."""
         with self.lock, self.connection:
             deleted = self.connection.execute(
                 "DELETE FROM runs WHERE id = ? AND status IN (?, ?, ?, ?)",
@@ -289,11 +291,6 @@ class Database:
             self.connection.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
             for table in ("conversations", "conversation_archives", "model_calls"):
                 self.connection.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
-            self.connection.execute("DELETE FROM retrospectives WHERE run_id = ?", (run_id,))
-            self.connection.execute("DELETE FROM learning_reviews WHERE run_id = ?", (run_id,))
-            self.connection.execute("DELETE FROM improvement_effects WHERE run_id = ? OR improvement_id IN "
-                                    "(SELECT id FROM improvements WHERE run_id = ?)", (run_id, run_id))
-            self.connection.execute("DELETE FROM improvements WHERE run_id = ?", (run_id,))
         return True
 
     def save_conversation(self, run_id: str, node_id: str, body: dict) -> None:

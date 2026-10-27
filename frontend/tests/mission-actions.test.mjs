@@ -1195,6 +1195,16 @@ test("models out of quota are listed until they reset, and can be put back by ha
   assert.equal(document.querySelector(".quota-banner"), null);
 });
 
+test("a membership CLI priced by its subscription shows its price and quota", async t => {
+  const note = "周额度已用 25%，11-02 14:09 重置；按月费 $200 折算 $2.31/百万 tokens";
+  const models = [{ id: "cli:codex", provider: "openai", display_name: "Codex CLI", channel: "cli", auth_type: "membership", enabled: true, configured: true, routing_ready: true, scores: {}, input_per_million: 2.31, output_per_million: 2.31, usage_note: note }];
+  const { document, click } = await setup(t, [mission("build-task", "running")], models);
+  await click(document.querySelector(".fleet-trigger"));
+  const link = document.querySelector('[aria-label="查看 Codex CLI 的画像"]');
+  assert.equal(link.querySelector("small").textContent, "会员折算 $2.31/百万 tokens · 周额度已用 25%");
+  assert.equal(link.getAttribute("title"), note);
+});
+
 test("a provider whose key waits in a locked keyring says so instead of not configured", async t => {
   const models = [{ id: "deepseek:deepseek-flash", provider: "deepseek", display_name: "DeepSeek", channel: "api", enabled: true, configured: false, scores: {} }];
   const providers = [{ id: "deepseek", name: "DeepSeek", configured: false, keyring_locked: true }];

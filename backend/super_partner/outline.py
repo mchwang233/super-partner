@@ -18,7 +18,15 @@ from uuid import uuid4
 
 from . import contracts
 from .models import PlanPart, TaskNode, TaskPlan
-from .planner import WORK_RULES, _extract_json, scope_problems, task_node
+from .planner import (
+    CHOICES_RULE,
+    CHOICES_SHAPE,
+    WORK_RULES,
+    _extract_json,
+    plan_choices,
+    scope_problems,
+    task_node,
+)
 
 # Levels of parts. Every child of a part at the deepest level must be a task.
 MAX_DEPTH = 3
@@ -77,9 +85,10 @@ OUTLINE_PROMPT = (
     "the steps' sandbox before the first task, so a missing tool is found before any work. Name only "
     "what the task cannot do without; [] if it needs nothing special.\n"
     "- \"folder\" names the task's folder in two to five lowercase English words joined by hyphens "
-    "(such as \"todo-cli-json\"), in English even when the request is not.\n\n"
+    "(such as \"todo-cli-json\"), in English even when the request is not.\n"
+    "- " + CHOICES_RULE + "\n"
     "Reply with only a JSON object, no markdown fences:\n"
-    '{"summary": "short objective", "folder": "short-english-name", '
+    '{"summary": "short objective", "folder": "short-english-name", ' + CHOICES_SHAPE + ', '
     '"requires": ["commands that show the tools it needs work"], '
     '"parts": [{"key": "p1", "title": "short title", '
     '"goal": "what this part delivers", "acceptance": "how to tell it is done", '
@@ -380,9 +389,9 @@ async def plan_outline(say: Say, opening: str, team_plan=None) -> TaskPlan:
                 if not employee or item.get("capability", "coding") not in employee.capabilities:
                     raise ValueError("each part needs a capable employee_id from the existing team")
         return (str(payload.get("summary") or "").strip(), siblings(payload.get("parts"), False, parts_only=True),
-                payload.get("requires"), str(payload.get("folder") or ""))
+                payload.get("requires"), str(payload.get("folder") or ""), plan_choices(payload))
 
-    summary, raw, requires, folder = await _ask(say, opening, read)
+    summary, raw, requires, folder, choices = await _ask(say, opening, read)
     tree = Tree()
     parts = tree.add(raw, None)
     for part, item in zip(parts, raw):
@@ -408,7 +417,7 @@ async def plan_outline(say: Say, opening: str, team_plan=None) -> TaskPlan:
     commands = [text for item in requires if isinstance(item, (str, int))
                 and 0 < len(text := str(item).strip()) <= MAX_REQUIRE_CHARS] if isinstance(requires, list) else []
     return TaskPlan(summary=(summary or "Autonomous task plan")[:240], nodes=[], parts=parts,
-                    requires=list(dict.fromkeys(commands))[:MAX_REQUIRES], folder=folder[:80],
+                    requires=list(dict.fromkeys(commands))[:MAX_REQUIRES], folder=folder[:80], choices=choices,
                     employees=team_plan.employees if team_plan else [], team_brief=team_plan.team_brief if team_plan else "")
 
 

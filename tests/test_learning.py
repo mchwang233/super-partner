@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from super_partner import learning, retrospect
+from super_partner import learning, retrospect, skills
 from super_partner.config import settings
 from super_partner.db import Database
 from super_partner.executor import Executor
@@ -66,7 +66,7 @@ class Models:
 def setup_learning(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "review_nodes", False)
     db = Database(tmp_path / "test.db")
-    db.save_learning_settings({"enabled": True, "budget_usd": 0.1, "auto_platform": False})
+    db.save_learning_settings({"enabled": True, "budget_usd": 0.1})
     models = Models()
     executor = Executor(db, models, {m.id: m for m in [model("x:writer", 90), model("y:reviewer", 92)]})
     yield db, models, executor
@@ -209,6 +209,13 @@ async def test_skill_requires_a_real_check_and_independent_review(setup_learning
     assert artifact.exists() == approved
     if approved:
         assert artifact.read_text() == content
+        # Written into this machine's skill for the tool, which the steps are given ...
+        [mine] = [s for s in skills.library() if s.machine]
+        assert "fakecompiler" in mine.tools and "Compile a small fixture first." in mine.body
+        assert item.validation["merged_into"] == [str(mine.path)]
+        # ... and so not repeated as a separate lesson.
+        uses = learning.selected(db, "fakecompiler")
+        assert uses and learning.instruction(uses) == ""
 
 
 async def test_failing_skill_check_is_never_published(setup_learning, monkeypatch):
@@ -286,7 +293,7 @@ async def test_platform_changes_use_the_existing_engineer_and_wait_for_actual_ac
     monkeypatch.setattr(executor, "engineer_request", engineer)
     review, [item] = await learn(db, executor)
     assert item.status == "engineering" and requested[0]["origin"] == "retrospective"
-    assert not requested[0]["auto_apply"] and requested[0]["budget_usd"] + review.cost_usd <= review.budget_usd
+    assert requested[0]["budget_usd"] + review.cost_usd <= review.budget_usd
     assert learning.selected(db, "fakecompiler") == []
     job = db.get_engineer_job(item.engineer_job_id)
     job.status, job.checks = "applied", ["backend tests"]
@@ -355,7 +362,7 @@ async def test_api_can_start_show_and_disable_a_lesson(task_api, monkeypatch):
     assert (await client.get("/api/tasks/missing/learning")).status_code == 404
 
 
-def test_delete_removes_learning_records_and_observations(setup_learning):
+def test_delete_keeps_learning_records_and_observations(setup_learning):
     db, _, _ = setup_learning
     run = finished(db)
     item = Improvement(run_id=run.id, revision=learning.revision(run), **proposal())
@@ -363,8 +370,8 @@ def test_delete_removes_learning_records_and_observations(setup_learning):
     db.save_learning_review(LearningReview(run_id=run.id, revision=learning.revision(run)))
     db.save_improvement_effect(item.id, "later", {"run_id": "later"})
     db.delete_run(run.id)
-    assert db.improvement(item.id) is None and db.learning_review(run.id) is None
-    assert db.improvement_effects(item.id) == []
+    assert db.improvement(item.id) and db.learning_review(run.id)
+    assert len(db.improvement_effects(item.id)) == 1
 
 
 @pytest.mark.parametrize("status", [RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.INCOMPLETE])

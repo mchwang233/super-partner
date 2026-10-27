@@ -154,36 +154,15 @@ async def test_the_engineer_asks_when_a_choice_is_the_users(setup):
     assert (job.status, job.question, job.choices) == ("needs_input", "接入哪个厂商？", ["DeepSeek", "Kimi"])
 
 
-async def test_retrospective_platform_changes_apply_automatically_only_after_checks(setup):
+async def test_a_retrospective_change_waits_for_approval_of_its_plan_and_of_its_result(setup):
     build, activated, _ = setup
     executor = build()
-    job = executor.engineer_request("改进拆分规则并增加验证", origin="retrospective", auto_apply=True,
-                                    improvement_id="lesson")
+    job = executor.engineer_request("改进拆分规则并增加验证", origin="retrospective", improvement_id="lesson")
     await idle(executor)
-    job = executor.db.get_engineer_job(job.id)
-    assert job.status == "applying" and job.checks and job.plan
-    assert len(activated) == 1 and activated[0]["status"] == "validated"
-
-
-async def test_automatic_platform_change_never_applies_a_failed_check(setup, monkeypatch):
-    build, activated, _ = setup
-    executor = build()
-
-    async def fail(record):
-        raise platform.RepairError("regression still fails")
-
-    monkeypatch.setattr(executor.platform, "check", fail)
-    job = executor.engineer_request("修正规则", origin="retrospective", auto_apply=True)
+    assert executor.db.get_engineer_job(job.id).status == "plan_ready" and not activated
+    executor.engineer_approve(job.id)
     await idle(executor)
-    assert executor.db.get_engineer_job(job.id).status == "failed" and not activated
-
-
-async def test_automatic_platform_change_needs_a_valid_plan(setup):
-    build, activated, _ = setup
-    executor = build(Engineer(plan="I cannot make a plan"))
-    job = executor.engineer_request("改进规则", origin="retrospective", auto_apply=True)
-    await idle(executor)
-    assert executor.db.get_engineer_job(job.id).status == "failed" and not activated
+    assert executor.db.get_engineer_job(job.id).status == "ready" and not activated
 
 
 def test_replies_are_read_with_their_status_and_question():

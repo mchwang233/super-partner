@@ -25,6 +25,7 @@ export type Model = {
   provider: string;
   channel: string;
   auth_type?: string;
+  usage_note?: string | null;
   configured: boolean;
   enabled: boolean;
   input_per_million: number | null;
@@ -170,7 +171,7 @@ function ModelDetail({ model, source, onToggle, onConfigure }: Pick<Props, "onTo
       <dl className="profile-catalog-facts"><div><dt>发布日期</dt><dd>{model.release_date ?? "来源未提供"}</dd></div><div><dt>目录来源</dt><dd>{model.catalog_source === "models.dev" ? "Models.dev 社区目录" : model.catalog_source === "official" ? "官方模型接口" : "项目内置"}{model.source_url?.startsWith("https://") && <a href={model.source_url} target="_blank" rel="noreferrer">查看来源 ↗</a>}</dd></div><div><dt>目录检查时间</dt><dd>{dateLabel(model.catalog_checked_at)}</dd></div><div><dt>官方接口可见性</dt><dd>{model.available_via_api === true ? "上次核对时可见" : model.available_via_api === false ? "上次核对时未列出" : "尚未核对"}{model.api_checked_at && <small>{dateLabel(model.api_checked_at)}</small>}</dd></div></dl>
       {model.catalog_status === "unlisted" && <p className="profile-pending-note">最新公开目录未收录此模型，已保留历史记录；这不等同于厂商已下线。</p>}
     </>}
-    <p className="profile-footnote">{isCli ? "CLI 画像代表接入通道，实际能力随 CLI 当前使用的模型和配置变化。本应用尚未统计 CLI 的 Token、会员额度或订阅费用。" : isDemo ? "演示模型不适合执行真实任务，也不用于判断其他模型的优劣。" : "上下文与价格来自当前模型目录；实际可用规格和账单以服务商为准。"}</p>
+    <p className="profile-footnote">{isCli ? (model.usage_note ? `CLI 画像代表接入通道，实际能力随 CLI 当前使用的模型和配置变化。会员用量：${model.usage_note}。` : "CLI 画像代表接入通道，实际能力随 CLI 当前使用的模型和配置变化。未设置订阅费时，CLI 按零成本计算。") : isDemo ? "演示模型不适合执行真实任务，也不用于判断其他模型的优劣。" : "上下文与价格来自当前模型目录；实际可用规格和账单以服务商为准。"}</p>
   </article>;
 }
 

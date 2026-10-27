@@ -36,6 +36,11 @@ def isolated_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
     monkeypatch.setattr(settings, "workspace_root", tmp_path / "workspaces")
     monkeypatch.setattr(settings, "auto_diagnose", False)
+    monkeypatch.setattr(settings, "problem_naming", False)
+    # The tests of reviews, verification and artifact handoffs check acceptance as it works when on.
+    monkeypatch.setattr(settings, "acceptance", True)
+    # The contract tests use small declared limits to reach them quickly.
+    monkeypatch.setattr(settings, "contract_call_floors", False)
     monkeypatch.setattr(settings, "platform_self_repair", False)
     monkeypatch.setattr(settings, "skill_reuse_first", False)
     monkeypatch.setattr(settings, "adaptive_refinement", False)

@@ -64,7 +64,8 @@ class ArtifactProviders:
         budget = kwargs["spend_ok"]
         await budget.begin_turn()
         await budget.record(model_id, 1000, 1000)
-        await budget.begin_tool()
+        if budget.begin_tool:  # API channels count tool calls; a CLI's are not counted
+            await budget.begin_tool()
         self.actual_calls.append((node.id, model_id))
         if self.work:
             result = await self.work(node, Path(workspace), kwargs)

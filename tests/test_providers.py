@@ -107,7 +107,7 @@ async def test_hard_tool_cap_counts_each_batch_item_before_side_effects(tmp_path
     assert len(sent) == 1  # no extra paid summary at either cap
 
 
-@pytest.mark.parametrize("model_id,act", [("cli:codex", True), ("mock:local", True), ("deepseek:worker", False)])
+@pytest.mark.parametrize("model_id,act", [("mock:local", True), ("deepseek:worker", False)])
 async def test_direct_constrained_provider_call_cannot_bypass_channel_admission(tmp_path, monkeypatch, model_id, act):
     from artifact_helpers import contract_node, setup_executor
     from super_partner.contracts import ArtifactBlocked
@@ -132,6 +132,29 @@ async def test_direct_constrained_provider_call_cannot_bypass_channel_admission(
     assert started == []
     node = db.get_run(run.id).plan.nodes[0]
     assert node.contract_turns == node.contract_tool_calls == 0
+
+
+async def test_a_membership_cli_may_take_a_contract_step(tmp_path, monkeypatch):
+    # It cannot count tool calls; time and progress checks bound it instead (Executor._timed_watch).
+    from artifact_helpers import contract_node, setup_executor
+
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [contract_node()])
+    registry = ProviderRegistry()
+    executor.providers = registry
+    run = db.get_run("artifacts")
+    started = []
+
+    async def cli(*args, **kwargs):
+        started.append(True)
+        return "done"
+
+    monkeypatch.setattr(registry.cli, "complete", cli)
+    try:
+        await executor._complete(run, run.plan.nodes[0], "cli:codex", "work", tmp_path, act=True,
+                                 tool_trace=tmp_path / "trace.jsonl")
+    finally:
+        await registry.client.aclose()
+    assert started == [True]
 
 
 class Reserving:

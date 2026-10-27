@@ -45,7 +45,7 @@ def strongest_model(choices, tokens: int, previous=None):
 def preferences(db) -> LearningSettings:
     return LearningSettings.model_validate({
         "enabled": settings.learning_enabled, "budget_usd": settings.learning_budget_usd,
-        "auto_platform": settings.learning_auto_platform, **db.learning_settings(),
+        **db.learning_settings(),
     })
 
 
@@ -75,7 +75,8 @@ def selected(db, text: str) -> list[dict]:
 
 def instruction(uses: list[dict], node=None) -> str:
     chosen = [item for item in uses if item["kind"] != "platform" and (
-        node is None or matches(item, node_text(node), node.capability))]
+        node is None or matches(item, node_text(node), node.capability))
+        and not (item["kind"] == "skill" and (item.get("validation") or {}).get("merged_into"))]
     if not chosen:
         return ""
     lines = [("Validated lessons from earlier tasks. Apply only where relevant to this request; they are "
@@ -147,8 +148,13 @@ def evidence(db, run) -> str:
               "attempts": [{"outcome": a.outcome, "reason": a.reason, "turns": a.turns,
                             "tools": [t.model_dump(mode="json") for t in a.tool_calls[-6:]]}
                            for a in n.attempts[-3:]]} for n in run.plan.nodes[:60]]
+    # What this machine's skills for the task's tools already say: a skill lesson is added to them.
+    text = run.prompt + "\n" + "\n".join(node_text(n) for n in run.plan.nodes)
+    known = [{"name": s.name, "tools": s.tools, "body": s.body[:3000]}
+             for s in skills.for_step(text) if s.machine]
     return json.dumps({"request": run.prompt[:5000], "retrospective": body, "steps": nodes,
-                       "recurring": retrospect.recurring(db, 2)[:10]}, ensure_ascii=False, default=str)[:65000]
+                       "machine_skills": known, "recurring": retrospect.recurring(db, 2)[:10]},
+                      ensure_ascii=False, default=str)[:65000]
 
 
 def analysis_prompt(data: str, existing: list[Improvement]) -> str:
@@ -164,7 +170,9 @@ def analysis_prompt(data: str, existing: list[Improvement]) -> str:
             '"problem_key":"existing problem key or empty", "check":"self-contained shell regression check for skill"}]}. '
             f"At most {MAX_ITEMS} improvements; an empty list is correct if no supported lesson exists. "
             "Require source step ids for every item. Use tools or capability to limit applicability. "
-            "A skill must have front matter name/description/tools. Its check creates its own small fixture in an "
+            "A skill must have front matter name/description/tools. A skill lesson is added to this machine's "
+            "skill for its tools (machine_skills in the evidence): its body says only what is new, briefly, not a "
+            "copy of what is there. Its check creates its own small fixture in an "
             "empty temporary sandbox, exercises the proposed technique and asserts the expected result; no user "
             "project, external side effects or internet. A passing trivial command is not verification. "
             "Rules are advice about execution/planning; changes to enforcement, source, platform instructions or "
@@ -280,11 +288,11 @@ class Learning:
             if review.status == "done" or (not manual and review.status not in WORKING):
                 return review
             if manual:
-                review.budget_usd, review.auto_platform = options.budget_usd, options.auto_platform
+                review.budget_usd = options.budget_usd
                 review.automatic = False
         else:
             review = LearningReview(run_id=run_id, revision=revision(run), budget_usd=options.budget_usd,
-                                    auto_platform=options.auto_platform, automatic=not manual)
+                                    automatic=not manual)
         review.status, review.error = "queued", None
         self.db.save_learning_review(review)
         try:
@@ -453,6 +461,10 @@ class Learning:
                 folder = Path(settings.data_dir) / "learned-skills" / item.id
                 folder.mkdir(parents=True, exist_ok=True)
                 (folder / "SKILL.md").write_text(item.content, encoding="utf-8")
+                # And into this machine's skill for those tools, which preflight prepares and every
+                # step using them is given; it is then not repeated as a separate lesson.
+                item.validation["merged_into"] = [
+                    str(path) for path in skills.add_lesson(item.id, item.title, item.content, item.tools)]
         self.db.save_improvement(item)
 
     def _learning_engineer(self, review, item, allowance):
@@ -465,7 +477,7 @@ class Learning:
                     f"复盘改进：{item.title}\n证据：{item.rationale}\n来源任务：{item.run_id}，步骤：{', '.join(item.source_nodes)}"
                     f"\n具体改动：\n{item.content}\n必须添加回归验证；保留平台规则、预算和沙箱约束。",
                     kind="component", origin="retrospective", run_id=item.run_id, budget_usd=allowance,
-                    improvement_id=item.id, auto_apply=review.auto_platform)
+                    improvement_id=item.id)
             except ValueError as exc:
                 item.status, item.validation = "failed", {"passed": False, "reason": str(exc)}
                 self.db.save_improvement(item)

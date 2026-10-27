@@ -161,9 +161,10 @@ class QuotaTracker:
                  "kind": self._kind[mid]} for mid, until in self._until.items()
             ], "rules": self.rules})
 
-    def mark(self, model_id: str, message: str, kind: str = "quota") -> ModelUnavailable:
-        until = (reset_time(message) if kind == "quota"
-                 else datetime.now(timezone.utc) + RATE_LIMIT_COOLDOWN)
+    def mark(self, model_id: str, message: str, kind: str = "quota",
+             until: Optional[datetime] = None) -> ModelUnavailable:
+        until = until or (reset_time(message) if kind == "quota"
+                          else datetime.now(timezone.utc) + RATE_LIMIT_COOLDOWN)
         with self.lock:
             self._until[model_id], self._reason[model_id] = until, message[:300]
             self._kind[model_id] = kind
@@ -186,6 +187,10 @@ class QuotaTracker:
                 self.clear(model_id)
                 return False
             return until is not None
+
+    def public_reason(self, model_id: str) -> Optional[str]:
+        with self.lock:
+            return self._reason.get(model_id)
 
     def clear(self, model_id: str) -> None:
         with self.lock:

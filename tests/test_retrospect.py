@@ -1,5 +1,6 @@
 """Finished tasks are looked back on, so a problem that keeps coming back is seen as one
 (retrospect.py)."""
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -97,10 +98,10 @@ def test_a_problem_that_comes_back_after_a_repair_is_marked(tmp_path):
     assert sandbox["recurred_after_repair"] is True
     assert len(groups["estimate_low", "deepseek:flash"]["runs"]) == 3
     assert groups["estimate_low", "deepseek:flash"]["recurred_after_repair"] is False
-    # Kept, and gone with its task.
+    # Kept, even when its task is deleted: later tasks learn from it.
     assert db.retrospective("first")["run_id"] == "first"
     db.delete_run("first")
-    assert db.retrospective("first") is None
+    assert db.retrospective("first")["run_id"] == "first"
 
 
 def test_a_diagnosis_is_told_about_the_same_problem_in_earlier_tasks(tmp_path):
@@ -149,3 +150,110 @@ async def test_the_api_lists_recurring_problems_and_a_tasks_look_back(task_api):
 def test_a_program_is_found_inside_bash_minus_c_and_after_cd():
     assert retrospect.program("bash -lc 'set -euo pipefail; source /eda/.edarc >/dev/null 2>&1; vcs -sverilog -full64 a.sv'") == "vcs"
     assert retrospect.program("cd /work && ./run.sh") == "run.sh"
+
+
+def platform_step(node_id="p") -> TaskNode:
+    return TaskNode(id=node_id, title="仿真", instructions="i", capability="coding", model_id="deepseek:flash",
+                    status=NodeStatus.SUCCEEDED, attempts=[NodeAttempt(model_id="deepseek:flash", outcome="passed")])
+
+
+class Namer:
+    """A cheap model that names problems: the EDA ones alike, whatever the records call them."""
+
+    def __init__(self, reply=None):
+        self.prompts, self.reply = [], reply
+
+    async def __call__(self, model_id, prompt):
+        self.prompts.append((model_id, prompt))
+        if self.reply is not None:
+            return ProviderResult(self.reply, 10, 5, model_id)
+        lines = [line for line in prompt.split("Problems:\n", 1)[1].split("\n\n", 1)[0].splitlines()]
+        names = ["新思 EDA 环境未加载" if "vcs" in line or "platform:agent" in line or ".edarc" in line else "其他"
+                 for line in lines]
+        return ProviderResult(json.dumps({"names": names}, ensure_ascii=False), 10, 5, model_id)
+
+
+def cheap_models():
+    from conftest import scored_models
+    models = scored_models()
+    return models, {m.id for m in models}
+
+
+async def test_one_cause_under_two_names_is_counted_as_one(tmp_path):
+    db = Database(tmp_path / "t.db")
+    models, configured = cheap_models()
+    namer = Namer()
+    # The first task: VCS not found (environment:vcs). The second: the sandbox repaired (platform:agent).
+    db.save_run(finished("first", [vcs_step()], days_ago=2, diagnoses=[
+        Diagnosis(id="d1", trigger="auto", node_id="n", status="done", verdict="fixed", report="沙箱里没有加载 .edarc")]))
+    db.save_run(finished("second", [platform_step()], days_ago=1))
+    retrospect.record(db, "first")
+    db.save_retrospective("second", retrospect.review(db.get_run("second"), [], [
+        {"id": "j", "files": ["backend/super_partner/agent.py"], "report": "步骤沙箱加载 .edarc", "node_id": "p"}]))
+    for run_id in ("first", "second"):
+        await retrospect.name_problems(db, namer, models, configured, run_id)
+    assert "新思 EDA 环境未加载" in namer.prompts[1][1]  # the names given so far are offered again
+    [eda] = [group for group in retrospect.topics(db) if group["topic"] == "新思 EDA 环境未加载"]
+    assert eda["runs"] == ["first", "second"] and {"environment:vcs", "platform:agent"} <= set(eda["members"])
+    assert eda["recurred_after_repair"]
+    # A third task's diagnosis of a failing VCS step hears of the sandbox repair too.
+    now = finished("now", [vcs_step()], status=RunStatus.RUNNING)
+    [line] = [line for line in retrospect.similar(db, now, now.plan.nodes[0]) if line.startswith("- 「新思 EDA")]
+    assert "platform:agent" in line and "2 earlier task" in line
+    # Recorded again, the problems keep their names.
+    retrospect.record(db, "first")
+    assert all(p.get("topic") for p in db.retrospective("first")["problems"])
+    assert db.retrospective("first")["topics_cost_usd"] >= 0
+
+
+@pytest.mark.parametrize("reply", ["not json", '{"names": ["只有一个"]}'])
+async def test_a_bad_naming_reply_leaves_the_retrospective_as_it_was(tmp_path, reply):
+    db = Database(tmp_path / "t.db")
+    models, configured = cheap_models()
+    db.save_run(finished("r", [vcs_step()]))
+    before = retrospect.record(db, "r")
+    assert len(before["problems"]) > 1
+    await retrospect.name_problems(db, Namer(reply), models, configured, "r")
+    assert db.retrospective("r") == before and retrospect.topics(db) == []
+
+
+async def test_a_tasks_problems_are_named_when_it_ends(tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(settings, "problem_naming", True)
+    db = Database(tmp_path / "t.db")
+    models, configured = cheap_models()
+    db.save_run(finished("r", [vcs_step()], status=RunStatus.RUNNING))
+
+    class Cheap:
+        def __init__(self):
+            self.calls = []
+
+        def configured_models(self, ids):
+            return configured
+
+        async def complete(self, model_id, prompt, *args, **kwargs):
+            self.calls.append((model_id, kwargs))
+            count = len(prompt.split("Problems:\n", 1)[1].split("\n\n", 1)[0].splitlines())
+            return ProviderResult(json.dumps({"names": ["步骤费用估算偏低"] * count}), 10, 5, model_id)
+
+    providers = Cheap()
+    executor = Executor(db, providers, {m.id: m for m in models})
+    run = db.get_run("r")
+    run.status = RunStatus.SUCCEEDED
+    db.save_run(run)
+    executor.emit("r", "run.succeeded")
+    await asyncio.gather(*executor.naming_tasks.values())
+    [(model_id, kwargs)] = providers.calls
+    assert kwargs["effort"] == "low" and not model_id.startswith(("cli:", "mock:"))
+    assert {p["topic"] for p in db.retrospective("r")["problems"]} == {"步骤费用估算偏低"}
+
+
+async def test_the_api_lists_problems_by_what_they_are_about(task_api):
+    api, client = task_api
+    api.db.save_run(finished("a", [vcs_step()]))
+    body = retrospect.record(api.db, "a")
+    for problem in body["problems"]:
+        problem["topic"] = "新思 EDA 环境未加载"
+    api.db.save_retrospective("a", body)
+    [group] = (await client.get("/api/retrospectives/topics")).json()
+    assert group["topic"] == "新思 EDA 环境未加载" and group["runs"] == ["a"] and "estimate_low:deepseek:flash" in group["members"]

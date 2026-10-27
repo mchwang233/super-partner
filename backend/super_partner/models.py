@@ -108,6 +108,8 @@ class ModelProfile(BaseModel):
     pricing_verified: bool = False
     channel: str = "api"
     execution_priority: int = 100
+    # A membership CLI's quota and the price its subscription works out to (cli_quota.py).
+    usage_note: Optional[str] = None
     description: Optional[str] = None
     release_date: Optional[date] = None
     catalog_source: str = "builtin"

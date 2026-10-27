@@ -9,18 +9,11 @@
 
 第 1～3 条已于 2026-10-21 修复，见文末「已修复」。还剩下的部分：
 
-### 1b. Codex（和 Claude Code）执行步骤时能读到私钥、平台数据和别的任务；/tmp 是全机共用的（存在，暂不改）
-- 2026-10-21 实测 Codex 的步骤沙箱：能读 `~/.ssh`、平台数据库和其他任务的目录；`/tmp` 是整台机器共用的真实 `/tmp`。Codex 自己的沙箱只限制写，不限制读。
-- 方向（用户暂不同意）：让 Codex 跑在平台自己的沙箱里（隐藏主目录和平台数据，`/tmp` 每次独立），并关掉 Codex 自己的沙箱和命令审核。
+### 1b. Claude Code 执行步骤时仍能读到私钥、平台数据和别的任务（存在；Codex 部分已修）
+- Codex 部分已于 2026-10-22 修复，见文末「已修复」。Claude Code 自己的沙箱同样只限制写、不限制读，还没处理；它目前在平台里是停用的（第 17 条）。
 
 ### 1c. Codex 拒绝带通配符的 `rm`（存在，影响小）
 - 2026-10-21 实测：Codex 执行步骤时，内置的危险命令检查（它的 exec policy）会拒绝 `rm -f` 这类命令，即使在它自己的沙箱里。现在平台在 Codex 调用期间往任务目录里临时放一个允许 `rm` 的规则文件（`cli_channels.codex_rules`），调用结束就删掉；`rm` 仍然受 Codex 沙箱限制，工作目录外照样不能删。实测放行：`rm -f a.o b.o`、`rm -rf build`、和其他命令连写的 `rm`；仍被拒：`rm -f *.o`、`rm -f $(...)`（Codex 无法确定会删什么）。步骤提示词里告诉 CLI 模型改用写明文件名或 `find . -name '*.o' -delete`。测试：`test_codex_may_delete_files_in_its_folder_and_the_rule_is_gone_after`。
-
-### 1d. 执行前检查只检查 API 模型的沙箱（存在）
-- Codex、Claude Code 执行步骤时用的是它们自己的沙箱，环境（PATH、能读的目录、网络）和平台的沙箱不同，执行前检查没有覆盖。
-
-### 1e. 任务目录在平台仓库里（等目录）
-- 默认的 `workspaces/` 在平台仓库里，Codex 和 Claude Code 执行步骤时会读到 Super Partner 自己的 `AGENTS.md`、`CLAUDE.md`。等管理员在 `/projects` 下建好目录后，用设置 `SUPER_PARTNER_WORKSPACE_ROOT` 切过去（`scripts/service.sh` 目前固定传的是仓库里的 `workspaces/`，要一起改）。新任务的目录名已经改成可读的英文名（`20261021-1441-async-fifo-uvm`）。
 
 ### 3b. Anthropic 写入缓存的费用按普通输入计算（存在，影响小）
 - Anthropic 写入缓存（`cache_creation_input_tokens`）按输入价的 1.25 倍收费，`budget.token_cost` 按 1 倍计算，这部分费用会略微少算。
@@ -51,13 +44,7 @@
 
 ## 三、回溯和记录
 
-第 11～13 条已于 2026-10-21 修复，见文末「已修复」。还剩下的部分：
-
-### 11b. 问题按意思归类还做不到（存在）
-- 复盘不调用模型，只按记录归类：平台修复按改了哪个模块，环境问题按失败命令里的程序名。所以能看出「沙箱（agent）在两个任务里修过、修完又出问题」，但认不出几次修复其实都是「新思 EDA 环境」这一件事；关键字识别不出来时归成 `general`。
-- 方向：任务结束时用最便宜的模型给每个问题起一个简短的名字，并尽量沿用已有的名字。
-- 结果页现有「复盘与改进」：可生成模型结论、建立并验证改进项，查看后续应用和效果对比。
-  全局重复问题统计仍通过接口 `/api/retrospectives/recurring` 查看；原统计分类仍按模块／程序名。
+第 11～13 条已于 2026-10-21、11b 已于 2026-10-22 修复，见文末「已修复」。
 
 ## 四、体验和其他
 
@@ -68,13 +55,16 @@
 
 ## 建议的处理顺序
 
-1. 第 1b 条：把会员 CLI 的沙箱也隔离起来，补完第 1 条。
+1. 第 1b 条剩下的 Claude Code 部分（启用 Claude Code 之前）。
 2. 第 5 条：保留 Claude Code 的轮数和费用。
-3. 第 11b 条：用模型给问题按意思归类，加前端页面。
-4. 跑一次完整的真实任务（例如异步 FIFO 加覆盖率），验证第 9、10 条。
+3. 跑一次完整的真实任务（例如异步 FIFO 加覆盖率），验证第 9、10 条。
 
 ## 已修复
 
+- 第 1b 条的 Codex 部分（2026-10-22）：Codex 执行步骤时能读到 `~/.ssh`、平台数据库和其他任务，`/tmp` 是整台机器共用的。没有把 Codex 套进平台的沙箱，而是用 Codex 自己的权限配置（它的 bubblewrap 执行）：步骤用 `super-partner-step`，主目录、平台数据目录、任务总目录里除了当前任务目录、Codex 程序及其临时目录、平台工具目录之外，逐条设为禁止读写；共用的 `/tmp` 禁用，每次调用给一个私有 `TMPDIR`，用完删除；任务允许联网时在配置里打开网络。负责人对话用只读的 `super-partner-lead`（同样读不到主目录和平台数据）。执行前检查用同一配置检查工具、联网，并确认读不到数据库和 Codex 登录凭据（`cli_channels.codex_step_permissions`、`private_tmp`、`preflight.cli_checks`）。实测：真实的 `codex exec` 步骤读不到 `~/.ssh` 和数据库，写自己的目录正常；负责人被拒绝读取。测试：`tests/test_preflight.py`（含真实 Codex 沙箱）、`tests/test_supervisor.py`。
+- 第 1d 条（2026-10-22）：执行前检查只检查 API 模型的沙箱。现在任务能用 Codex 时，同样的工具检查也在 Codex 自己的沙箱里、用步骤的权限配置跑一遍（`codex sandbox`，不调用模型；`preflight.cli_checks`），找不到的工具和 API 沙箱一样会让任务停下、先修复；任务允许联网时也检查联网。Claude Code 没有单独运行命令的方式，未覆盖。测试：`tests/test_preflight.py`。
+- 第 1e 条（2026-10-22）：任务目录在平台仓库里，Codex 和 Claude Code 会读到 Super Partner 自己的 `AGENTS.md`、`CLAUDE.md`。现在本机 `.env` 设 `SUPER_PARTNER_WORKSPACE_ROOT=/projects/workspace`，`scripts/service.sh` 从环境或 `.env` 读取（没设才用仓库里的 `workspaces/`），原有任务目录已搬过去。
+- 第 11b 条（2026-10-22）：问题只能按记录归类（模块名、程序名），同一原因分散在几个名字下。现在任务结束时，用最便宜的可用 API 模型按实际原因给每个问题起简短的名字，尽量沿用已有名字（`retrospect.name_problems`，设置 `problem_naming`）；跨任务按名字归类（`retrospect.topics`，接口 `/api/retrospectives/topics`），诊断时先列出同类问题的历史；新增「重复问题」页面。测试：`tests/test_retrospect.py`。
 - 第 25 条（2026-10-21）：步骤没有可用的 skill，每一步都从 `vcs -help` 开始自学工具（一个步骤前 20 轮都在读手册、搭小例子）；执行前检查明明跑通了 VCS 加覆盖率加 URG 的完整流程，却只记下「通过」。现在：skill 库（`skills.py`，通用的在 `skills/steps/`，本机的在数据目录 `skills/`）；执行前检查通过后，为任务要用的每个专业工具准备本机 skill（没有就让模型在步骤沙箱里实测后写出，已有就复用，`preflight._prepare_skills`）；每个步骤自动带上和它提到的工具相关的 skill。第一个通用 skill：`skills/steps/synopsys-vcs`（命令已在步骤沙箱实测）。测试：`tests/test_skills.py`。已补充：结项复盘会提取新经验，实际验证后保存为独立 Skill 版本，按适用范围注入后续任务，并记录效果；见 `docs/design/continuous-improvement.md`。
 - 第 26 条：同时运行的步骤数默认不再限制（`max_parallel_nodes=0`），改同一批文件的步骤仍会排队。
 - 第 24 条（2026-10-21）：一个困难步骤卡住整个任务。实测 FIFO 任务里，最先开始的 RTL 步骤分给了 GLM 5.3（编码分只比 DeepSeek Flash 高 1.6 分，但慢约 8 倍、贵 20 多倍），用 `max` 强度跑了 30 多分钟，后面 6 个步骤全在等它。现在：困难步骤在比最高分低不超过 `hard_score_margin`（默认 2）分的模型里选最便宜的（`routing.close_to_best`）；有别的步骤在等的步骤，用时超过预期（预计轮数 × `minutes_per_turn` 0.5 分钟）的 `critical_overrun_factor`（默认 2）倍时，由主管决定继续，还是停下换更快的模型（`Review._critical_check`，事件 `node.critical_overrun_check`）。测试：`tests/test_critical_path.py`。

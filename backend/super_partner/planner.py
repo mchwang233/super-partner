@@ -77,6 +77,34 @@ def heuristic_plan(prompt: str, in_project: bool = False) -> TaskPlan:
 
 # How tasks are rated and scoped; the flat planner and the lead's top-down planning (outline.py)
 # both give these rules.
+# Said to the lead in every plan: independent deliverables run side by side, and open scope
+# decisions that change the work a lot are listed for the user to see before confirming.
+INDEPENDENT_RULE = (
+    "Several independent deliverables (modules, components, services) each get their own line of "
+    "tasks (build, then verify) running alongside the others, joined only where results must come "
+    "together (an integration test, a combined report). Never put several independent deliverables "
+    "into one task per stage, such as one task building all of them and another verifying all of them.\n")
+CHOICES_RULE = (
+    "In \"choices\" list each scope decision the request leaves open that changes the work a lot, "
+    "such as a full protocol versus its lite subset, or what to do if a hard target (100% coverage, "
+    "a performance figure) proves unreachable: the question, what you assumed and the main "
+    "alternative, in the user's language. The user sees them before confirming the plan. Assume the "
+    "reading that best fits the request; list only decisions that change the work a lot, at most "
+    "five; [] when there are none.\n")
+CHOICES_SHAPE = '"choices":[{"question":"...","assumed":"...","alternative":"..."}]'
+
+
+def plan_choices(payload: dict) -> list:
+    """The open scope decisions of a planner's JSON (CHOICES_RULE); malformed ones are dropped."""
+    from .models import PlanChoice
+    found = []
+    for item in payload.get("choices") or []:
+        if isinstance(item, dict) and all(str(item.get(k) or "").strip() for k in ("question", "assumed")):
+            found.append(PlanChoice(**{k: str(item.get(k) or "").strip()[:400]
+                                       for k in ("question", "assumed", "alternative")}))
+    return found[:5]
+
+
 WORK_RULES = """Rate each task's difficulty for the model that will do it:
 - easy: routine, well-specified work (formatting, summarising given results, small edits).
 - normal: ordinary analysis, research or implementation with clear requirements.
@@ -277,6 +305,51 @@ def scope_problems(plan: TaskPlan) -> list[str]:
     return problems
 
 
+# How hard it is to plan a request, the effort the lead plans it with, and how much longer than
+# planning_call_timeout a call at that effort may take.
+PLANNING_EFFORT = {"easy": "low", "normal": "medium", "hard": "high", "exceptional": "max"}
+DIFFICULTY_LABELS = {"easy": "容易", "normal": "一般", "hard": "困难", "exceptional": "特别难"}
+PLANNING_TIME = {"low": 1, "medium": 1, "high": 2, "max": 3}
+# Judging the difficulty means reading the whole request: low is too shallow to tell a hard task
+# from an easy one, more is not needed for one word.
+DIFFICULTY_EFFORT = "medium"
+DIFFICULTY_PROMPT = """Before this request is planned, rate how hard it is to PLAN (not to carry out):
+- easy: one clear deliverable, a few files, common tools, nothing to work out;
+- normal: several connected parts with clear interfaces;
+- hard: many interdependent parts, special tools (EDA, hardware, licences), strict verification
+  or hand-offs between parts that must be designed;
+- exceptional: an unclear approach, research or a large system, where a weak plan would waste most
+  of the budget.
+Reply with JSON only: {"difficulty": "easy|normal|hard|exceptional", "reason": "<one sentence>"}
+
+Request:
+"""
+
+
+# Without step acceptance (settings.acceptance), verification steps would only cost time.
+NO_ACCEPTANCE_NOTE = (
+    "\n\nPlatform note: results are not reviewed step by step; only the lead checks the whole result at "
+    "the end. Do not add separate verification, review or acceptance-checking tasks (leave verifies empty): "
+    "each task runs its own checks of its own deliverables as part of its work and reports what they "
+    "showed; checks that need a separate setup (a testbench, a regression, synthesis) belong to the "
+    "task that owns that work.")
+
+
+async def planning_difficulty(say, request: str) -> tuple[str, str]:
+    """How hard ``request`` is to plan and why, judged quickly; hard when no answer is usable, so a
+    failed judgement never makes the plan worse."""
+    try:
+        data = _extract_json(await say(DIFFICULTY_PROMPT + request[:20000]))
+        difficulty = str(data.get("difficulty") or "").strip().lower()
+        if difficulty in PLANNING_EFFORT:
+            return difficulty, str(data.get("reason") or "").strip()[:300]
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("planning difficulty not judged: %s", exc)
+    return "hard", "难度判断没有得到有效回答，按困难处理"
+
+
 async def _plan_as_lead(request: str, models: list[ModelProfile], configured: set[str], providers,
                         session: SupervisorSession, in_project: bool, team_request: str = "",
                         artifact_work: bool = False) -> Optional[TaskPlan]:
@@ -287,16 +360,20 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
 
     spent = [0.0]
     roster = None
+    planning_effort = settings.planning_reasoning_effort
+    judged = None  # (difficulty, reason) once a lead has judged it
     for model in supervisor.candidates(models, configured)[:supervisor.MAX_LEADS]:
         fresh = supervisor.new_session(model)
 
         async def say(text: str, effort: str, stage: str, fresh=fresh, model=model, spent=spent) -> str:
             previous = fresh.reasoning_effort
             fresh.reasoning_effort = effort or previous
+            seconds = settings.planning_call_timeout * PLANNING_TIME.get(
+                fresh.reasoning_effort or settings.lead_reasoning_effort, 1)
             try:
                 logger.info("planning stage %s on %s (effort=%s)", stage, model.id,
                             fresh.reasoning_effort or settings.lead_reasoning_effort)
-                if seconds := settings.planning_call_timeout:
+                if seconds:
                     # The outer deadline also bounds API retries/queueing and providers that do
                     # not enforce the CLI timeout argument. Cancellation finishes before fallback.
                     result = await asyncio.wait_for(providers.converse(fresh, text, timeout=seconds), seconds)
@@ -305,23 +382,34 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
                 spent[0] += _cost(result, model)
                 return result.text
             except asyncio.TimeoutError as exc:
-                raise TimeoutError(f"{stage} exceeded {settings.planning_call_timeout:g}s") from exc
+                raise TimeoutError(f"{stage} exceeded {seconds:g}s") from exc
             finally:
                 fresh.reasoning_effort = previous
+
+        if planning_effort == "auto" and judged is None:
+            # In a conversation of its own, so the plan's conversation starts with the plan.
+            judge = supervisor.new_session(model)
+            judged = await planning_difficulty(
+                partial(say, effort=DIFFICULTY_EFFORT, stage="difficulty", fresh=judge), team_request or request)
+            planning_effort = PLANNING_EFFORT[judged[0]]
+            logger.info("planning difficulty %s: effort %s (%s)", judged[0], planning_effort, judged[1])
 
         try:
             # A valid team is a completed decision. An outline timeout/model switch must not
             # discard it, spend another staffing call or change employee identities.
             if settings.employee_teams and roster is None:
-                roster = await team.form(partial(say, effort=settings.team_reasoning_effort, stage="team"),
+                # Staffing is part of planning: with "auto", at the effort the difficulty calls for.
+                team_effort = planning_effort if settings.team_reasoning_effort == "auto" else settings.team_reasoning_effort
+                roster = await team.form(partial(say, effort=team_effort, stage="team"),
                                          team_request or request, models, configured)
             opening = supervisor.ROLE + request + (team.assignment_prompt(roster) if roster else "")
             if settings.direct_task_planning:
                 from .task_planning import plan_tasks
-                plan = await plan_tasks(partial(say, effort=settings.planning_reasoning_effort, stage="tasks"),
+                plan = await plan_tasks(partial(say, effort=planning_effort, stage="tasks"),
                                         opening, roster, artifact_work)
+                concurrency = plan.planning_note
             else:
-                plan = await outline.plan_outline(partial(say, effort=settings.planning_reasoning_effort, stage="outline"),
+                plan = await outline.plan_outline(partial(say, effort=planning_effort, stage="outline"),
                                                   opening, team_plan=roster)
         except Exception as exc:
             # The next lead tries; with none left, the usual single-call planner does.
@@ -338,7 +426,11 @@ async def _plan_as_lead(request: str, models: list[ModelProfile], configured: se
             plan.planning_note = f"负责人 {model.display_name} 先配置 {len(plan.employees)} 名员工，再划分和分配工作；员工可委派子任务"
         if settings.direct_task_planning:
             plan.planning_note = (f"负责人 {model.display_name} 已明确 {len(plan.nodes)} 个任务的事项、依赖和验收条件；"
-                                  "按依赖直接执行，不再细化" + (f"；分配给 {len(plan.employees)} 名员工" if plan.employees else ""))
+                                  "按依赖直接执行，不再细化" + (f"；分配给 {len(plan.employees)} 名员工" if plan.employees else "")
+                                  + (f"；{concurrency}" if concurrency else ""))
+        if judged:
+            plan.planning_note += (f"；规划难度{DIFFICULTY_LABELS[judged[0]]}，用 {planning_effort} 强度规划"
+                                   + (f"（{judged[1]}）" if judged[1] else ""))
         return plan
     if settings.direct_task_planning:
         raise contracts.ContractError("未能生成有效的直接任务计划；请检查可用负责人模型或任务约束后重试。")
@@ -368,6 +460,8 @@ async def autonomous_plan(
     packages, each naming the files it needs, so no step has to learn the whole project."""
     in_project = project_context is not None or brief is not None
     body = prompt + "".join(f"\n\n{part}" for part in (project_context, brief) if part)
+    if not settings.acceptance:
+        body += NO_ACCEPTANCE_NOTE
     request = PLANNER_PROMPT + body
     artifact_work = bool(contracts.stages(TaskNode(id="request", title=prompt, instructions="",
                                                   capability="planning")) & {"coverage_vdb", "urg_report"})
