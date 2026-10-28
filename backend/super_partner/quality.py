@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import skills
-from .models import ArtifactEvidence, ExecutionRun, NodeInput, TaskNode
+from .models import ArtifactEvidence, ExecutionRun, NodeInput, NodeStatus, TaskNode
 
 # Marks a review request so the offline demo model can answer it with a verdict.
 REVIEW_MARKER = "[[super-partner:review]]"
@@ -108,6 +108,13 @@ def scope_section(node: TaskNode) -> str:
     return "Your work package.\n" + "\n".join(lines)
 
 
+def folders_section(node: TaskNode) -> str:
+    """Where a step that owns folders may write: other steps work in other folders at the same time."""
+    return ("Your folders: " + ", ".join(node.folders) + "\nOther steps work in other folders at the same time. "
+            "Create and change files only inside yours, including your tests, logs and build output; read "
+            "anything else you need, but do not change it.")
+
+
 def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, list[NodeInput]]:
     """The node's prompt and a record of what it received from each upstream node."""
     by_id = {item.id: item for item in run.plan.nodes}
@@ -132,11 +139,15 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
     scoped = bool(node.files or node.reads)
     if scoped:
         sections.append(scope_section(node))
+    elif node.folders:
+        sections.append(folders_section(node))
     if node.feedback:
         previous = f"\n\nYour previous result:\n{node.result[:limit]}" if node.result else ""
         sections.append(f"A previous attempt was not accepted. Fix these problems:\n{node.feedback}{previous}")
     if notes := attempt_notes(node):
         sections.append(notes)
+    if node.head_start and node.head_start_generation == node.generation and not node.attempts:
+        sections.append(HEAD_START_DONE + node.head_start[:HEAD_START_CHARS])
     if clarifications := _clarifications(run):
         sections.append(clarifications)
     upstream = []
@@ -174,6 +185,31 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
     elif scoped:
         sections.append(SCOPED_ANSWER)
     return "\n\n".join(sections), inputs
+
+
+HEAD_START_CHARS = 4000
+HEAD_START_DONE = (
+    "Before the steps you depend on finished, you already started this task (its files are in the working "
+    "directory). Check that work against their actual results below, fix what does not match, and do not "
+    "redo what is finished. What you reported then:\n")
+
+
+def head_start_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> str:
+    """The prompt for starting a step early, while steps it depends on are still at work
+    (executor._head_start): only what does not need their results, and no verdict yet."""
+    prompt, _ = node_prompt(node, run, limit)
+    waiting = [item for item in run.plan.nodes if item.id in node.dependencies and item.status != NodeStatus.SUCCEEDED]
+    listed = "\n".join(f"- {item.title}" + (f": it will provide {item.provides}" if item.provides else "")
+                       for item in waiting)
+    return prompt + "\n\n" + (
+        "HEAD START. Steps your task depends on are not finished yet:\n" + listed + "\n"
+        "Do now only the part of your task that does not need their results: read what you need, set up your "
+        "own files, and build what the agreed interface and the descriptions above allow (for example a "
+        "testbench, its checkers and test cases from the interface contract). Do not guess their results, do "
+        "not create or change their files, and do not run anything that needs their output. Give no verdict "
+        "now. Stop when the rest needs their results, then answer without calling a tool: what you did, the "
+        "files you made, and what is left for when they finish. If nothing can be done before then, say so "
+        "and stop at once.")
 
 
 def cli_environment(model_id: Optional[str], network: bool) -> str:
@@ -360,9 +396,20 @@ def parse_review(text: str) -> Optional[dict]:
 
 
 def unable_claim(text: str) -> Optional[str]:
-    """The last UNABLE line of a result: what its model says cannot be done here."""
+    """The last UNABLE line's reason, unless it explicitly says nothing is blocked."""
     matches = UNABLE.findall(text or "")
-    return matches[-1].strip()[:1000] if matches else None
+    if not matches:
+        return None
+    claim = matches[-1].strip()
+    # Match the whole declaration, never a prefix: "no credentials" and "none of the
+    # required services are reachable" still describe real limits. Normalize only for
+    # this comparison so genuine reasons keep their wording and punctuation.
+    if claim.casefold().rstrip(".。").strip() in {
+        "none", "no", "null", "false", "n/a", "not applicable", "no blockers", "no blocking issues",
+        "无", "没有", "不适用", "无阻塞", "无阻塞项", "没有阻塞", "没有阻塞项",
+    }:
+        return None
+    return claim[:1000]
 
 
 def blocked_claim(text: str) -> Optional[str]:
