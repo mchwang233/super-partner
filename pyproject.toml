@@ -2,6 +2,8 @@
 name = "super-partner"
 version = "0.1.0"
 description = "Local-first multi-model autonomous task orchestrator"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = [
   "fastapi>=0.115,<0.130",
@@ -14,6 +16,9 @@ dependencies = [
   "keyring>=25,<26",
   "openpyxl>=3.1,<4",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mchwang233/super-partner"
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1", "ruff>=0.8,<1"]
