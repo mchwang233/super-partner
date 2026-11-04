@@ -65,10 +65,15 @@ export function CatalogStatus({ apiBase, benchmarkSource = DEFAULT_BENCHMARK_SOU
     } catch (error) { setError(error instanceof Error ? error.message : "启动同步失败"); }
     finally { setPending(false); }
   }
+  const failed = Object.values(status?.providers ?? {}).some(item => item.public_status === "error")
+    || Object.values(status?.benchmarks?.sources ?? {}).some(item => item.status === "error");
   return <section className="catalog-sync" aria-label="模型目录自动更新">
     <div className="catalog-sync-heading"><div><h3>模型目录自动更新</h3><p>{status ? status.auto_sync ? `每 ${status.interval_hours} 小时检查 · 启动时补查到期更新` : "自动更新已关闭，可手动更新" : "正在读取同步设置…"}</p></div><button onClick={refresh} disabled={pending || status?.running}>{pending || status?.running ? "正在更新…" : "立即更新"}</button></div>
     <p className="catalog-sync-summary" role="status">{status?.running ? "正在获取最新目录，已有模型仍可使用。" : status?.last_finished_at ? `上次检查 ${dateLabel(status.last_finished_at)} · 新增 ${status.added ?? 0} 个模型` : "首次更新完成后，将显示各家模型与同步结果。"}{status?.next_sync_at && <span>下次检查 {dateLabel(status.next_sync_at)}（应用运行期间）</span>}</p>
     {error && <p className="catalog-sync-error" role="alert">{error}</p>}
+    {/* The details matter only when something failed; then they open by themselves. */}
+    <details className="catalog-sync-details" open={failed || undefined}>
+    <summary>各服务商目录与评分同步情况{failed ? " · 有更新失败" : ""}</summary>
     <div className="catalog-providers">{Object.entries(PROVIDER_NAMES).map(([id, name]) => {
       const state = status?.providers?.[id];
       const official = state?.official_status;
@@ -82,5 +87,6 @@ export function CatalogStatus({ apiBase, benchmarkSource = DEFAULT_BENCHMARK_SOU
     })}</div>
     <p className="catalog-source-note">公开规格与参考价格来自 <a href="https://models.dev/" target="_blank" rel="noreferrer">Models.dev 社区目录</a>，可能滞后于厂商发布。OpenAI、Anthropic、Google、DeepSeek 配置密钥后会额外核对官方列表。目录收录不代表当前账户已获调用权限。</p>
     <div className="benchmark-sync-status"><h4>{BENCHMARK_SOURCES[benchmarkSource].name} 评分同步<span>{status?.benchmarks?.sources[benchmarkSource]?.matched_models ?? 0} 个模型已匹配</span></h4><div className="catalog-providers benchmark-providers">{Object.entries(status?.benchmarks?.sources ?? {}).filter(([id]) => id === benchmarkSource).map(([id, state]) => <div className={`catalog-provider ${state.status === "error" ? "has-error" : ""}`} key={id}><b>{state.name}<span>{state.matched_models} 个匹配</span></b><small>{state.status === "ok" ? `已同步 ${state.count} 组成绩` : state.status === "error" ? "更新失败 · 保留上次评分" : "等待同步"}</small>{state.collection_method === "public_page" && <small>公开网页 · 无需密钥 · 综合指数与分项</small>}{state.collection_method === "api" && <small>API · 综合智能、编程、智能体指数</small>}{id === "artificial_analysis" && state.with_details !== undefined && <small>{state.with_details} 组成绩含能力分项</small>}{state.error && <p>{state.error}</p>}<small>来源最新标注日期：{state.latest_published_at ?? "未提供（不等于同步时间）"}</small>{state.last_success_at && <time>同步成功时间 {dateLabel(state.last_success_at)}</time>}{id === "artificial_analysis" && state.collection_method !== "api" && <small><a href="https://artificialanalysis.ai/leaderboards/models" target="_blank" rel="noreferrer">查看公开榜单 ↗</a><br/>可选：配置 SUPER_PARTNER_ARTIFICIAL_ANALYSIS_API_KEY 并重启，通过 API 补充编程、智能体指数。</small>}</div>)}</div><p className="catalog-source-note">与模型目录一起定时更新，也可点“立即更新”。目录收录时间与榜单发布成绩的时间不同；同步成功只说明读取成功。匹配要求服务商与型号一致，不跨快照日期、型号档次或评测版本填分。</p></div>
+    </details>
   </section>;
 }

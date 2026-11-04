@@ -4,11 +4,16 @@ import httpx
 import pytest
 from super_partner import secrets
 from super_partner.catalog import builtin_models
-from super_partner.config import settings
+from super_partner.config import Settings, settings
 from super_partner.db import Database
 from super_partner.executor import Executor
 from super_partner.models import CapabilityScore, ModelProfile
 from super_partner.quota import QuotaTracker
+
+# Tests start from the platform's defaults, not this machine's .env (provider limits, timeouts,
+# feature switches): the same tests must pass on any machine.
+for _name, _value in Settings(_env_file=None):
+    setattr(settings, _name, _value)
 
 
 def scored_models() -> list[ModelProfile]:
@@ -31,7 +36,19 @@ def isolated_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
     monkeypatch.setattr(settings, "workspace_root", tmp_path / "workspaces")
     monkeypatch.setattr(settings, "auto_diagnose", False)
+    monkeypatch.setattr(settings, "problem_naming", False)
+    # The tests of reviews, verification and artifact handoffs check acceptance as it works when on.
+    monkeypatch.setattr(settings, "acceptance", True)
+    # The contract tests use small declared limits to reach them quickly.
+    monkeypatch.setattr(settings, "contract_call_floors", False)
     monkeypatch.setattr(settings, "platform_self_repair", False)
+    monkeypatch.setattr(settings, "skill_reuse_first", False)
+    monkeypatch.setattr(settings, "adaptive_refinement", False)
+    monkeypatch.setattr(settings, "employee_teams", False)
+    monkeypatch.setattr(settings, "direct_task_planning", False)
+    monkeypatch.setattr(settings, "team_reasoning_effort", "")
+    monkeypatch.setattr(settings, "planning_reasoning_effort", "")
+    monkeypatch.setattr(settings, "planning_call_timeout", 0)
 
 
 @pytest.fixture
@@ -84,3 +101,18 @@ def database(tmp_path, monkeypatch):
         supervisor=SupervisorSession(model_id="cli:claude", session_id="lead-1", cwd=str(tmp_path / "lead")),
         plan=TaskPlan(summary="s", nodes=[node])))
     return database
+
+
+@pytest.fixture(autouse=True)
+def own_codex_home(monkeypatch, tmp_path):
+    """Tests never read the user's Codex config (cli_channels.codex_servers), nor put leads'
+    folders in the user's cache (folders.lead_root)."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setattr(settings, "lead_root", tmp_path / "leads")
+
+
+@pytest.fixture(autouse=True)
+def no_preflight(monkeypatch):
+    """The check before a task's first step runs real sandboxes and asks the models; tests of
+    other behaviour leave it out, and tests/test_preflight.py turns it on."""
+    monkeypatch.setattr(settings, "preflight", False)

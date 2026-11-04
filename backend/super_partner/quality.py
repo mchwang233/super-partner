@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .models import ExecutionRun, NodeInput, TaskNode
+from . import skills
+from .models import ArtifactEvidence, ExecutionRun, NodeInput, NodeStatus, TaskNode
 
 # Marks a review request so the offline demo model can answer it with a verdict.
 REVIEW_MARKER = "[[super-partner:review]]"
@@ -21,7 +22,7 @@ MAX_INVENTORY_FILES = 200
 # Relative or absolute paths, or bare file names with an extension, mentioned in a result.
 PATH_MENTION = re.compile(r"/?[\w.-]+(?:/[\w.-]+)+|[\w-]+\.[A-Za-z0-9]{1,8}\b")
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".super-partner"}
-# Explicitly cited verification logs may live in hidden scratch folders. This exception
+# Explicitly cited verification logs may live in build or hidden scratch folders. This exception
 # never grants access to credentials, agent state or repository metadata.
 PRIVATE_DIRS = {".ssh", ".aws", ".azure", ".config", ".kube", ".docker", ".gnupg",
                 ".codex", ".claude", ".agents", ".review", "credentials", "secrets"}
@@ -30,6 +31,7 @@ PRIVATE_SUFFIXES = {".key", ".pem", ".p12", ".pfx", ".keystore", ".db", ".sqlite
 LOG_SUFFIXES = {".log", ".txt", ".out"}
 # A worker's own statement that part of its task cannot be done in this environment.
 UNABLE = re.compile(r"^\s*UNABLE:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+BLOCKED = re.compile(r"^\s*(?:STATUS:\s*)?BLOCKED\s*(?::\s*(.*))?$", re.IGNORECASE | re.MULTILINE)
 UNABLE_RULE = (
     "Be honest about what actually happened. If something this step's own task requires cannot "
     "really be done here (no network access, missing credentials, accounts, permissions, hardware or services), "
@@ -58,6 +60,8 @@ class Verdict:
     cost_usd: float = 0.0
     accounted_cost_usd: float = 0.0
     verified: bool = True
+    blocked: Optional[str] = None
+    artifact_evidence: Optional[ArtifactEvidence] = None
 
 
 # --- what a node is told -------------------------------------------------------------------
@@ -90,6 +94,7 @@ def scope_section(node: TaskNode) -> str:
     lines = []
     if node.files:
         lines.append("Change only these files (create them if they do not exist): " + ", ".join(node.files))
+        lines.append("Write them first, then check them; do not spend your calls on work other steps own.")
     if node.reads:
         lines.append("For reference: " + ", ".join(node.reads))
     lines.append("This is a small work package: those of the files above that exist are attached in full below, as "
@@ -103,10 +108,24 @@ def scope_section(node: TaskNode) -> str:
     return "Your work package.\n" + "\n".join(lines)
 
 
+def folders_section(node: TaskNode) -> str:
+    """Where a step that owns folders may write: other steps work in other folders at the same time."""
+    return ("Your folders: " + ", ".join(node.folders) + "\nOther steps work in other folders at the same time. "
+            "Create and change files only inside yours, including your tests, logs and build output; read "
+            "anything else you need, but do not change it.")
+
+
 def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, list[NodeInput]]:
     """The node's prompt and a record of what it received from each upstream node."""
     by_id = {item.id: item for item in run.plan.nodes}
     sections, inputs = [f"Task: {node.instructions}"], []
+    from .team import context as employee_context
+    if shared := employee_context(node, run):
+        sections.append(shared)
+    if path := run.plan.part_path(node.part_id):
+        # Only where the task sits; its instructions are complete on their own.
+        sections.append("Part of: " + " › ".join(part.title for part in path)
+                        + (f" (goal: {path[-1].goal})" if path[-1].goal else ""))
     if run.background:
         # A requirement change: the working directory already holds the earlier task's results.
         sections.append("Context: this task changes an earlier task. Its results are already in the working "
@@ -114,14 +133,21 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
                         + run.background[:BACKGROUND_CHARS])
     if node.acceptance_criteria:
         sections.append(f"Acceptance criteria (your result will be checked against these):\n{node.acceptance_criteria}")
+    from .contracts import prompt as contract_prompt
+    if contract := contract_prompt(node):
+        sections.append(contract)
     scoped = bool(node.files or node.reads)
     if scoped:
         sections.append(scope_section(node))
+    elif node.folders:
+        sections.append(folders_section(node))
     if node.feedback:
         previous = f"\n\nYour previous result:\n{node.result[:limit]}" if node.result else ""
         sections.append(f"A previous attempt was not accepted. Fix these problems:\n{node.feedback}{previous}")
     if notes := attempt_notes(node):
         sections.append(notes)
+    if node.head_start and node.head_start_generation == node.generation and not node.attempts:
+        sections.append(HEAD_START_DONE + node.head_start[:HEAD_START_CHARS])
     if clarifications := _clarifications(run):
         sections.append(clarifications)
     upstream = []
@@ -146,12 +172,69 @@ def node_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> tuple[str, lis
     if others:
         # So a step knows what is someone else's job, and neither does it nor reports it undone.
         sections.append("Other steps of this task, not yours: " + "; ".join(others[:MAX_OTHER_STEPS]))
+    if note := cli_environment(node.model_id, run.allow_network):
+        # API models are told this in their tools' instructions (agent.AGENT_INSTRUCTIONS).
+        sections.append(note)
+    # How to use the tools it names, as this machine's skills and the general ones say (skills.py).
+    if known := skills.section(skills.for_step("\n".join([node.title, node.instructions, node.check or "",
+                                                           node.acceptance_criteria or ""]))):
+        sections.append(known)
     sections.append(UNABLE_RULE)
     if node.verifies:
         sections.append(_verdict_rule(node, by_id))
     elif scoped:
         sections.append(SCOPED_ANSWER)
     return "\n\n".join(sections), inputs
+
+
+HEAD_START_CHARS = 4000
+HEAD_START_DONE = (
+    "Before the steps you depend on finished, you already started this task (its files are in the working "
+    "directory). Check that work against their actual results below, fix what does not match, and do not "
+    "redo what is finished. What you reported then:\n")
+
+
+def head_start_prompt(node: TaskNode, run: ExecutionRun, limit: int) -> str:
+    """The prompt for starting a step early, while steps it depends on are still at work
+    (executor._head_start): only what does not need their results, and no verdict yet."""
+    prompt, _ = node_prompt(node, run, limit)
+    waiting = [item for item in run.plan.nodes if item.id in node.dependencies and item.status != NodeStatus.SUCCEEDED]
+    listed = "\n".join(f"- {item.title}" + (f": it will provide {item.provides}" if item.provides else "")
+                       for item in waiting)
+    return prompt + "\n\n" + (
+        "HEAD START. Steps your task depends on are not finished yet:\n" + listed + "\n"
+        "Do now only the part of your task that does not need their results: read what you need, set up your "
+        "own files, and build what the agreed interface and the descriptions above allow (for example a "
+        "testbench, its checkers and test cases from the interface contract). Do not guess their results, do "
+        "not create or change their files, and do not run anything that needs their output. Give no verdict "
+        "now. Stop when the rest needs their results, then answer without calling a tool: what you did, the "
+        "files you made, and what is left for when they finish. If nothing can be done before then, say so "
+        "and stop at once.")
+
+
+def cli_environment(model_id: Optional[str], network: bool) -> str:
+    """Where a membership CLI does a step, as it runs there, so it does not take itself for
+    being on an open machine. Empty for other models; the same for every CLI."""
+    if not model_id or not model_id.startswith("cli:"):
+        return ""
+    lines = [
+        ("Where you are: Super Partner runs you in your own sandbox. You can write only the working "
+         "directory and $TMPDIR (put temporary files there: the shared /tmp may be unavailable); the rest of "
+         "the system is read-only, and your home folder, other tasks' folders and Super Partner's own data "
+         "may not be readable at all: do not look for files there. You are an ordinary user, not root: sudo, "
+         "system packages and system files are out of reach. The tools installed on this machine for every "
+         "step are on PATH."),
+        ("This task allows the internet: commands may download packages (into the working directory) and "
+         "call external services." if network else "Commands have no network access."),
+    ]
+    # The same for every CLI: a step can be handed from one to another with its prompt.
+    lines.append("Deleting files in the working directory is allowed: name them (rm -f a.o b.o, rm -rf build) "
+                 "or use find (find . -name '*.o' -delete). Codex refuses rm with wildcards or $(...) as "
+                 "dangerous. If your tool still refuses a command, do not retry it the same way: do without it "
+                 "if you can, and say so in your answer.")
+    lines.append("When something the task needs is missing or blocked here, do not work around it with "
+                 "stand-ins or fake results: say exactly what is missing.")
+    return "\n".join(lines)
 
 
 def _verdict_rule(node: TaskNode, by_id: dict) -> str:
@@ -182,10 +265,11 @@ def attempt_notes(node: TaskNode) -> str:
     def files(*tools):
         return list(dict.fromkeys(call.detail.split(" (", 1)[0] for call in attempt.tool_calls
                                   if call.tool in tools and call.ok))
-    changed = files("write_file", "edit_file")
-    read = [path for path in files("read_file") if path not in changed]
-    commands = [f"{'ok' if call.ok else 'failed'}: {call.detail}" for call in attempt.tool_calls
-                if call.tool == "run_command"][-MAX_NOTED_COMMANDS:]
+    # Attempts recorded before the tools followed Claude Code's used the older names.
+    changed = files("Write", "Edit", "MultiEdit", "write_file", "edit_file")
+    read = [path for path in files("Read", "read_file") if path not in changed]
+    commands = [f"{'ok' if call.ok is True else call.status}: {call.detail}" for call in attempt.tool_calls
+                if call.tool in {"Bash", "run_command", "command"}][-MAX_NOTED_COMMANDS:]
     lines = [(f"What the previous attempt did ({attempt.model_id}, {attempt.turns} turns), which ended: "
               f"{(attempt.reason or attempt.outcome)[:300]}")]
     if changed:
@@ -201,8 +285,15 @@ def attempt_notes(node: TaskNode) -> str:
 def continue_prompt(node: TaskNode, run: ExecutionRun) -> str:
     """The message that continues a step's conversation with its model in a new attempt."""
     attempt = node.attempts[-1]
+    if run.plan.employees:
+        prompt, _ = node_prompt(node, run, SCOPED_HANDOFF_CHARS)
+        return ("Continue your saved work. Read the current deliveries and files below; delegated work is now "
+                "available only when its status is succeeded. Inspect changed files before editing.\n" + prompt)
+    from .contracts import prompt as contract_prompt
     sections = [(f"This step continues in a new attempt. Your previous attempt ended "
                  f"({attempt.outcome}): {(attempt.reason or '')[:500]}")]
+    if contract := contract_prompt(node):
+        sections.append(contract)
     if node.feedback:
         sections.append(f"Fix these problems:\n{node.feedback}")
     if clarifications := _clarifications(run):
@@ -238,6 +329,7 @@ def retry_feedback(previous: Optional[str], problem: str) -> str:
 # --- checking a result ---------------------------------------------------------------------
 
 def review_prompt(node: TaskNode, result: str, changed: list[str], diff: str, summarize: bool) -> str:
+    from .contracts import prompt as contract_prompt
     criteria = node.acceptance_criteria or "The result fully and correctly completes the task."
     files = ", ".join(changed[:MAX_LISTED_FILES]) or "(none)"
     summary_rule = (
@@ -253,18 +345,20 @@ def review_prompt(node: TaskNode, result: str, changed: list[str], diff: str, su
     return (
         f"{REVIEW_MARKER}\nYou are reviewing another model's work. Do not modify any files.\n\n"
         f"Task:\n{node.instructions}\n\nAcceptance criteria:\n{criteria}\n\n{rework}"
-        f"Result:\n{result}\n\nFiles changed: {files}\n"
+        + contract_prompt(node) + "\n"
+        + f"Result:\n{result}\n\nFiles changed: {files}\n"
         + (
             "\nEvidence from the workspace (diff or contents of the relevant files, then a listing of the "
             "files that exist). Files this attempt did not change may come from earlier attempts; judge "
             "them by these contents and the listing, not by the list of changed files. Excerpts may "
             "be clipped: omitted content is not evidence that an implementation or check is missing. "
-            "When read_file is available, inspect the relevant files before deciding; use tail=true "
-            f"to read the final verification output in a long log:\n{diff}\n"
+            "When Read is available, inspect the relevant files before deciding; Read with a negative "
+            f"offset (such as -50) reads the final verification output of a long log:\n{diff}\n"
             if diff else ""
         )
         + '\nReply with JSON only: {"passed": true or false, "reason": "one or two sentences", '
         '"fix": "what to change if not passed, else empty", '
+        '"blocked": "empty, or the missing prerequisite evidence that blocks this step", '
         '"unable": "empty, or what the task required that did not actually happen because of a limit '
         'outside the work, why, and what would make it possible"}.'
         + summary_rule
@@ -294,15 +388,41 @@ def parse_review(text: str) -> Optional[dict]:
         payload = json.loads(text[start:end + 1])
     except json.JSONDecodeError:
         return None
+    if isinstance(payload, dict) and payload.get("status") == "blocked":
+        payload = {**payload, "passed": False, "blocked": str(payload.get("reason") or "missing prerequisite evidence")}
     if not isinstance(payload, dict) or not isinstance(payload.get("passed"), bool):
         return None
     return payload
 
 
 def unable_claim(text: str) -> Optional[str]:
-    """The last UNABLE line of a result: what its model says cannot be done here."""
+    """The last UNABLE line's reason, unless it explicitly says nothing is blocked."""
     matches = UNABLE.findall(text or "")
-    return matches[-1].strip()[:1000] if matches else None
+    if not matches:
+        return None
+    claim = matches[-1].strip()
+    # Match the whole declaration, never a prefix: "no credentials" and "none of the
+    # required services are reachable" still describe real limits. Normalize only for
+    # this comparison so genuine reasons keep their wording and punctuation.
+    if claim.casefold().rstrip(".。").strip() in {
+        "none", "no", "null", "false", "n/a", "not applicable", "no blockers", "no blocking issues",
+        "无", "没有", "不适用", "无阻塞", "无阻塞项", "没有阻塞", "没有阻塞项",
+    }:
+        return None
+    return claim[:1000]
+
+
+def blocked_claim(text: str) -> Optional[str]:
+    matches = BLOCKED.findall(text or "")
+    if matches:
+        return matches[-1].strip()[:1000] or "步骤报告阻塞；详见本次结果和工具日志。"
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(payload, dict) and str(payload.get("status", "")).lower() == "blocked":
+        return str(payload.get("reason") or "步骤报告阻塞。")[:1000]
+    return None
 
 
 def verification_verdict(text: str) -> Optional[tuple[bool, str]]:
@@ -367,10 +487,41 @@ def _tracked(root: Path, files: list[str]) -> set[str]:
     return {name for name in output.split("\0") if name}
 
 
+def private(name: str) -> bool:
+    """Whether a file or folder of this name may hold credentials or agent state."""
+    lower = name.lower()
+    return (lower in PRIVATE_DIRS or lower in PRIVATE_NAMES
+            or lower.startswith((".env", "id_rsa.", "id_dsa.", "id_ecdsa.", "id_ed25519."))
+            or Path(lower).stem in {"credentials", "secrets", "token", "tokens"}
+            and Path(lower).suffix in {".json", ".yaml", ".yml", ".toml", ".ini", ".txt", ".log"}
+            or Path(lower).suffix in PRIVATE_SUFFIXES)
+
+
+# Folders a reviewer's commands may not need to look into for private files: too big to walk.
+UNWALKED = {"node_modules", ".venv", "venv", "__pycache__"}
+
+
+def private_paths(root: Path, limit: int = 2000) -> tuple[list[Path], list[Path]]:
+    """The private folders and files in ``root`` (``private``, and a repository's config, which
+    can hold tokens), at most ``limit``: what a reviewer's commands must not see."""
+    folders, files = [], []
+    for folder, dirs, names in os.walk(root):
+        here = Path(folder)
+        hidden = [name for name in dirs if private(name)]
+        # A link cannot be mounted over; what it points to inside the workspace is hidden itself.
+        folders += [here / name for name in hidden if not (here / name).is_symlink()]
+        dirs[:] = [name for name in dirs if name not in UNWALKED and name not in hidden]
+        files += [here / name for name in names if (private(name) or (here.name == ".git" and name == "config"))
+                  and not (here / name).is_symlink()]
+        if len(folders) + len(files) >= limit:
+            break
+    return folders, files
+
+
 def review_path(root: Path, name: str, *, allow_hidden_log: bool = False) -> Optional[Path]:
     """One access policy for inline evidence and API review tools, including symlink targets.
 
-    Only an explicitly referenced log may bypass the normal hidden-folder exclusion.
+    Only an explicitly referenced log may bypass the build/hidden-folder exclusion.
     Both its written path and resolved target must be safe and inside the workspace.
     """
     try:
@@ -381,16 +532,12 @@ def review_path(root: Path, name: str, *, allow_hidden_log: bool = False) -> Opt
             parts = relative.parts
             for i, part in enumerate(parts):
                 lower = part.lower()
-                stem = Path(lower).stem
-                if (lower in SKIP_DIRS or lower in PRIVATE_DIRS or lower in PRIVATE_NAMES
-                        or lower.startswith((".env", "id_rsa.", "id_dsa.", "id_ecdsa.", "id_ed25519."))
-                        or stem in {"credentials", "secrets", "token", "tokens"}
-                        and Path(lower).suffix in {".json", ".yaml", ".yml", ".toml", ".ini", ".txt", ".log"}
-                        or Path(lower).suffix in PRIVATE_SUFFIXES):
+                referenced_log = (allow_hidden_log and i < len(parts) - 1
+                                  and relative.suffix.lower() in LOG_SUFFIXES)
+                if lower in SKIP_DIRS and not (lower == "build" and referenced_log) or private(part):
                     return None
                 if part.startswith(".") and not (
-                    allow_hidden_log and i < len(parts) - 1 and part not in {".", ".."}
-                    and relative.suffix.lower() in LOG_SUFFIXES
+                    referenced_log and part not in {".", ".."}
                 ):
                     return None
         return resolved
@@ -402,7 +549,7 @@ def _excerpt(text: str, limit: int) -> str:
     """Keep both ends: verification summaries are usually at the end of a file."""
     if len(text) <= limit:
         return text
-    note = "\n[... clipped; read_file can inspect omitted content ...]\n"
+    note = "\n[... clipped; Read can inspect omitted content ...]\n"
     if limit <= len(note):
         return note[:max(0, limit)]
     head = (limit - len(note) + 1) // 2

@@ -56,15 +56,19 @@ def _tool_summary(attempt, last: bool) -> str:
     themselves, so a diagnosis can see where the turns went."""
     counts: dict[str, list[int]] = {}
     for call in attempt.tool_calls:
-        tally = counts.setdefault(call.tool, [0, 0])
+        tally = counts.setdefault(call.tool, [0, 0, 0])
         tally[0] += 1
-        tally[1] += not call.ok
-    spread = ", ".join(f"{tool}×{n}" + (f" ({bad} failed)" if bad else "") for tool, (n, bad) in counts.items())
+        tally[1] += call.ok is False
+        tally[2] += call.ok is None
+    spread = ", ".join(f"{tool}×{n}" + (f" ({bad} failed)" if bad else "")
+                       + (f" ({unknown} unknown/incomplete)" if unknown else "")
+                       for tool, (n, bad, unknown) in counts.items())
     head = f"  tool calls: {attempt.turns} turns{' (ran out of turns)' if attempt.turn_limit else ''}: {spread}"
     if not last:
         return head
-    calls = [f"    t{call.turn} {call.tool} {call.detail}{'' if call.ok else '  [failed]'}" for call in attempt.tool_calls[-MAX_LISTED_CALLS:]]
-    return "\n".join([head, *calls])
+    calls = [f"    t{call.turn} {call.tool} {call.detail}  [{call.status}]" for call in attempt.tool_calls[-MAX_LISTED_CALLS:]]
+    trace = [f"    every call with its whole output, one JSON line each: {attempt.trace}"] if attempt.trace else []
+    return "\n".join([head, *calls, *trace])
 
 
 def _history(run: ExecutionRun, events: list[str]) -> list[str]:
@@ -95,13 +99,20 @@ def _history(run: ExecutionRun, events: list[str]) -> list[str]:
             )
             if attempt.tool_calls:
                 lines.append(_tool_summary(attempt, last=number == len(node.attempts)))
+            if attempt.result is not None:
+                lines.append(f"attempt {number} result (source={attempt.result_source or 'unknown'}):\n"
+                             + attempt.result[:MAX_RESULT_CHARS])
+            else:
+                lines.append(f"attempt {number} result: unknown (not recorded; do not substitute an older answer)")
+            if attempt.trace:
+                lines.append(f"attempt {number} evidence trace: {attempt.trace}")
         if node.feedback:
             lines.append(f"Pending feedback: {node.feedback}")
         if node.changed_files:
             lines.append(f"Changed files: {', '.join(node.changed_files[:40])}")
-        if node.result:
+        if node.result and not any(a.result == node.result for a in node.attempts):
             clipped = node.result[:MAX_RESULT_CHARS]
-            lines.append(f"Last result:\n{clipped}" + ("\n[...]" if len(node.result) > len(clipped) else ""))
+            lines.append(f"Historical node output (attempt/source unknown; not evidence of the latest attempt):\n{clipped}" + ("\n[...]" if len(node.result) > len(clipped) else ""))
     if events:
         lines.append("\nRecent events:\n" + "\n".join(events[-40:]))
     replied = sorted((d for d in run.diagnoses if d.messages), key=lambda d: d.messages[-1].created_at)
@@ -153,9 +164,11 @@ def prompt(run: ExecutionRun, node_id: Optional[str], workspace: str, events: li
 
 
 def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str, ports: list[int], events: list[str],
-                  shared_repairs: tuple | list = (), platform: str = "", brief: str = "") -> str:
+                  shared_repairs: tuple | list = (), platform: str = "", brief: str = "",
+                  history: tuple | list = ()) -> str:
     """Find and repair what blocks a step from outside the task, or say what should happen.
-    ``brief`` is what the task's lead asked to be repaired."""
+    ``brief`` is what the task's lead asked to be repaired; ``history`` the same kind of problem
+    in earlier tasks (retrospect.similar)."""
     port_note = f"local ports {', '.join(map(str, ports))} only" if ports else "nothing"
     last = node.attempts[-1] if node.attempts else None
     return "\n".join([
@@ -207,7 +220,13 @@ def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str,
         f"- npm packages: `npm install --prefix {tools}/node ...`, then symlink their binaries into {tools}/bin;",
         (f"- environment variables, and local TCP ports (such as a license server) that sandboxed "
          f"commands must reach, go in {tools}/sandbox.json: "
-         '`{"env": {"NAME": "value"}, "host_ports": [26585]}`; keep what is already there.'),
+         '`{"env": {"NAME": "value"}, "host_ports": [26585]}`; keep what is already there. '
+         "For a FlexLM license server list only lmgrd's port: the ports of its vendor daemons "
+         "(snpslmd, ...) are found and bridged automatically, from lmgrd's process tree or, when "
+         "lmgrd runs as another user, by tracing `lmutil lmstat` with strace (both must be on the "
+         "host's PATH or next to lmgrd). Only if that fails, pin the vendor daemon's port in the "
+         "license file (`VENDOR snpslmd PORT=27021`), restart lmgrd and add that port too, or ask "
+         "the user to."),
         ("The folder is mounted read-only into the sandbox at the same path, so symlinks to elsewhere "
          "under the home folder do not work there; copy or install into the folder instead."),
         ("Then check the repair the way the step will use it, e.g. run the tool by its name with PATH "
@@ -220,6 +239,10 @@ def repair_prompt(run: ExecutionRun, node: TaskNode, workspace: str, tools: str,
         *[f"- {item['id']} scope={item.get('scope', 'environment')} status={item.get('status', 'fixed')}: "
           f"files={item.get('files', [])}\n{item.get('report', '')[:2000]}\n{item.get('error') or ''}"
           for item in shared_repairs],
+        *(["", "# The same kind of problem in earlier tasks",
+           ("It has happened before. Find the cause that keeps bringing it back, not only this "
+            "occurrence; if an earlier repair did not hold, say why and repair it for good:"),
+           *history] if history else []),
         "",
         *_history(run, events),
         platform_instructions(platform),

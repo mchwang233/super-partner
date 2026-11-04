@@ -1,16 +1,18 @@
 import React, { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
-import { MarkdownView } from "./markdown";
+import { Markdown as MarkdownView } from "./markdown";
 import { Composer, UserMessage, when, type Diagnosis, type SendReply } from "./diagnosis";
+import type { EngineerJob, EngineerMessage } from "./engineer";
+import { ENGINEER_WAITING, EngineerEntry, JoinEngineer, MENTION, tellEngineer, useEngineerJobs, type Act } from "./lead-engineer";
 
 export type Decision = {
   id: string; node_id?: string | null; event: string; action: string; reason?: string;
-  instructions?: string | null; model_id?: string | null; targets?: string[]; created_at: string;
+  instructions?: string | null; model_id?: string | null; targets?: string[]; engineer_job_id?: string | null; created_at: string;
 };
-export type LeadMessage = { id: string; role: "user" | "lead"; text: string; status: string; created_at: string };
+export type LeadMessage = { id: string; role: "user" | "lead"; text: string; status: string; created_at: string; engineer_job_id?: string | null };
 export type LeadThinking = { event: string; node_id?: string | null; started_at: string };
 type Repair = Diagnosis & { decision_id?: string | null };
 type RunLike = {
-  status: string; diagnoses?: Repair[]; waiting_diagnosis_id?: string | null;
+  id: string; status: string; updated_at?: string; diagnoses?: Repair[]; waiting_diagnosis_id?: string | null; engineer_job_id?: string | null;
   supervisor?: { model_id?: string | null; calls?: number } | null;
   decisions?: Decision[]; lead_messages?: LeadMessage[]; lead_thinking?: LeadThinking | null;
   plan: { nodes: { id: string; title: string }[] };
@@ -20,13 +22,13 @@ export type AskLead = (text: string) => Promise<string | null>;
 
 const EVENTS: Record<string, string> = {
   attempt_failed: "尝试失败", verify_failed: "验证没通过", user_answer: "你的回答", all_done: "全部步骤完成后检查",
-  repair_done: "修复结束后", overrun: "超出预计轮数",
+  repair_done: "修复结束后", engineer_done: "平台工程师结束后", overrun: "超出预计轮数",
 };
 // What the lead is weighing while it thinks, by event.
 const THINKING: Record<string, string> = {
   attempt_failed: "尝试失败了，正在判断怎么处理", verify_failed: "验证没通过，正在判断是否返工",
   user_answer: "正在根据你的回答决定下一步", all_done: "全部步骤已完成，正在对照需求检查整体结果",
-  repair_done: "修复已结束，正在核对修复结果", overrun: "已超出预计轮数，正在判断是否继续",
+  repair_done: "修复已结束，正在核对修复结果", engineer_done: "平台工程师的工作已结束，正在决定这一步怎么办", overrun: "已超出预计轮数，正在判断是否继续",
 };
 const REPAIR_LABELS: Record<string, { label: string; tone: string }> = {
   fixed: { label: "已修复", tone: "ok" }, retry: { label: "未发现环境问题", tone: "ok" },
@@ -51,6 +53,7 @@ function actionLabel(item: Decision, title: (id: string) => string, model: (id?:
   const labels: Record<string, string> = {
     retry: "按要求重试", switch_model: `换成 ${model(item.model_id)}`, accept: "接受结果", unable: "判定无法完成",
     ask_user: "问你", repair_environment: "修复环境", repair_platform: "修复 Super Partner",
+    request_component: "请平台工程师添加组件",
     rework: `返工 ${(item.targets ?? []).map(title).join("、")}`, fallback: "交给诊断处理",
     replan: "调整计划", done: "确认完成",
   };
@@ -66,18 +69,28 @@ export function hasLead(run: RunLike) {
 type Entry =
   | { kind: "decision"; at: string; item: Decision }
   | { kind: "question"; at: string; item: Diagnosis }
-  | { kind: "message"; at: string; item: LeadMessage };
+  | { kind: "message"; at: string; item: LeadMessage }
+  | { kind: "engineer"; at: string; job: EngineerJob; message: EngineerMessage; first: boolean; last: boolean };
 
-/** The task's lead: everything it decided and why, its questions to you, and a box to write to it. */
-export function LeadPanel({ run, models, onReply, onAsk }: { run: RunLike; models: ModelLike[]; onReply: SendReply; onAsk: AskLead }) {
-  const [open, setOpen] = useState(true);
+/** The task's conversation: its lead (everything it decided and why, its questions to you) and,
+ * once brought in, the platform engineer (its plans, questions and progress); a box to write to them. */
+export function LeadPanel({ apiBase, run, models, onReply, onAsk, onOpenEngineer }: {
+  apiBase: string; run: RunLike; models: ModelLike[]; onReply: SendReply; onAsk: AskLead; onOpenEngineer?: (jobId: string) => void;
+}) {
+  const [joining, setJoining] = useState(false);
+  const signal = `${run.status}|${run.updated_at ?? ""}|${run.lead_messages?.length ?? 0}|${run.decisions?.length ?? 0}|${run.engineer_job_id ?? ""}`;
+  const { jobs, act } = useEngineerJobs(apiBase, run.id, signal, ["queued", "running", "paused"].includes(run.status));
   const model = (id?: string | null) => models.find(m => m.id === id)?.display_name ?? id ?? "—";
   const title = (id: string) => run.plan.nodes.find(n => n.id === id)?.title ?? id;
   const entries: Entry[] = [
     ...(run.decisions ?? []).filter(item => item.action !== "ask_user").map(item => ({ kind: "decision" as const, at: item.created_at, item })),
     ...(run.diagnoses ?? []).filter(item => item.trigger === "lead").map(item => ({ kind: "question" as const, at: item.created_at, item })),
     ...(run.lead_messages ?? []).map(item => ({ kind: "message" as const, at: item.created_at, item })),
+    ...jobs.flatMap(job => (job.messages ?? []).map((message, index, all) => ({
+      kind: "engineer" as const, at: message.created_at, job, message, first: index === 0, last: index === all.length - 1 }))),
   ].sort((a, b) => a.at.localeCompare(b.at));
+  const engineerWaiting = jobs.some(job => ENGINEER_WAITING.has(job.status));
+  const send = (text: string) => MENTION.test(text) ? tellEngineer(text, run.id, jobs, act) : onAsk(text);
   const answering = (run.lead_messages ?? []).some(item => item.status === "pending");
   const repairIds = leadRepairIds(run.diagnoses);
   const repairs = (run.diagnoses ?? []).filter(item => repairIds.has(item.id));
@@ -86,36 +99,41 @@ export function LeadPanel({ run, models, onReply, onAsk }: { run: RunLike; model
   const thinking = run.lead_thinking;
   const decided = (run.decisions ?? []).length;
   const status = waiting || repairs.some(item => item.id === run.waiting_diagnosis_id) ? { label: "等你回复", tone: "warn" }
+    : engineerWaiting ? { label: "平台工程师等你", tone: "warn" }
     : thinking ? { label: "判断中", tone: "busy" } : repairing ? { label: "修复中", tone: "busy" }
     : answering ? { label: "思考中", tone: "busy" }
     : { label: decided ? `已决策 ${decided} 次` : "跟进中", tone: "ok" };
   return <section className={`diagnosis-card dx-panel lead-panel${waiting ? " waiting" : ""}`} aria-label="负责人">
     <div className="diagnosis-head">
-      <b>负责人</b>
-      <span className="lead-model">{model(run.supervisor?.model_id)}</span>
+      <span className="lead-who"><span className="dx-avatar" aria-hidden="true">🧭</span><b>负责人</b><span className="lead-model">{model(run.supervisor?.model_id)}</span></span>
+      {jobs.length > 0 && <span className="lead-who engineer" title="平台工程师在这个对话里"><span className="dx-avatar engineer-avatar" aria-hidden="true">🛠</span><b>平台工程师</b></span>}
       <span className={`dx-chip ${status.tone}`}>{status.tone === "busy" && <i className="pulse" aria-hidden="true" />}{status.label}</span>
-      <button type="button" className="ghost diagnosis-fold" onClick={() => setOpen(o => !o)} aria-expanded={open}>{open ? "收起" : "展开"}</button>
+      {!joining && <button type="button" className="ghost lead-invite" onClick={() => setJoining(true)}>拉平台工程师进来</button>}
     </div>
-    {open && <div className="dx-thread">
-      <p className="lead-intro">规划这个任务的模型，会全程跟进：步骤失败、验证没通过时由它决定怎么办，并写明理由。需要你决定的事它会在这里问你；你也可以随时给它留言。</p>
+    <div className="dx-thread">
+      {joining && <JoinEngineer runId={run.id} act={act} onDone={() => setJoining(false)} />}
       {entries.map(entry => entry.kind === "decision"
         ? <DecisionMessage key={entry.item.id} item={entry.item} label={actionLabel(entry.item, title, model)} step={entry.item.node_id ? title(entry.item.node_id) : undefined}
             repairs={repairs.filter(repair => rootDecision(repair, repairs) === entry.item.id)}
-            run={run} model={model} onReply={onReply} />
+            run={run} model={model} onReply={onReply} onOpenEngineer={onOpenEngineer} />
         : entry.kind === "question"
           ? <QuestionMessage key={entry.item.id} item={entry.item} step={entry.item.node_id ? title(entry.item.node_id) : undefined}
               waiting={entry.item.id === waiting?.id} onReply={onReply} />
-          : <ChatMessage key={entry.item.id} item={entry.item} />)}
+          : entry.kind === "engineer"
+            ? <EngineerEntry key={`${entry.job.id}-${entry.at}-${entry.first}`} job={entry.job} message={entry.message} first={entry.first}
+                last={entry.last} act={act} onOpenEngineer={onOpenEngineer} />
+            : <ChatMessage key={entry.item.id} item={entry.item} />)}
       {thinking && <ThinkingMessage thinking={thinking} step={thinking.node_id ? title(thinking.node_id) : undefined} />}
-      {!waiting && <AskBox disabled={answering} onAsk={onAsk} />}
-    </div>}
+      {!waiting && <AskBox disabled={answering} onAsk={send} engineer={jobs.length > 0} />}
+    </div>
   </section>;
 }
 
-function LeadMeta({ note, at }: { note: string; at: string }) {
+function LeadMeta({ note, at, tag }: { note: string; at: string; tag?: React.ReactNode }) {
   return <div className="dx-meta">
     <span className="dx-avatar" aria-hidden="true">🧭</span>
     <b>负责人</b>
+    {tag}
     <small>{note} · {when(at)}</small>
   </div>;
 }
@@ -151,14 +169,20 @@ function ThinkingMessage({ thinking, step }: { thinking: LeadThinking; step?: st
   </article>;
 }
 
-function DecisionMessage({ item, label, step, repairs, run, model, onReply }: {
+function DecisionMessage({ item, label, step, repairs, run, model, onReply, onOpenEngineer }: {
   item: Decision; label: string; step?: string; repairs: Repair[]; run: RunLike;
-  model: (id?: string | null) => string; onReply: SendReply;
+  model: (id?: string | null) => string; onReply: SendReply; onOpenEngineer?: (jobId: string) => void;
 }) {
   return <article className="dx-msg dx-ai lead-decision">
-    <LeadMeta note={[EVENTS[item.event] ?? item.event, step].filter(Boolean).join(" · ")} at={item.created_at} />
-    <p className="lead-verdict"><span className={`dx-chip ${TONES[item.action] ?? "ok"}`}>{label}</span>{item.reason}</p>
+    <LeadMeta note={[EVENTS[item.event] ?? item.event, step].filter(Boolean).join(" · ")} at={item.created_at}
+      tag={<span className={`dx-chip ${TONES[item.action] ?? "ok"}`}>{label}</span>} />
+    {item.reason && <p className="lead-verdict">{item.reason}</p>}
     {item.instructions && <details className="lead-instructions"><summary>具体要求</summary><p>{item.instructions}</p></details>}
+    {item.engineer_job_id && <div className="lead-repair lead-engineer">
+      <b>平台工程师</b>
+      <span>{run.engineer_job_id === item.engineer_job_id ? "任务在等这个组件：先写方案给你批准，改好后由你确认生效。" : item.action === "request_component" ? "这项工作已结束，结果已交回负责人。" : "负责人顺带请平台工程师处理，进度见下面的对话。"}</span>
+      {onOpenEngineer && <button type="button" className="ghost" onClick={() => onOpenEngineer(item.engineer_job_id!)}>查看方案和进度</button>}
+    </div>}
     {repairs.map(repair => <RepairProgress key={repair.id} repair={repair} model={model(repair.model_id)}
       waiting={run.waiting_diagnosis_id === repair.id} onReply={onReply} />)}
   </article>;
@@ -209,7 +233,7 @@ function ChatMessage({ item }: { item: LeadMessage }) {
   </article>;
 }
 
-function AskBox({ disabled, onAsk }: { disabled: boolean; onAsk: AskLead }) {
+function AskBox({ disabled, onAsk, engineer }: { disabled: boolean; onAsk: AskLead; engineer: boolean }) {
   const [text, setText] = useState(""), [busy, setBusy] = useState(false), [error, setError] = useState("");
   const form = useRef<HTMLFormElement>(null), box = useRef<HTMLTextAreaElement>(null);
   useEffect(() => { const el = box.current; if (el) { el.style.height = "auto"; el.style.height = `${Math.min(el.scrollHeight, 200)}px`; } }, [text]);
@@ -229,7 +253,7 @@ function AskBox({ disabled, onAsk }: { disabled: boolean; onAsk: AskLead }) {
       <div className="dx-input">
         <textarea ref={box} aria-label="给负责人的消息" rows={1} maxLength={6000} value={text}
           onChange={event => setText(event.target.value)} onKeyDown={keys}
-          placeholder="问它进展、为什么这样决定，或告诉它你的要求" />
+          placeholder={engineer ? "问负责人进展，或用「@平台工程师」直接对平台工程师说" : "问它进展、为什么这样决定，或告诉它你的要求；「@平台工程师」可以把平台工程师拉进来"} />
         <div className="dx-input-bar">
           <small className="dx-hint">{disabled ? "负责人正在回复上一条消息…" : "它记得这个任务从规划起的全部经过 · Ctrl+Enter 发送"}</small>
           <button type="submit" className="primary" disabled={!text.trim()}>{busy ? "发送中…" : "发送"}</button>

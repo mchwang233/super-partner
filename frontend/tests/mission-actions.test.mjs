@@ -5,6 +5,51 @@ import { MessageChannel } from "node:worker_threads";
 import { JSDOM } from "jsdom";
 import { build } from "vite";
 
+test("employee page groups assignments and shows delegation", async t => {
+  const run = mission("team-task", "running");
+  run.plan.team_brief = "保持公开接口；验证员工独立验收";
+  run.plan.employees = [
+    { id: "builder", name: "开发员工", role: "实现模块", model_id: "test:build", capabilities: ["coding"], skills: ["parser-guide"] },
+    { id: "tester", name: "验证员工", role: "检查边界条件", model_id: "test:verify", capabilities: ["research"], skills: [] },
+  ];
+  run.plan.nodes = [
+    { id: "parent", title: "完成解析模块", employee_id: "builder", model_id: "test:build", status: "pending", dependencies: ["child"], estimated_cost_usd: 0 },
+    { id: "child", title: "检查解析边界", employee_id: "tester", model_id: "test:verify", status: "running", delegation_parent_id: "parent", estimated_cost_usd: 0 },
+  ];
+  const { document, button, click } = await setup(t, [run], [], { openComposer: false });
+  await click(button("员工"));
+  const panel = document.querySelector('[aria-label="项目员工"]');
+  assert.ok(panel);
+  const builder = panel.querySelector('[data-employee="builder"]');
+  const tester = panel.querySelector('[data-employee="tester"]');
+  assert.match(builder.textContent, /完成解析模块/);
+  assert.match(builder.textContent, /parser-guide/);
+  assert.match(builder.textContent, /等待子任务/);
+  assert.match(tester.textContent, /检查解析边界/);
+  assert.match(tester.textContent, /开发员工.*委派/);
+  assert.match(panel.textContent, /test:build/);
+  assert.match(panel.textContent, /test:verify/);
+  assert.match(panel.textContent, /保持公开接口/);
+  await click(button("检查解析边界", tester));
+  assert.ok(document.querySelector(".node-progress"));
+  assert.match(document.querySelector(".node-progress").textContent, /检查解析边界/);
+  await click(document.querySelector('[aria-label="关闭进行情况"]'));
+  await click(button("完成解析模块", tester));
+  assert.match(document.querySelector(".node-progress").textContent, /完成解析模块/);
+});
+
+test("employee page keeps legacy assignments explicitly unassigned", async t => {
+  const run = mission("old-task", "cancelled");
+  run.plan.nodes = [{ id: "old-node", title: "历史工作", model_id: "test:old", status: "pending", estimated_cost_usd: 0 }];
+  const { document, button, click } = await setup(t, [run], [], { openComposer: false });
+  await click(button("员工"));
+  const panel = document.querySelector('[aria-label="项目员工"]');
+  assert.match(panel.textContent, /尚未配置员工/);
+  assert.match(panel.textContent, /未分配/);
+  assert.match(panel.textContent, /历史工作/);
+  assert.equal(panel.querySelectorAll('[data-employee]').length, 0);
+});
+
 let browserCode;
 before(async () => {
   const appFile = fileURLToPath(new URL("../src.tsx", import.meta.url));
@@ -57,7 +102,7 @@ function mission(id, status) {
   };
 }
 
-async function setup(t, records = [mission("finished-task", "succeeded"), mission("running-task", "running")], models = [], { openComposer = true } = {}) {
+async function setup(t, records = [mission("finished-task", "succeeded"), mission("running-task", "running")], models = [], { openComposer = true, providers = [] } = {}) {
   const dom = new JSDOM('<div id="root"></div>', {
     url: "http://127.0.0.1:5173", runScripts: "outside-only", pretendToBeVisual: true,
   });
@@ -67,7 +112,7 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
     constructor() { super(); channels.push(this); }
   };
   const state = {
-    records, models, actions: [], resumes: [], publishes: [], uploads: [], attachmentDeletes: [], taskBodies: [], diagnosisReplies: [], leadMessages: [], followups: [], network: [],
+    records, models, providers, actions: [], resumes: [], publishes: [], uploads: [], attachmentDeletes: [], taskBodies: [], diagnosisReplies: [], leadMessages: [], followups: [], network: [],
     deletes: [], cancels: [], confirms: [], taskPosts: 0, quota: [], quotaResets: [], nativePicker: true, pickerStarts: [], nativeConfirms: 0, holdNextRead: false, releaseRead: null,
   };
   const json = value => new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
@@ -98,6 +143,56 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
   state.poll = () => [...polls.values()][0]();
   window.fetch = async (url, options = {}) => {
     const path = new URL(url).pathname;
+    if (/^\/api\/tasks\/[^/]+\/calls$/.test(path)) {
+      return json(state.calls ?? { calls: [], limit: 1000, summary: { calls: 0 } });
+    }
+    if (path === "/api/retrospectives/topics") return json(state.topics ?? []);
+    if (/^\/api\/tasks\/[^/]+\/choices$/.test(path)) {
+      const id = path.split("/")[3], body = JSON.parse(options.body);
+      state.choicePicks = [...(state.choicePicks ?? []), body.picks];
+      const current = state.records.find(run => run.id === id);
+      const updated = { ...current, plan: { ...current.plan, summary: "按你的选择重新规划", choices: [] } };
+      state.records = state.records.map(run => run.id === id ? updated : run);
+      return json(updated);
+    }
+    if (path === "/api/improvements/settings") {
+      if (options.method === "PUT") state.learningSettings = JSON.parse(options.body);
+      return json(state.learningSettings ?? { enabled: false, budget_usd: 0.5 });
+    }
+    if (/^\/api\/tasks\/[^/]+\/learning$/.test(path)) {
+      if (options.method === "POST") {
+        state.learningStarts = (state.learningStarts ?? 0) + 1;
+        state.learning = { improvements: [], applied: [], ...state.learning, review: { status: "queued", conclusion: "", budget_usd: 0.5, cost_usd: 0, allocated_usd: 0 } };
+      }
+      return json(state.learning ?? { review: null, retrospective: { estimated_usd: 0.2, actual_usd: 0.3, problems: [] }, improvements: [], applied: [] });
+    }
+    if (/^\/api\/improvements\/[^/]+\/disable$/.test(path)) {
+      const id = path.split("/")[3];
+      state.disabledImprovements = [...(state.disabledImprovements ?? []), id];
+      state.learning.improvements = state.learning.improvements.map(item => item.id === id ? { ...item, status: "disabled" } : item);
+      return json({ status: "disabled" });
+    }
+    if (/^\/api\/tasks\/[^/]+\/engineer$/.test(path) && options.method === "POST") {
+      const body = JSON.parse(options.body || "{}");
+      state.engineerActions = [...(state.engineerActions ?? []), { path, body }];
+      return json({ id: "joined", run_id: path.split("/")[3], ...body }, 201);
+    }
+    if (path.startsWith("/api/engineer/") && options.method === "POST") {
+      const body = JSON.parse(options.body || "{}");
+      state.engineerActions = [...(state.engineerActions ?? []), { path, body }];
+      const engineer = state.engineer ?? (state.engineer = { available: true, jobs: [] });
+      if (path === "/api/engineer/jobs") {
+        const job = { id: `job${engineer.jobs.length + 1}`, kind: body.kind, origin: "user", title: body.request.slice(0, 40),
+          request: body.request, status: "queued", messages: [], budget_usd: 2, cost_usd: 0,
+          created_at: "2026-10-19T08:00:00Z", updated_at: "2026-10-19T08:00:00Z" };
+        engineer.jobs = [job, ...engineer.jobs];
+        return json(job, 201);
+      }
+      const [, , , , id, action] = path.split("/");
+      const next = { approve: "queued", reject: "rejected", reply: "queued" }[action];
+      engineer.jobs = engineer.jobs.map(job => job.id === id ? { ...job, status: next } : job);
+      return json(engineer.jobs.find(job => job.id === id));
+    }
     if (path.startsWith("/api/models/quota")) {
       if (options.method === "DELETE") {
         const id = decodeURIComponent(path.slice("/api/models/quota/".length));
@@ -186,7 +281,11 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
       state.deletes.push(id);
       return state.deleteResponse(id, options.signal);
     }
-    if (path === "/api/tasks" && options.method === "POST") { state.taskPosts++; state.taskBodies.push(JSON.parse(options.body)); return json(state.records[0]); }
+    if (path === "/api/tasks" && options.method === "POST") {
+      state.taskPosts++; state.taskBodies.push(JSON.parse(options.body));
+      if (state.createError) return new Response(JSON.stringify({ detail: state.createError }), { status: 422, headers: { "content-type": "application/json" } });
+      return json(state.records[0]);
+    }
     if (path === "/api/projects/discover") return json({ projects: [{ name: "shop", path: "/home/me/prj/shop" }], truncated: false });
     if (path === "/api/projects/inspect") {
       const target = new URL(url).searchParams.get("path");
@@ -221,7 +320,8 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
       return json({ url: state.githubUrl });
     }
     if (path === "/api/models") return json(state.models);
-    if (path === "/api/providers") return json([]);
+    if (path === "/api/providers") return json(state.providers);
+    if (path === "/api/engineer") return json(state.engineer ?? { available: true, jobs: [] });
     throw new Error(`Unexpected request: ${path}`);
   };
   window.eval(browserCode);
@@ -602,6 +702,83 @@ test("the plan shows stages, dependencies, parallel work and each task's model",
   assert.equal([...document.querySelectorAll(".app-nav button")].find(b => b.textContent.startsWith("模型画像")).getAttribute("aria-pressed"), "true");
 });
 
+test("a plan made in parts shows its major parts as stages; each opens in place, or all at once", async t => {
+  const node = (id, part_id, status = "pending", deps = []) => ({
+    id, title: `Task ${id}`, instructions: "", capability: "coding", dependencies: deps, part_id,
+    model_id: "cli:claude", status, estimated_cost_usd: 0, difficulty: "normal", quality_threshold: 80,
+    attempts: status === "succeeded" ? [{ model_id: "cli:claude", outcome: "passed", cost_usd: 0.25 }] : [],
+  });
+  const run = mission("parted", "running");
+  run.plan.parts = [
+    { id: "api", title: "后端", goal: "提供待办接口", acceptance: "接口测试通过", parent_id: null, dependencies: [] },
+    { id: "store", title: "存储", goal: "保存待办", parent_id: "api", dependencies: [] },
+    { id: "ui", title: "前端", goal: "待办页面", parent_id: null, dependencies: ["api"] },
+  ];
+  run.plan.nodes = [node("model", "store", "succeeded"), node("db", "store", "running", ["model"]),
+    node("routes", "api", "pending", ["db"]), node("page", "ui", "pending", ["routes"])];
+  const { document, click } = await setup(t, [run]);
+
+  // Only the major parts, as stages from left to right, with how far each has come.
+  assert.match(document.querySelector(".plan-summary").textContent, /2 个大项.*4 个任务.*已完成 1/);
+  const stages = [...document.querySelectorAll(".plan-stage")];
+  assert.deepEqual(stages.map(stage => [...stage.querySelectorAll(".part-card-line b")].map(b => b.textContent)), [["后端"], ["前端"]]);
+  assert.ok(document.querySelector(".plan-board svg.plan-links"));
+  assert.equal(document.querySelector(".part-task"), null);
+  const cards = [...document.querySelectorAll(".part-card")];
+  assert.match(cards[0].textContent, /进行中.*1 \/ 3 个任务完成 · 1 个进行中.*1 个子项.*\$0\.25.*展开/);
+
+  // A part opens in place on its sub-parts and tasks, in plan order; numbers are those of the whole plan.
+  await click(cards[0].querySelector(".part-card-head"));
+  assert.equal(cards[0].querySelector(".part-card-head").getAttribute("aria-expanded"), "true");
+  const body = cards[0].querySelector(".part-body");
+  assert.deepEqual([...body.children].map(item => item.className.split(" ")[0]), ["part-sub", "part-task"]);
+  assert.match(body.querySelector(".part-sub-head").textContent, /1\.1存储1\/2/);
+  assert.match(body.querySelector(".part-task").textContent, /03Task routes.*等待 02/);
+  await click(body.querySelector(".part-sub-head"));
+  assert.deepEqual([...body.querySelectorAll(".part-task .part-task-title span:nth-child(2)")].map(n => n.textContent), ["Task model", "Task db", "Task routes"]);
+  await click(body.querySelector(".part-task-title"));
+  assert.match(document.querySelector(".node-progress.drawer h4").textContent, /Task model/);
+  await click(document.querySelector('[aria-label="关闭进行情况"]'));
+
+  // One switch opens every part, and closes them all again.
+  const all = document.querySelector(".part-toggle-all");
+  assert.equal(all.textContent, "全部展开");
+  await click(all);
+  assert.equal(all.textContent, "全部关闭");
+  assert.equal(document.querySelectorAll(".part-task").length, 4);
+  await click(all);
+  assert.equal(document.querySelectorAll(".part-task").length, 0);
+});
+
+test("a task planned as major parts says they are split once it runs, and what each provides", async t => {
+  const run = mission("outlined", "awaiting_confirmation");
+  run.plan.parts = [
+    { id: "api", title: "后端", goal: "提供待办接口", provides: "GET /todos -> [{id, title, done}]", size: 3, status: "planned", dependencies: [] },
+    { id: "ui", title: "前端", goal: "待办页面", size: 2, status: "failed", error: "回复不是计划", dependencies: ["api"] },
+  ];
+  const { document, click } = await setup(t, [run]);
+  assert.match(document.querySelector(".plan-summary").textContent, /2 个大项.*0 个任务（另有 2 个大项待细化，预计约 5 个任务）/);
+  const cards = [...document.querySelectorAll(".part-card")];
+  assert.match(cards[0].textContent, /后端待细化.*预计 3 个任务/);
+  assert.match(cards[1].textContent, /前端细化失败/);
+  await click(cards[0].querySelector(".part-card-head"));
+  assert.match(cards[0].querySelector(".part-provides").textContent, /对外提供（接口约定）GET \/todos/);
+  assert.match(cards[0].querySelector(".part-split").textContent, /确认执行后，这一项会和其他大项同时细化成任务/);
+  await click(cards[1].querySelector(".part-card-head"));
+  assert.match(cards[1].querySelector(".part-split.failed").textContent, /原因：回复不是计划/);
+});
+
+test("parts show the lead's chosen refinement effort and its reason", async t => {
+  const run = mission("adaptive", "running");
+  run.plan.parts = [{ id: "docs", title: "使用说明", status: "refining", size: 1,
+    difficulty: "easy", refinement_effort: "low", refinement_reason: "接口已明确，只需整理使用步骤" }];
+  const { document, click } = await setup(t, [run]);
+  const card = document.querySelector(".part-card");
+  assert.match(card.textContent, /细化推理：低/);
+  await click(card.querySelector(".part-card-head"));
+  assert.match(card.querySelector(".part-effort").textContent, /接口已明确，只需整理使用步骤/);
+});
+
 test("the budget accepts round amounts such as 2 and can be cleared while typing", async t => {
   const { window, document, act } = await setup(t);
   const input = document.querySelector(".composer .budget-field input");
@@ -718,6 +895,54 @@ test("each task shows its check result, and clicking it shows its progress", asy
   assert.equal(document.querySelector(".node-progress"), null);
 });
 
+test("a step waiting for its inputs shows it is starting early, and later what it prepared", async t => {
+  const run = mission("head-start", "running");
+  run.plan.nodes = [
+    { id: "rtl", title: "RTL", capability: "coding", dependencies: [], model_id: "test:a", status: "running", estimated_cost_usd: 0 },
+    { id: "tb", title: "Testbench", capability: "coding", dependencies: ["rtl"], model_id: "test:b", status: "pending", estimated_cost_usd: 0,
+      preparing: true, folders: ["tb/"] },
+    { id: "lint", title: "Lint", capability: "coding", dependencies: ["rtl"], model_id: "test:b", status: "pending", estimated_cost_usd: 0,
+      head_start: "搭好了 **tb_top.sv**，只差接上 RTL" },
+  ];
+  const { state, document, click } = await setup(t, [run]);
+  state.timeline = [{ id: 1, kind: "node.head_start", data: { node_id: "tb" }, created_at: "2026-10-28T03:00:00Z" }];
+  const [, tb, lint] = [...document.querySelectorAll(".plan-node")];
+  assert.equal(tb.querySelector(".state").textContent, "先行准备中");
+  assert.match(tb.querySelector(".plan-check").textContent, /先行准备中：先做不需要 01 结果的部分/);
+  assert.match(lint.querySelector(".plan-check").textContent, /已先行准备，等待 01/);
+  await click(tb.querySelector(".plan-node-title"));
+  let panel = document.querySelector(".node-progress");
+  assert.match(panel.querySelector(".node-progress-now").textContent, /先行准备中.*之后等它们完成再正式执行/);
+  assert.ok(panel.querySelector(".node-activity"));
+  assert.match(panel.querySelector(".node-progress-timeline").textContent, /先行准备：先做不需要前置步骤结果的部分/);
+  await click(panel.querySelector('[aria-label="关闭进行情况"]'));
+  await click(lint.querySelector(".plan-node-title"));
+  panel = document.querySelector(".node-progress");
+  assert.match(panel.querySelector(".node-head-start").textContent, /依赖完成前已做的准备.*tb_top\.sv/s);
+});
+
+test("a running step still waiting for another to leave the folder shows as queued", async t => {
+  const run = mission("queued-step", "running");
+  run.plan.nodes = [
+    { id: "core", title: "Core", capability: "coding", dependencies: [], model_id: "test:a", status: "running", estimated_cost_usd: 0,
+      started_at: new Date(Date.now() - 65000).toISOString() },
+    { id: "periph", title: "Peripherals", capability: "coding", dependencies: [], model_id: "test:b", status: "running", estimated_cost_usd: 0,
+      waiting_for_folder: true, folders: ["rtl/periph/"], started_at: new Date(Date.now() - 65000).toISOString() },
+  ];
+  const { state, document, click } = await setup(t, [run]);
+  state.timeline = [{ id: 1, kind: "node.queued", data: { node_id: "periph" }, created_at: "2026-10-27T07:00:00Z" }];
+  const [core, periph] = [...document.querySelectorAll(".plan-node")];
+  assert.equal(core.querySelector(".state").textContent, "运行中");
+  assert.equal(periph.querySelector(".state").textContent, "排队中");
+  assert.match(periph.querySelector(".plan-check").textContent, /排队中/);
+  await click(periph.querySelector(".plan-node-title"));
+  const panel = document.querySelector(".node-progress");
+  assert.match(panel.querySelector(".node-progress-now").textContent, /排队中：等其他步骤用完工作目录 · 已等 1 分/);
+  assert.equal(panel.querySelector(".node-activity"), null);
+  assert.match(panel.querySelector(".node-scope").textContent, /负责的目录：rtl\/periph\//);
+  assert.match(panel.querySelector(".node-progress-timeline").textContent, /排队：等其他步骤用完工作目录/);
+});
+
 test("a failed task continues from the failed step with the budget entered there", async t => {
   const run = mission("broken", "failed");
   run.error = "1 个步骤失败：Verify（node --check needs approval）";
@@ -736,6 +961,61 @@ test("a failed task continues from the failed step with the budget entered there
   await click([...bar.querySelectorAll("button")].find(b => b.textContent === "从失败处继续"));
   assert.deepEqual(state.resumes, [{ id: "broken", budget_usd: 3 }]);
   assert.equal(document.querySelector(".resume-bar"), null);
+});
+
+test("retrospective settings persist and manual generation shows its progress", async t => {
+  const { state, document, button, click } = await setup(t);
+  await click(button("复盘与改进"));
+  assert.match(document.querySelector(".learning-panel").textContent, /尚未生成复盘结论/);
+  const enable = document.querySelector(".learning-settings input[type=checkbox]");
+  await click(enable);
+  await click(button("保存自动改进设置"));
+  assert.equal(state.learningSettings.enabled, true);
+  assert.equal(state.learningSettings.auto_platform, undefined);
+  assert.equal(state.learningSettings.budget_usd, 0.5);
+  await click(button("生成复盘与改进项"));
+  assert.equal(state.learningStarts, 1);
+  assert.equal(button("复盘进行中…").disabled, true);
+});
+
+test("model calls show unknown usage and explicit effort downgrade", async t => {
+  const { state, document, button, click } = await setup(t);
+  state.calls = { limit: 1000, summary: { calls: 1, requests: 2, retries: 1, unknown_usage: 1,
+    observed_cost_usd: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 },
+    calls: [{ id: "c", model_id: "api:test", node_id: "n", purpose: "work", status: "succeeded",
+      requested_effort: "max", effective_effort: "provider_default", warnings: ["推理参数被拒绝，使用默认值"],
+      input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_write_tokens: 0, usage_known: false,
+      cost_usd: 0, requests: 2, retries: 1, duration_seconds: 2, queue_seconds: 1 }] };
+  await click(button("模型调用"));
+  const panel = document.querySelector('[aria-label="模型调用记录"]');
+  assert.match(panel.textContent, /不能按零用量计算/);
+  assert.match(panel.textContent, /max → 供应商默认值/);
+  assert.match(panel.textContent, /推理参数被拒绝/);
+  assert.match(panel.textContent, /2 次 API 请求/);
+});
+
+test("retrospective shows evidence, effects and permits disabling future use", async t => {
+  const { state, document, button, click } = await setup(t);
+  const before = { steps: 1, cost_per_step: 0.2, turns_per_step: 40, failures_per_step: 1, success_rate: 1, problem_rate: 1 };
+  state.learning = {
+    review: { status: "done", conclusion: "重复准备导致浪费，复用经过验证的命令。", budget_usd: 0.5, cost_usd: 0.02, allocated_usd: 0 },
+    applied: [{ id: "prior", title: "先验证接口", node_ids: ["n"], planning: true, source_run_id: "prior-run" }],
+    improvements: [{ id: "lesson", kind: "skill", title: "编译前检查", rationale: "原任务使用了 40 轮。", content: "先检查编译环境。",
+      status: "active", tools: ["compiler"], source_nodes: ["n"], validation: { passed: true, reason: "样例编译通过", output: "PASS" },
+      effects: [{ run_id: "later", before, after: { ...before, turns_per_step: 12, cost_per_step: 0.05 }, comparable: true,
+        delta: {}, note: "观察性对比，不能认定因果。" }] }],
+  };
+  await click(button("复盘与改进"));
+  const panel = document.querySelector(".learning-panel");
+  assert.match(panel.textContent, /重复准备导致浪费/);
+  assert.match(panel.textContent, /先验证接口/);
+  assert.match(panel.querySelector("table").textContent, /40/);
+  assert.match(panel.querySelector("table").textContent, /12/);
+  assert.match(panel.textContent, /不能认定因果/);
+  await click(button("后续任务停用"));
+  assert.deepEqual(state.disabledImprovements, ["lesson"]);
+  assert.match(panel.textContent, /已停用/);
+  assert.equal(button("后续任务停用"), undefined);
 });
 
 test("a finished task opens on its result tab with files, ZIP download and GitHub upload", async t => {
@@ -967,6 +1247,28 @@ test("models out of quota are listed until they reset, and can be put back by ha
   assert.equal(document.querySelector(".quota-banner"), null);
 });
 
+test("a membership CLI priced by its subscription shows its price and quota", async t => {
+  const note = "周额度已用 25%，11-02 14:09 重置；按月费 $200 折算 $2.31/百万 tokens";
+  const models = [{ id: "cli:codex", provider: "openai", display_name: "Codex CLI", channel: "cli", auth_type: "membership", enabled: true, configured: true, routing_ready: true, scores: {}, input_per_million: 2.31, output_per_million: 2.31, usage_note: note }];
+  const { document, click } = await setup(t, [mission("build-task", "running")], models);
+  await click(document.querySelector(".fleet-trigger"));
+  const link = document.querySelector('[aria-label="查看 Codex CLI 的画像"]');
+  assert.equal(link.querySelector("small").textContent, "会员折算 $2.31/百万 tokens · 周额度已用 25%");
+  assert.equal(link.getAttribute("title"), note);
+});
+
+test("a provider whose key waits in a locked keyring says so instead of not configured", async t => {
+  const models = [{ id: "deepseek:deepseek-flash", provider: "deepseek", display_name: "DeepSeek", channel: "api", enabled: true, configured: false, scores: {} }];
+  const providers = [{ id: "deepseek", name: "DeepSeek", configured: false, keyring_locked: true }];
+  const { document, click } = await setup(t, [mission("build-task", "running")], models, { providers });
+  await click(document.querySelector(".fleet-trigger"));
+  await click(document.querySelector('[aria-label="配置 DeepSeek 的 API Key"]'));
+  const card = document.querySelector(".provider-card");
+  assert.ok(card);
+  assert.match(card.textContent, /密钥环未解锁/);
+  assert.doesNotMatch(card.textContent, /未配置/);
+});
+
 test("service failures are distinguished from quota exhaustion", async t => {
   const models = [{ id: "deepseek:deepseek-flash", provider: "deepseek", display_name: "DeepSeek", channel: "api", enabled: true, configured: true, scores: null }];
   const { state, document, act } = await setup(t, [mission("build-task", "running")], models, { openComposer: false });
@@ -975,6 +1277,20 @@ test("service failures are distinguished from quota exhaustion", async t => {
   const banner = document.querySelector(".quota-banner");
   assert.match(banner.textContent, /DeepSeek（服务故障）.*后重试/);
   assert.doesNotMatch(banner.textContent, /额度用完/);
+});
+
+test("cancelled work explains the automatic-review exclusion and manual review stays explicit", async t => {
+  const { state, document, button, click } = await setup(t, [mission("cancelled-task", "cancelled")], [], { openComposer: false });
+  state.learning = { review: { status: "skipped", conclusion: "", budget_usd: 0.5, cost_usd: 0, allocated_usd: 0 },
+    automatic_eligible: false, automatic_skip_reason: "任务已手动取消，不自动复盘。", retrospective: null, improvements: [], applied: [] };
+  await click(button("结果"));
+  await click(button("复盘与改进"));
+  const panel = document.querySelector(".learning-panel");
+  assert.match(panel.textContent, /手动取消.*不自动复盘/);
+  assert.match(panel.textContent, /已跳过自动复盘/);
+  assert.equal(state.learningStarts ?? 0, 0);
+  await click(button("手动生成复盘与改进项"));
+  assert.equal(state.learningStarts, 1);
 });
 
 test("a failed task with a running repair can be cancelled but cannot be resumed concurrently", async t => {
@@ -1064,6 +1380,8 @@ test("diagnosis reply remains available for legacy reports without choices", asy
   delete run.diagnoses[0].question;
   run.diagnoses[0].verdict = "blocked";
   const context = await setup(t, [run], [], { openComposer: false });
+  // Not waiting for you, the conversation does not open by itself.
+  await context.click([...context.document.querySelectorAll(".task-tabs button")].find(node => node.textContent.startsWith("对话")));
   assert.equal(context.document.querySelectorAll('.diagnosis-choices input').length, 0);
   await fillDiagnosisReply(context, "这个权限已经配置好了，请继续检查。");
   await context.click(context.button("发送并继续诊断"));
@@ -1207,7 +1525,7 @@ test("the lead panel shows its decisions and questions, takes replies, and lets 
   const { document, state, act, click, button } = context;
   const panel = () => document.querySelector(".lead-panel");
   assert.match(panel().textContent, /负责人Codex CLI.*等你回复/);
-  assert.match(panel().textContent, /验证没通过 · 验证.*返工 实现.*这是原有要求中的真实缺陷/);
+  assert.match(panel().textContent, /返工 实现.*验证没通过 · 验证.*这是原有要求中的真实缺陷/);
   assert.match(panel().querySelector(".lead-instructions").textContent, /到期时按完成结算/);
   // The lead's question is answered here, not in a separate diagnosis panel.
   assert.equal(document.querySelectorAll(".diagnosis-card").length, 1);
@@ -1245,7 +1563,8 @@ test("the lead panel shows the lead deciding, and the repair it asked for under 
   run.diagnoses = [{ id: "r1", trigger: "lead_repair", decision_id: "d1", node_id: "d", model_id: "cli:codex",
     status: "done", verdict: "retry", report: "没找到可读的私钥。", created_at: "2026-10-16T07:19:05Z" }];
   const models = [{ id: "cli:codex", provider: "openai", display_name: "Codex CLI", channel: "cli", enabled: true, configured: true, scores: null }];
-  const { document } = await setup(t, [run], models, { openComposer: false });
+  const { document, click } = await setup(t, [run], models, { openComposer: false });
+  await click([...document.querySelectorAll(".task-tabs button")].find(node => node.textContent.startsWith("对话")));
   const panel = document.querySelector(".lead-panel");
   assert.match(panel.textContent, /判断中/);
   assert.match(panel.querySelector(".lead-thinking").textContent, /尝试失败了，正在判断怎么处理：「发布」 · 已 4\d 秒/);
@@ -1253,4 +1572,270 @@ test("the lead panel shows the lead deciding, and the repair it asked for under 
   assert.match(repair.textContent, /修复Codex CLI未发现环境问题.*修复报告.*结果已交回负责人/s);
   // Its repair is not shown again in the separate diagnosis panel.
   assert.equal(document.querySelectorAll(".diagnosis-card").length, 1);
+});
+
+function engineerJob(fields) {
+  return { id: "job1", kind: "component", origin: "user", title: "导出按钮", request: "给结果页加一个导出按钮",
+    status: "plan_ready", plan: "- 目标: 结果页可以导出 CSV", messages: [], files: [], checks: [], budget_usd: 2, cost_usd: 0,
+    created_at: "2026-10-19T08:00:00Z", updated_at: "2026-10-19T08:00:00Z", ...fields };
+}
+
+test("the platform engineer page opens from a task's conversation, shows finished work, and takes approvals", async t => {
+  const run = mission("finished-task", "succeeded");
+  run.supervisor = { model_id: "cli:claude", calls: 1 };
+  const { state, document, click, act, window } = await setup(t, [run], [], { openComposer: false });
+  state.engineer = { available: true, jobs: [engineerJob({ run_id: "finished-task", messages: [{ role: "user", text: "加导出按钮", created_at: "2026-10-19T08:00:00Z" }] }),
+    engineerJob({ id: "job0", title: "修复状态", status: "applied", kind: "repair",
+    report: "改好了", files: ["backend/super_partner/executor.py"], checks: ["Backend tests"], diff: "+fixed", commit: "abcdef1234" })] };
+  state.records[0] = { ...state.records[0], updated_at: "2026-10-19T08:00:01Z" };
+  await act(async () => state.poll());
+  await click([...document.querySelectorAll(".task-tabs button")].find(node => node.textContent.startsWith("对话")));
+  // The engineer has no page of its own in the navigation: it works in tasks' conversations.
+  assert.equal([...document.querySelectorAll(".app-nav button")].some(node => node.textContent.startsWith("平台工程师")), false);
+  await click([...document.querySelectorAll(".lead-panel button")].find(node => node.textContent === "在平台工程师页面查看"));
+  const page = document.querySelector(".engineer-page");
+  assert.match(page.querySelector(".engineer-job").textContent, /方案待批准.*结果页可以导出 CSV/s);
+  await click([...page.querySelectorAll("button")].find(node => node.textContent === "批准方案，开始实施"));
+  assert.deepEqual(state.engineerActions.map(item => item.path), ["/api/engineer/jobs/job1/approve"]);
+  // A finished repair shows its files, checks, diff and commit.
+  await click([...page.querySelectorAll(".engineer-list button")].find(node => node.textContent.includes("修复状态")));
+  const detail = document.querySelector(".engineer-job");
+  assert.match(detail.textContent, /已生效.*executor\.py.*检查通过：Backend tests.*abcdef12/s);
+  // A new request goes to the engineer with its kind.
+  await click([...page.querySelectorAll(".engineer-kind label")].find(node => node.textContent === "修复缺陷"));
+  const box = page.querySelector(".engineer-request textarea");
+  await act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+    setter.call(box, "暂停后继续一直显示排队中");
+    box.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await click([...page.querySelectorAll("button")].find(node => node.textContent === "交给平台工程师"));
+  const posted = state.engineerActions.at(-1);
+  assert.equal(posted.path, "/api/engineer/jobs");
+  assert.deepEqual(posted.body, { request: "暂停后继续一直显示排队中", kind: "repair" });
+});
+
+test("the lead panel shows a component the lead asked for, and opens it on the engineer page", async t => {
+  const run = mission("waiting-task", "paused");
+  run.plan.nodes = [{ id: "a", title: "读资料", dependencies: [], status: "pending", estimated_cost_usd: 0, attempts: [] }];
+  run.supervisor = { model_id: "cli:claude", calls: 2 };
+  run.engineer_job_id = "job1";
+  run.decisions = [{ id: "d1", node_id: "a", event: "attempt_failed", action: "request_component", engineer_job_id: "job1",
+    reason: "缺一个读 PDF 的工具。", instructions: "给执行模型加一个读 PDF 的工具", created_at: "2026-10-19T07:00:00Z" }];
+  const { state, document, click } = await setup(t, [run], [], { openComposer: false });
+  await click([...document.querySelectorAll(".task-tabs button")].find(node => node.textContent.startsWith("对话")));
+  state.engineer = { available: true, jobs: [engineerJob({ origin: "lead", run_id: "waiting-task", node_id: "a", title: "PDF 工具" })] };
+  const panel = document.querySelector(".lead-panel");
+  assert.match(panel.textContent, /请平台工程师添加组件.*任务在等这个组件/s);
+  await click([...panel.querySelectorAll("button")].find(node => node.textContent === "查看方案和进度"));
+  const detail = document.querySelector(".engineer-job");
+  assert.match(detail.textContent, /PDF 工具.*负责人请求.*来自任务.*结束后结果会交回负责人/s);
+});
+
+
+test("the lead's panel is a group chat the platform engineer joins, where its plan is approved and @ talks to it", async t => {
+  const run = mission("chat-task", "paused");
+  run.plan.nodes = [{ id: "a", title: "跑仿真", dependencies: [], status: "pending", estimated_cost_usd: 0, attempts: [] }];
+  run.supervisor = { model_id: "cli:claude", calls: 3 };
+  run.lead_messages = [
+    { id: "m1", role: "user", text: "应该是沙箱的问题", status: "done", created_at: "2026-10-20T06:16:00Z" },
+    { id: "m2", role: "lead", text: "是沙箱连不到宿主机的许可证端口。\n\n（已请平台工程师加入：放行许可证端口）", status: "done",
+      engineer_job_id: "job1", created_at: "2026-10-20T06:16:30Z" },
+  ];
+  const { state, document, click, act, window } = await setup(t, [run], [], { openComposer: false });
+  state.engineer = { available: true, jobs: [
+    engineerJob({ kind: "repair", origin: "lead", run_id: "chat-task", title: "放行许可证端口", plan: "- 只放行 26585 和 39097",
+      messages: [{ role: "lead", text: "让步骤沙箱能连宿主机的许可证端口", created_at: "2026-10-20T06:16:31Z" },
+                 { role: "engineer", text: "方案写好了，请看过后批准。", created_at: "2026-10-20T06:18:00Z" }] }),
+    engineerJob({ id: "other", run_id: "another-task", title: "别的任务的工作" }),
+  ] };
+  // The panel looks again whenever the task changes.
+  state.records[0] = { ...state.records[0], updated_at: "2026-10-20T06:18:01Z" };
+  await act(async () => state.poll());
+  await click([...document.querySelectorAll(".task-tabs button")].find(node => node.textContent.startsWith("对话")));
+  const panel = () => document.querySelector(".lead-panel");
+  const button = text => [...panel().querySelectorAll("button")].find(node => node.textContent === text);
+  assert.match(panel().querySelector(".diagnosis-head").textContent, /负责人.*平台工程师/);
+  // The engineer's lines sit among the lead's, after the lead brought it in; other tasks' work does not.
+  assert.match(panel().textContent, /应该是沙箱的问题.*已请平台工程师加入.*负责人请平台工程师加入.*让步骤沙箱能连.*平台工程师.*方案写好了/s);
+  assert.doesNotMatch(panel().textContent, /别的任务的工作/);
+  const card = panel().querySelector(".engineer-card");
+  assert.match(card.textContent, /修复 · 放行许可证端口.*方案待批准.*只放行 26585 和 39097/s);
+
+  // @平台工程师 answers the job waiting for the user, instead of the lead.
+  const box = document.querySelector('[aria-label="给负责人的消息"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(box, "@平台工程师 39097 是动态端口，用 VENDOR 固定一下");
+    box.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await click(button("发送"));
+  assert.deepEqual(state.engineerActions.at(-1), { path: "/api/engineer/jobs/job1/reply", body: { text: "39097 是动态端口，用 VENDOR 固定一下" } });
+  assert.equal(state.leadMessages.length, 0);
+
+  // Its plan is approved right here.
+  state.engineer.jobs[0].status = "plan_ready";
+  state.records[0] = { ...state.records[0], updated_at: "2026-10-20T06:19:00Z" };
+  await act(async () => state.poll());
+  await click(panel().querySelector(".engineer-card .primary"));
+  assert.equal(state.engineerActions.at(-1).path, "/api/engineer/jobs/job1/approve");
+
+  // The user can bring it in too, for a repair or a component.
+  await click(button("拉平台工程师进来"));
+  await click([...panel().querySelectorAll('[role="radio"]')].find(node => node.textContent === "添加组件"));
+  const ask = panel().querySelector('[aria-label="要平台工程师做的事"]');
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(ask, "加一个 EDA 许可证检查");
+    ask.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  await click(button("拉它进来"));
+  assert.deepEqual(state.engineerActions.at(-1), { path: "/api/tasks/chat-task/engineer", body: { request: "加一个 EDA 许可证检查", kind: "component" } });
+  assert.equal(panel().querySelector(".engineer-join"), null);
+});
+
+test("a bubble in the corner opens a chat with the platform engineer, for answers and new requests", async t => {
+  const run = mission("chip-task", "succeeded");
+  const { state, document, click, act, window } = await setup(t, [run], [], { openComposer: false });
+  state.engineer = { available: true, jobs: [
+    engineerJob({ id: "job1", run_id: "chip-task", title: "放行许可证端口", status: "plan_ready", updated_at: "2026-10-20T06:41:00Z",
+      messages: [{ role: "lead", text: "让沙箱连许可证端口", created_at: "2026-10-20T06:40:00Z" },
+                 { role: "engineer", text: "方案写好了，请看过后批准。", created_at: "2026-10-20T06:41:00Z" }] }),
+    engineerJob({ id: "job0", title: "修复状态", status: "applied", kind: "repair", updated_at: "2026-10-19T08:00:00Z",
+      messages: [{ role: "user", text: "暂停后一直显示排队中", created_at: "2026-10-19T08:00:00Z" }] }),
+  ] };
+  state.records[0] = { ...state.records[0], updated_at: "2026-10-20T06:41:01Z" };
+  await act(async () => state.poll());
+  const bubble = document.querySelector(".engineer-bubble");
+  assert.equal(bubble.querySelector(".engineer-bubble-badge").textContent, "1");
+  await click(bubble);
+  const chat = () => document.querySelector(".engineer-chat");
+  // One card per job, oldest first, saying where it came from; finished work is folded to its header.
+  assert.match(chat().textContent, /修复状态在这里提出 · 修复已生效.*放行许可证端口来自任务「chip-task」 · 组件方案待批准.*方案写好了/s);
+  assert.doesNotMatch(chat().textContent, /暂停后一直显示排队中/);
+  await click(chat().querySelector(".engineer-thread-head"));
+  assert.match(chat().textContent, /暂停后一直显示排队中/);
+  const box = chat().querySelector('[aria-label="给平台工程师的消息"]');
+  const type = async value => act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(box, value);
+    box.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+  // By default a message answers the job waiting for the user.
+  assert.match(chat().querySelector(".engineer-chat-target").textContent, /回复：放行许可证端口/);
+  await type("只放行 26585");
+  await click([...chat().querySelectorAll("button")].find(node => node.textContent === "发送"));
+  assert.deepEqual(state.engineerActions.at(-1), { path: "/api/engineer/jobs/job1/reply", body: { text: "只放行 26585" } });
+  // Or it starts a new request; asking for something new is a component.
+  state.engineer.jobs[0].status = "plan_ready";
+  state.records[0] = { ...state.records[0], updated_at: "2026-10-20T06:42:00Z" };
+  await act(async () => state.poll());
+  await click([...chat().querySelectorAll("button")].find(node => node.textContent === "改为提新需求"));
+  await type("给结果页加一个导出 PDF 的功能");
+  await click([...chat().querySelectorAll("button")].find(node => node.textContent === "发送"));
+  assert.deepEqual(state.engineerActions.at(-1), { path: "/api/engineer/jobs", body: { request: "给结果页加一个导出 PDF 的功能", kind: "component" } });
+  await click(document.querySelector('[aria-label="关闭平台工程师聊天"]'));
+  assert.equal(chat(), null);
+});
+
+test("the task's conversation is a tab that opens when the lead asks you, with a bar from the other tabs", async t => {
+  const run = mission("asking-task", "paused");
+  run.plan.nodes = [{ id: "a", title: "存数据", dependencies: [], status: "pending", estimated_cost_usd: 0, attempts: [] }];
+  run.supervisor = { model_id: "cli:claude", calls: 1 };
+  run.waiting_diagnosis_id = "q1";
+  run.diagnoses = [{ id: "q1", trigger: "lead", node_id: "a", status: "done", verdict: "needs_input", question: "用 SQLite 还是 JSON？",
+    choices: ["SQLite", "JSON"], report: "两种都行", created_at: "2026-10-20T07:00:00Z" }];
+  const { document, click } = await setup(t, [run], [], { openComposer: false });
+  const tabs = () => [...document.querySelectorAll(".task-tabs button")];
+  assert.deepEqual(tabs().map(tab => tab.textContent), ["对话", "进度", "员工", "结果", "详情"]);
+  assert.equal(tabs()[0].getAttribute("aria-pressed"), "true");
+  assert.ok(tabs()[0].querySelector(".tab-dot") && document.querySelector(".lead-panel"));
+  await click(tabs()[1]);
+  assert.equal(document.querySelector(".lead-panel"), null);
+  assert.match(document.querySelector(".chat-alert").textContent, /负责人在问你：用 SQLite 还是 JSON？/);
+  await click(document.querySelector(".chat-alert button"));
+  assert.ok(document.querySelector(".lead-panel") && !document.querySelector(".chat-alert"));
+});
+
+
+test("delegation continuations are not displayed as failed retries", async t => {
+  const run = mission("delegated-complete", "succeeded");
+  run.plan.nodes = [{ id: "parent", title: "完成模块", status: "succeeded", model_id: "test:build", dependencies: [],
+    estimated_cost_usd: 0, attempts: [{ outcome: "delegated", cost_usd: 0 }, { outcome: "passed", cost_usd: 0 }] }];
+  const { document, button, click } = await setup(t, [run], [], { openComposer: false });
+  await click(button("进度"));
+  assert.doesNotMatch(document.querySelector(".plan-summary").textContent, /重试/);
+});
+
+test("recurring problems are listed by what they are about and lead back to their tasks", async t => {
+  const { state, document, button, click } = await setup(t);
+  state.topics = [{ topic: "新思 EDA 环境未加载", runs: ["missing-run"], repaired_in: ["missing-run"], members: ["environment:vcs", "platform:agent"],
+    label: "沙箱里没有加载 .edarc", recurred_after_repair: true, last_seen: "2026-10-22T10:00:00Z" }];
+  await click(button("重复问题"));
+  const page = document.querySelector(".problems-page");
+  assert.match(page.textContent, /新思 EDA 环境未加载/);
+  assert.match(page.textContent, /environment:vcs、platform:agent/);
+  assert.match(page.textContent, /修复后又出现/);
+  assert.equal(page.querySelector(".problem-runs button").disabled, true); // its task was deleted
+});
+
+test("the plan's open choices are picked on the page and the plan is made again with them", async t => {
+  const run = mission("with-choices", "awaiting_confirmation");
+  run.plan.choices = [{ question: "AXI4 还是 AXI4-Lite？", assumed: "完整 AXI4", alternative: "AXI4-Lite" },
+    { question: "apb_mux 是什么？", assumed: "一主多从", alternative: "多主一从" }];
+  const { state, document, act, click } = await setup(t, [run], [], { openComposer: false });
+  const panel = document.querySelector(".plan-choices");
+  assert.match(panel.textContent, /负责人建议/);
+  const replan = () => [...panel.querySelectorAll("button")].find(b => b.textContent.includes("按我的选择重新规划"));
+  assert.equal(replan(), undefined); // the lead's answers need no new plan
+  const radios = panel.querySelectorAll('[role="radio"]');
+  assert.equal(radios[0].getAttribute("aria-checked"), "true");
+  await click(radios[1]); // AXI4-Lite
+  assert.equal(radios[1].getAttribute("aria-checked"), "true");
+  await click(replan());
+  assert.deepEqual(state.choicePicks, [["alternative", "assumed"]]);
+  await act(async () => {});
+  assert.match(document.querySelector(".task-title h3").textContent, /按你的选择重新规划/);
+  assert.equal(document.querySelector(".plan-choices"), null);
+});
+
+
+test("attempt answers and unknown tool outcomes retain their provenance", async t => {
+  const run = mission("answer-provenance", "running");
+  run.plan.nodes = [{ id: "a", title: "Check", dependencies: [], status: "pending", estimated_cost_usd: 0,
+    result: "historical answer", attempts: [
+      { outcome: "rejected", cost_usd: 0, result: "first answer", result_source: "provider" },
+      { outcome: "error", cost_usd: 0, tool_calls: [
+        { turn: 0, tool: "command", detail: "unknown check", ok: null, status: "unknown" },
+        { turn: 0, tool: "command", detail: "unfinished check", ok: null, status: "incomplete",
+          diagnostic: "No completion event" },
+      ] },
+    ] }];
+  const { document, click } = await setup(t, [run], [], { openComposer: false });
+  await click(document.querySelector(".plan-node-title"));
+  const attempts = document.querySelectorAll(".plan-attempts > li");
+  assert.match(attempts[0].textContent, /first answer/);
+  assert.match(attempts[1].textContent, /本次回答未记录/);
+  assert.match(attempts[1].textContent, /未知/);
+  assert.match(attempts[1].textContent, /未完成/);
+  assert.match(attempts[1].textContent, /No completion event/);
+  assert.equal(attempts[1].querySelectorAll("li.bad").length, 0);
+  assert.match(document.querySelector(".node-progress-output h5").textContent, /历史输出.*来源未记录/);
+});
+
+test("a task that cannot be planned says why, whatever form the reason comes in", async t => {
+  const { state, window, document, act } = await setup(t);
+  const textarea = document.querySelector(".composer textarea");
+  const submit = async detail => {
+    state.createError = detail;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(textarea, "做一个飞控 MCU");
+      textarea.dispatchEvent(new window.Event("input", { bubbles: true }));
+    });
+    await act(async () => document.querySelector(".composer form").requestSubmit());
+    await settle(act, 0);
+    return document.querySelector(".form-error").textContent;
+  };
+  assert.equal(await submit({ status: "blocked", reason: "实现飞控软件链路: these files/reads are not allowed: fw/*.c" }),
+    "实现飞控软件链路: these files/reads are not allowed: fw/*.c");
+  assert.equal(await submit([{ loc: ["body", "budget_usd"], msg: "Input should be greater than 0" }]),
+    "budget_usd：Input should be greater than 0");
+  assert.doesNotMatch(document.querySelector(".form-error").textContent, /object Object/);
 });

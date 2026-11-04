@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,17 +17,97 @@ class Settings(BaseSettings):
     project_roots: list[Path] = [Path.home()]
     allow_host_shell: bool = False
     default_budget_usd: float = 2.0
-    max_parallel_nodes: int = 3
+    # Steps of one task running at once; 0: no limit, every step whose inputs are ready starts
+    # (steps changing the same files still take turns, scopes.py).
+    max_parallel_nodes: int = Field(default=0, ge=0)
+    # A step whose inputs are not ready yet starts early on what does not need them (a testbench from
+    # the interface contract, its own files), for at most head_start_minutes, then waits for them.
+    # Only steps whose files or folders are known: an unscoped one would hold the whole folder. Off by default.
+    head_start: bool = False
+    head_start_minutes: float = Field(default=30, gt=0)
+    # New projects form a durable team before planning. Existing records keep their workflow.
+    employee_teams: bool = False
+    # New plans contain executable tasks immediately, with no subsequent part refinement.
+    direct_task_planning: bool = False
+    team_max_employees: int = Field(default=8, ge=1, le=12)
+    team_max_delegation_depth: int = Field(default=3, ge=1, le=5)
+    team_max_delegations: int = Field(default=6, ge=1, le=20)
+    # A hard step takes the strongest model, unless a cheaper one scores within this many points:
+    # a point or two is not worth a model many times slower and dearer (GLM 5.3 against DeepSeek
+    # Flash, 2026-10-21: 93.9 against 92.3 for coding, about 8 times slower and 20 times dearer).
+    hard_score_margin: float = Field(default=2.0, ge=0)
+    # A step others wait for is put to the lead once it has run this many times its expected
+    # minutes (its expected turns at minutes_per_turn): go on, or stop for a faster model.
+    minutes_per_turn: float = Field(default=0.5, gt=0)
+    critical_overrun_factor: float = Field(default=2.0, gt=0)
+    # Before a task's first step, check the step sandbox, the tools and licenses the plan needs,
+    # the internet (if allowed) and the models (preflight.py).
+    preflight: bool = True
+    preflight_command_timeout: float = Field(default=120, gt=0)
+    # Before the first step, write this machine's skill for each tool the task needs that has none
+    # yet, by trying it in a step's sandbox (preflight.py, skills.py); at most this long each.
+    preflight_skills: bool = True
+    # Opt in to reusing general/local skills, then public discovery (only for tasks allowing
+    # network), before bounded generation. Existing installations retain their old policy.
+    skill_reuse_first: bool = False
+    skill_generation_max_turns: int = Field(default=6, ge=1, le=30)
+    # Optional post-task learning; the UI can persist overrides. Its budget is separate and shown.
+    learning_enabled: bool = False
+    learning_budget_usd: float = Field(default=0.5, ge=0, le=100)
+    skill_preparation_timeout: float = Field(default=900, gt=0)
+    # A public address that shows the internet can be reached from a step's sandbox.
+    preflight_network_url: str = "https://pypi.org/simple/"
+    # Steps of one task running on one API provider at once; a step past it goes to another
+    # provider's model if one can do it for at most spread_cost_factor times the cost. Off (0) by
+    # default: steps one after another on one provider are fine (a failing one switches model
+    # anyway), and spreading would hand everyday steps to weaker models.
+    max_steps_per_provider: int = Field(default=0, ge=0)
+    spread_cost_factor: float = Field(default=3.0, ge=1.0)
     # API models work on files and run sandboxed commands through tools (agent.py); off, they
     # only return text and cannot be routed to nodes that change a project.
     api_agent: bool = True
     # Turns of tool calls per attempt of an API model; 0 means no limit. Long attempts are not cut
     # off but checked (progress_check_minutes).
     api_agent_max_turns: int = Field(default=0, ge=0, le=1000)
+    # Per provider: concurrency, rpm, tpm. Zero/absent means unconfigured; never guess API quotas.
+    provider_limits: dict[str, dict[str, int]] = Field(default_factory=dict)
+    # Membership CLIs priced by their subscription, e.g. {"cli:codex": {"monthly_usd": 200}}: each call
+    # costs its share of the quota (cli_quota.py) and counts against task budgets. Empty: CLIs cost nothing.
+    cli_plans: dict[str, dict[str, float]] = Field(default_factory=dict)
+    # Share of a priced CLI's quota window used from which it no longer goes first in routing, and
+    # from which it takes no new work until the window resets.
+    cli_quota_soft_percent: float = Field(default=70, ge=0, le=100)
+    cli_quota_stop_percent: float = Field(default=90, ge=0, le=100)
+    # Compatibility mode records an explicit warning; strict mode rejects effort downgrades.
+    reasoning_fallback: Literal["report", "strict"] = "report"
+    # Configured tools receive one JSON argv argument inside the ordinary task sandbox.
+    api_tool_extensions: dict[str, dict] = Field(default_factory=dict)
+    # before_tool / after_tool argv commands receive one JSON event. Empty: no hooks.
+    api_tool_hooks: dict[str, list[list[str]]] = Field(default_factory=dict)
+
+    @field_validator("provider_limits")
+    @classmethod
+    def valid_provider_limits(cls, value):
+        for limits in value.values():
+            if set(limits) - {"concurrency", "rpm", "tpm"} or any(v < 0 for v in limits.values()):
+                raise ValueError("provider limits accept only nonnegative concurrency, rpm and tpm")
+        return value
+
+    @field_validator("api_tool_hooks")
+    @classmethod
+    def valid_hook_events(cls, value):
+        if set(value) - {"before_tool", "after_tool"}:
+            raise ValueError("tool hooks accept before_tool and after_tool only")
+        return value
     # Minutes of an attempt after which, and then every so often, another model checks whether it
     # is still making progress; only a stuck attempt is stopped. CLIs are checked the same way
     # instead of being killed at a fixed timeout.
     progress_check_minutes: float = Field(default=10, gt=0)
+    # A lead's conversation call through Codex (splitting a part, a decision) runs while Codex
+    # keeps printing its work, and is stopped after this long without any output, at most
+    # lead_call_max_minutes in all (also the limit for Claude Code, which answers only at the end).
+    lead_idle_minutes: float = Field(default=10, gt=0)
+    lead_call_max_minutes: float = Field(default=60, gt=0)
     # A failed attempt goes to the task's lead to decide what next (supervisor.py), instead of a
     # new diagnosis each time. Past these many decisions for one step, or for the whole task, the
     # task pauses for the user.
@@ -47,15 +127,51 @@ class Settings(BaseSettings):
     # run a task's steps or lead it: glm-5.3-flash leaves tool-calling requests unanswered.
     helper_only_models: list[str] = Field(default_factory=lambda: ["glm:glm-5.3-flash"])
     deepseek_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] = "max"
+    # A step's reasoning effort by its difficulty: thinking hard on every turn of an easy step only
+    # makes it slower. Calls outside steps (reviews, summaries) use deepseek_reasoning_effort.
+    reasoning_by_difficulty: dict[str, str] = Field(default_factory=lambda: {"easy": "low", "normal": "medium", "hard": "max"})
+    # The task's lead plans and decides for the whole task: it thinks hardest. Diagnoses a step below.
+    lead_reasoning_effort: str = "max"
+    # Initial staffing and outline generation can use their own effort, without changing the
+    # retained lead, refinement or retrospective. Empty/zero preserve the existing policy.
+    # "auto": staffing at the planning effort for the request's difficulty (planner.PLANNING_EFFORT).
+    team_reasoning_effort: Literal["", "auto", "low", "medium", "high", "max"] = "auto"
+    # "auto": the lead first judges how hard the request is to plan (one quick call at medium effort)
+    # and plans it at the effort for that difficulty (planner.PLANNING_EFFORT).
+    planning_reasoning_effort: Literal["", "auto", "low", "medium", "high", "max"] = "auto"
+    # Seconds a planning call may take at low or medium effort; longer at high and max
+    # (planner.PLANNING_TIME). 0: no limit.
+    planning_call_timeout: float = Field(default=0, ge=0)
+    # Let the lead's per-part difficulty/effort assessment control refinement conversations.
+    adaptive_refinement: bool = False
+    diagnosis_reasoning_effort: str = "high"
+    # A diagnosis, environment repair or platform repair call may run this long. A long
+    # regression or a tool install can outlast half an hour, and the call must still finish.
+    repair_call_minutes: float = Field(default=60, gt=0)
+    # Codex's service tier for the lead ("fast", "flex", ...); empty keeps the user's Codex config.
+    codex_lead_service_tier: str = ""
+    # Codex as the platform runs it leaves out the user's plugins, apps and MCP servers, which its
+    # leads and steps do not use and which slow every start.
+    codex_without_extras: bool = True
+    # Where the leads' conversations keep their folders (a CLI conversation is tied to one); outside
+    # any project, so a CLI does not take a project's instructions (AGENTS.md, CLAUDE.md) for its own.
+    # Empty: <XDG cache>/super-partner/leads.
+    lead_root: Optional[Path] = None
     # Seconds to wait for one API response; long outputs take minutes to generate.
     api_request_timeout: float = Field(default=600, ge=30)
     # A response not complete after this many seconds, even if data keeps arriving, fails at
     # once without a retry: its model counts as unavailable for a while, and another takes over.
     api_reply_deadline: float = Field(default=300, ge=30)
     # Local TCP ports that API models' sandboxed commands may still reach, such as an EDA
-    # license server: lmgrd's port plus its vendor daemon's, which must be pinned in the license
-    # file (VENDOR snpslmd port=...). All other network access stays blocked. Needs socat.
+    # license server's lmgrd port; its vendor daemons' ports (snpslmd, ...) are found and added at
+    # each command (environment.license_daemon_ports; for a root lmgrd by tracing lmutil lmstat,
+    # needs strace). All other network access stays blocked.
+    # Needs socat.
     sandbox_host_ports: list[int] = []
+    # Shell scripts every step command sources first, e.g. an EDA tool setup that puts vcs on PATH
+    # and sets license variables. A machine's own scripts can also be recorded in
+    # .super-partner/tools/sandbox.json as "profiles" (environment.profiles).
+    sandbox_profiles: list[str] = []
     # Host environment variables copied into that sandbox, e.g. VCS_HOME or
     # SNPSLMD_LICENSE_FILE. Listing PATH replaces the sandbox's minimal PATH with the host's.
     sandbox_env: list[str] = []
@@ -65,12 +181,29 @@ class Settings(BaseSettings):
     # Handle a failed attempt instead of only retrying it: the task's lead decides (lead_decisions),
     # or, without a lead able to, a diagnosis looks for what blocks it.
     auto_diagnose: bool = True
+    # When a task ends, the cheapest API model names its problems by what they are about, so one
+    # cause recorded under several names is counted as one (retrospect.name_problems).
+    problem_naming: bool = True
     # Diagnose and repair this application's source, separately from task workspaces.
     platform_self_repair: bool = True
     platform_root: Optional[Path] = None
     platform_repair_attempts: int = Field(default=2, ge=1, le=3)
+    # Spending cap of a platform engineer job the user starts (engineer.py); membership CLIs cost
+    # nothing extra. Repairs started from a task are charged to that task instead.
+    engineer_budget_usd: float = Field(default=2.0, ge=0)
+    # Commit an applied platform change to the source checkout's current branch (never pushed).
+    engineer_commit: bool = True
     # Have another model check each node's result against its acceptance criteria.
     review_nodes: bool = True
+    # Accepting each step's result: off, a step that finishes has passed. No reviewer, no declared
+    # check or artifact acceptance command, no verification steps sending work back. The lead's
+    # final check of the whole result stays (leading._final_review). A step saying it cannot do
+    # its work (UNABLE/BLOCKED) still fails, and progress checks, artifact contracts' turn and
+    # cost limits and the budget still apply.
+    acceptance: bool = False
+    # Contract steps get at least contracts.MIN_TOOL_CALLS tool calls by difficulty, whatever
+    # tighter limit the lead declared.
+    contract_call_floors: bool = True
     # Without a lead deciding (the fallback): runs per node (first try plus retries) before it
     # fails, retries going to the strongest model, and times verification nodes may send work back
     # within one task. With a lead, max_node_decisions and max_run_decisions bound it instead.

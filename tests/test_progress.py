@@ -1,11 +1,15 @@
 """No turn limit and no fixed timeout: a long attempt is checked, and stopped only if stuck."""
 import asyncio
+import contextlib
 import json
 import os
+import shlex
+import signal
+import sys
 
 import httpx
 import pytest
-from super_partner import progress
+from super_partner import activity, progress
 from super_partner.budget import ProviderError
 from super_partner.cli_channels import CliChannelRegistry
 from super_partner.config import settings
@@ -30,10 +34,10 @@ def often(monkeypatch):
     monkeypatch.setattr(settings, "progress_check_minutes", 0.2 / 60)
 
 
-def test_the_checker_must_say_stop_to_stop():
+def test_the_checker_must_explicitly_permit_continuation():
     assert progress.parse("还在写测试，进展正常。\nVERDICT: CONTINUE") is None
     assert progress.parse("VERDICT: STOP: 连续 12 次运行同一条失败的命令") == "连续 12 次运行同一条失败的命令"
-    assert progress.parse("看不出来") is None
+    assert "未给出唯一有效结论" in progress.parse("看不出来")
 
 
 def test_there_is_no_turn_limit_by_default():
@@ -111,6 +115,61 @@ async def test_a_cli_past_its_timeout_is_checked_not_killed(tmp_path, monkeypatc
     assert checks and "made.txt" in checks[0] and "sleep" in checks[0]
 
 
+async def test_a_cli_child_in_a_session_of_its_own_is_still_seen_running(tmp_path, monkeypatch, often):
+    child = tmp_path / "child.pid"
+    code = ("import os,time; os.setsid(); "
+            f"open({str(child)!r},'w').write(str(os.getpid())); time.sleep(30)")
+    fake_codex(tmp_path, monkeypatch,
+               "#!/bin/sh\n"
+               f"{shlex.quote(sys.executable)} -c {shlex.quote(code)} &\n"
+               "i=0\n"
+               f"while [ ! -s {shlex.quote(str(child))} ] && [ $i -lt 200 ]; do i=$((i+1)); sleep 0.01; done\n"
+               "sleep 1\n"
+               "echo finished\n")
+    checks = []
+
+    async def watch(evidence):
+        checks.append(evidence)
+
+    try:
+        text = await CliChannelRegistry().complete("cli:codex", "hi", tmp_path, timeout=0.1, watch=watch)
+        assert text == "finished"
+        assert any("time.sleep(30)" in evidence for evidence in checks), checks
+    finally:
+        pid = child.read_text().strip() if child.exists() else ""
+        if pid.isdigit():
+            with contextlib.suppress(OSError):
+                os.kill(int(pid), signal.SIGKILL)
+
+
+async def test_a_growing_log_and_the_output_it_prints_are_shown_to_the_checker(tmp_path, monkeypatch, often):
+    # Codex prints one JSON event per line; the last agent message is its answer.
+    fake_codex(tmp_path, monkeypatch,
+               "#!/bin/sh\n"
+               "i=0\n"
+               "while [ $i -lt 30 ]; do i=$((i+1)); echo \"regression $i\" >> run.log; "
+               "printf '{\"type\":\"item.completed\",\"item\":{\"id\":\"m%s\",\"type\":\"agent_message\","
+               "\"text\":\"regression %s\"}}\\n' \"$i\" \"$i\"; sleep 0.05; done\n"
+               "sleep 1\n"
+               "printf '{\"type\":\"item.completed\",\"item\":{\"id\":\"done\","
+               "\"type\":\"agent_message\",\"text\":\"finished\"}}\\n'\n")
+    checks = []
+
+    async def watch(evidence):
+        checks.append(evidence)
+
+    with activity.recording([]):
+        text = await CliChannelRegistry().complete("cli:codex", "hi", tmp_path, timeout=0.1, watch=watch)
+    assert text == "finished"
+    assert any("run.log" in evidence and "larger" in evidence for evidence in checks), checks
+    assert any("printed" in evidence for evidence in checks), checks
+
+
+def test_the_checker_is_told_a_long_regression_with_children_is_progressing():
+    prompt = progress.check_prompt(TaskNode(id="n", title="t", instructions="i", capability="coding"), 30, "e")
+    assert "regression" in prompt and "child processes" in prompt
+
+
 async def test_a_stuck_cli_is_stopped_with_its_processes_and_does_not_fall_back(tmp_path, monkeypatch, often):
     child = tmp_path / "child.pid"
     fake_codex(tmp_path, monkeypatch, f"#!/bin/sh\nsleep 30 &\necho $! > {child}\nwait\n")
@@ -132,7 +191,7 @@ async def test_the_executor_asks_another_model_and_records_the_check(tmp_path, m
     monkeypatch.setattr(settings, "workspace_root", tmp_path / "workspaces")
     database = Database(tmp_path / "test.db")
     one_node_run(database)
-    asked = []
+    asked, efforts = [], []
 
     class Checker:
         def configured_models(self, ids):
@@ -140,6 +199,7 @@ async def test_the_executor_asks_another_model_and_records_the_check(tmp_path, m
 
         async def complete(self, model_id, prompt, workspace=None, **kwargs):
             asked.append((model_id, prompt))
+            efforts.append(kwargs.get("effort"))
             return ProviderResult("同一条命令失败了 9 次\nVERDICT: STOP: 反复运行同一条失败的命令", 0, 0, model_id)
 
     executor = Executor(database, Checker(), MODELS)
@@ -147,11 +207,37 @@ async def test_the_executor_asks_another_model_and_records_the_check(tmp_path, m
     watch = executor._progress_watch(run, run.plan.nodes[0], "x:api")
     reason = await watch("- turn 9: run_command node --check app.js  (failed)")
     assert reason == "反复运行同一条失败的命令"
-    # Not the model at work, and it saw the step and the evidence.
+    # This fixture's CLI is weaker. A fresh call to the producer sees the step and evidence.
     [(checker, prompt)] = asked
-    assert checker == "cli:claude" and "run node --check" in prompt and "turn 9" in prompt
+    assert checker == "x:api" and "run node --check" in prompt and "turn 9" in prompt
+    assert efforts == ["low"]  # a quick yes or no, not the step's effort
     event = [e for e in database.events("r") if e.kind == "node.progress_check"][-1]
     assert event.data["stop"] is True and event.data["reason"] == reason
+
+
+async def test_a_long_attempt_goes_on_when_no_model_can_check_it(tmp_path, monkeypatch):
+    """The producing model has no peer able to check it: a check that cannot be made must let the
+    attempt go on (the task's budget still bounds it), never stop work that keeps producing evidence."""
+    monkeypatch.setattr(settings, "workspace_root", tmp_path / "workspaces")
+    database = Database(tmp_path / "test.db")
+    one_node_run(database)
+
+    class NoChecker:
+        def configured_models(self, ids):
+            return set()
+
+        async def complete(self, *args, **kwargs):
+            raise AssertionError("no model can check this attempt")
+
+    executor = Executor(database, NoChecker(), {})
+    run = database.get_run("r")
+    watch = executor._progress_watch(run, run.plan.nodes[0], "cli:codex")
+    for _ in range(3):
+        assert await watch("回归日志仍在增长，子进程还在运行") is None
+    checks = [event for event in database.events("r") if event.kind == "node.progress_check"]
+    assert len(checks) == 3
+    assert all(event.data["stop"] is False and event.data["checked"] is False
+               and event.data["checker_model_id"] is None for event in checks)
 
 
 async def test_a_request_the_model_never_answers_is_checked_while_it_waits(tmp_path, monkeypatch, often):
@@ -203,3 +289,64 @@ def test_helper_only_models_never_run_or_lead_a_task():
     step = TaskNode(id="n", title="t", instructions="i", capability="coding")
     assert [m.id for m in eligible_for_node(step, [helper, worker], {helper.id, worker.id})] == ["x:api"]
     assert [m.id for m in supervisor.candidates([helper, worker], {helper.id, worker.id})] == ["x:api"]
+async def test_artifact_hard_turn_limit_makes_no_extra_summary_request_and_keeps_trace(tmp_path, monkeypatch):
+    from super_partner.budget import RequestBudget, StepLimitExceeded
+    from super_partner.models import ModelProfile
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    calls, turns, tools = [], [], []
+    model_id = "deepseek:deepseek-flash"
+    model = ModelProfile(id=model_id, provider="deepseek", display_name="test", input_per_million=1, output_per_million=1)
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json=reply({"content": "Still working", "tool_calls": [READ]}))
+
+    async def turn():
+        turns.append(1)
+
+    async def charge(cost):
+        pass
+
+    async def begin_tool():
+        if len(tools) >= 2:
+            raise StepLimitExceeded("达到声明工具调用上限")
+        tools.append(1)
+
+    budget = RequestBudget({model_id: model}, lambda: 1, {}, charge, asyncio.Event(),
+                           turn_remaining=lambda: 2 - len(turns), use_turn=turn)
+    budget.begin_tool = begin_tool
+    budget.tool_remaining = lambda: 2 - len(tools)
+    registry = ProviderRegistry(models={model_id: model})
+    registry.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    log, trace = [], tmp_path / "trace.jsonl"
+    try:
+        result = await registry.complete(model_id, "work", tmp_path, act=True, spend_ok=budget,
+                                         tool_log=log, tool_trace=trace)
+    finally:
+        await registry.client.aclose()
+    assert len(calls) == len(turns) == result.turns == 2
+    assert result.turn_limit and len(log) == 2 and len(trace.read_text().splitlines()) == 2
+    assert result.input_tokens == result.output_tokens == 2
+    assert len(tools) == 2
+
+
+async def test_artifact_limit_survives_provider_failure_after_a_plain_response(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.budget import ProviderError
+    from super_partner.models import NodeStatus
+
+    async def fail(node, workspace, kwargs):
+        error = ProviderError("truncated reply")
+        error.usage = ProviderResult("", 1000, 1000, "test:worker", turns=1)
+        raise error
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch,
+                                           [contract_node(contract={"max_turns": 1})], fail)
+    await executor.execute("artifacts")
+    node = db.get_run("artifacts").plan.nodes[0]
+    assert node.status == NodeStatus.BLOCKED and providers.calls == ["vdb"]
+    assert node.attempts[0].turns == node.contract_turns == 1
+    assert node.attempts[0].cost_usd == pytest.approx(0.002)
+    assert "truncated reply" in node.review
+

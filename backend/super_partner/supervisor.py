@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Optional
-from uuid import uuid4
 
+from . import folders
 from .budget import ProviderError
 from .cli_channels import SESSION_CLIS, SessionLost
 from .config import settings
@@ -50,7 +51,7 @@ def candidates(models: list[ModelProfile], configured: set[str], exclude=()) -> 
 
 def new_session(model: ModelProfile, previous: Optional[SupervisorSession] = None) -> SupervisorSession:
     """A fresh conversation for ``model``, in a folder of its own (a CLI conversation is tied to it)."""
-    session = SupervisorSession(model_id=model.id, cwd=str(settings.data_dir / "supervisors" / uuid4().hex))
+    session = SupervisorSession(model_id=model.id, cwd=str(folders.lead_folder(model.id)))
     if previous and previous.model_id:
         session.previous = [*previous.previous, previous.model_id]
     return session
@@ -82,10 +83,13 @@ def handover(run: ExecutionRun) -> str:
         f"Working directory: {run.project_dir or settings.workspace_root / run.folder_id}",
         "Steps:",
     ]
+    if run.plan.employees:
+        from .team import assignment_prompt
+        lines.append(assignment_prompt(run.plan))
     for node in run.plan.nodes:
         deps = f" (after {', '.join(node.dependencies)})" if node.dependencies else ""
-        lines.append(f"- [{node.id}] {node.title}{deps}: {node.status.value}, {len(node.attempts)} attempts, "
-                     f"model {node.model_id}")
+        lines.append(f"- [{node.id}] {node.title}{part_of(run, node)}{deps}: {node.status.value}, {len(node.attempts)} attempts, "
+                     f"model {node.model_id}" + (f", employee {node.employee_id}, delegated by {node.delegation_parent_id}" if node.employee_id else ""))
         if node.status == NodeStatus.SUCCEEDED and (node.summary or node.result):
             lines.append(f"  result: {(node.summary or node.result)[:MAX_RESULT_CHARS]}")
         elif node.attempts and node.attempts[-1].outcome != "passed":
@@ -140,11 +144,11 @@ async def ask(providers, models: list[ModelProfile], configured: set[str], run: 
 # --- deciding what to do after a failed attempt -------------------------------------------------
 
 ACTIONS = ("retry", "switch_model", "accept", "unable", "ask_user", "repair_environment", "repair_platform",
-           "rework", "replan", "done")
+           "request_component", "rework", "replan", "done")
 # What the lead may answer when every step has finished.
 FINAL_ACTIONS = ("done", "rework", "replan")
 ACTION_RULES = {
-    "rework": "- rework: send the verified steps listed in targets back to be redone, with instructions "
+    "rework": "- rework: send the steps listed in targets back to be redone, with instructions "
               "saying exactly what to change. Only for real problems the task needs fixed; not for new "
               "requirements the task never asked for, and not when the verification itself is wrong.\n",
     "retry": "- retry: the same model again. Only if the next attempt will do something materially different.\n",
@@ -161,7 +165,13 @@ ACTION_RULES = {
                           "or machine limits, configuration). A repair session with access to this machine "
                           "fixes it, then the step runs again.\n",
     "repair_platform": "- repair_platform: Super Partner itself (its scheduler, tools or sandbox) is at fault; say "
-                       "what and where. A source repair is made, checked and applied, then the task continues.\n",
+                       "what and where. Its platform engineer (平台工程师) makes a source repair, checked and "
+                       "applied, then the task continues.\n",
+    "request_component": "- request_component: the task needs a capability Super Partner does not have (a tool for "
+                         "the steps, a model channel, a kind of step or check) and no repair of a defect would "
+                         "give it. Say in instructions what to add and why. Super Partner's platform engineer "
+                         "(平台工程师) plans it, the user approves, and it is built, checked and applied; the task waits, "
+                         "then you decide again.\n",
     "replan": "- replan: change the plan in \"plan\": add steps, remove steps that have not finished, or rewrite "
               "the instructions of steps that have not finished (splitting a step that is too big, adding a "
               "missing prerequisite, dropping one the task does not need). Finished steps stay as they are.\n",
@@ -173,7 +183,8 @@ PLAN_FORMAT = (
     '"difficulty": "easy | normal | hard", "dependencies": ["ids of existing steps or keys of added ones"], '
     '"verifies": ["optional: ids or keys of steps this one verifies"], '
     '"files": ["files it creates or changes, at most 5"], "reads": ["files it reads for reference"], '
-    '"provides": "what later steps can rely on", "check": "a command that shows it works"}], '
+    '"provides": "what later steps can rely on", "check": "a command that shows it works", '
+    '"part": "optional: id of the plan part it belongs to; by default the part of the step decided on"}], '
     '"remove": ["ids of steps that have not finished"], '
     '"update": [{"id": "...", "title": "optional", "instructions": "optional", "acceptance_criteria": "optional", '
     '"dependencies": ["optional: the full new list"], "files": ["optional: the full new list"], '
@@ -191,11 +202,14 @@ def decision_format(rework: bool = False, final: bool = False) -> str:
         f'{{"action": "{" | ".join(actions)}", '
         '"reason": "one or two sentences in Chinese, shown to the user", '
         '"instructions": "for retry / switch_model / rework: exactly what must be done differently; '
-        'for repair_*: what to repair", "model_id": "switch_model only: one of the models listed", '
+        'for repair_*: what to repair; for request_component: what to add and why", "model_id": "switch_model only: one of the models listed", '
         + ('"targets": ["rework only: ids of the steps to redo"], ' if rework or final else "")
         + (PLAN_FORMAT + ", " if "replan" in actions else "")
         + '"question": "ask_user only, in Chinese", "options": ["ask_user only: up to 4 answers"], '
-        '"user_action": "unable only: what the user could do to make it possible"}\n'
+        '"user_action": "unable only: what the user could do to make it possible", '
+        '"engineer": {"kind": "repair | component", "request": "optional, with any action: a fault in Super '
+        'Partner itself, or a capability it lacks, that you found and this decision does not deal with; the '
+        'platform engineer (平台工程师) joins the task\'s conversation and works on it in the background"}}\n'
         + "".join(ACTION_RULES[action] for action in actions)
     )
 
@@ -204,8 +218,14 @@ DECISION_FORMAT = decision_format()
 MAX_EVIDENCE_CHARS = 1500
 
 
+def part_of(run: ExecutionRun, node) -> str:
+    """Where a step sits in a plan made in parts: " in [id] Part › Sub-part"."""
+    path = run.plan.part_path(node.part_id)
+    return f" in [{path[-1].id}] {' › '.join(part.title for part in path)}" if path else ""
+
+
 def _steps(run: ExecutionRun) -> list[str]:
-    return [f"- [{node.id}] {node.title}: {node.status.value}" for node in run.plan.nodes]
+    return [f"- [{node.id}] {node.title}{part_of(run, node)}: {node.status.value}" for node in run.plan.nodes]
 
 
 def _models(choices: list[ModelProfile], node) -> list[str]:
@@ -213,9 +233,19 @@ def _models(choices: list[ModelProfile], node) -> list[str]:
             f"reliability {model.scores.reliability:g})" for model in choices]
 
 
+BLOCKED_NOTE = (
+    "This step stopped as BLOCKED: something it needs is missing or a target it must meet was not "
+    "reached (see why above). Decide what unblocks it: rework the steps it builds on (targets) with "
+    "instructions saying exactly what to add or fix, which redoes them and then this step; "
+    "repair_environment or repair_platform when the machine or Super Partner is at fault; retry when "
+    "something has changed; accept when what it delivered is enough for the request; ask_user when "
+    "only the user can decide (for example whether a target can be relaxed); unable to stop.")
+
+
 def failure_message(run: ExecutionRun, node, attempt, verdict, choices: list[ModelProfile],
-                    left: tuple[int, int]) -> str:
-    """Tell the lead an attempt of ``node`` failed, with the evidence, and ask what to do."""
+                    left: tuple[int, int], upstream: Optional[set[str]] = None) -> str:
+    """Tell the lead an attempt of ``node`` failed, with the evidence, and ask what to do;
+    ``upstream``: the finished steps it builds on, which rework may send back."""
     from .diagnosis import NETWORK_CHOICE, _tool_summary
 
     earlier = [f"- {item.model_id}: {item.outcome}: {(item.reason or '')[:200]}" for item in node.attempts[:-1][-6:]]
@@ -230,6 +260,7 @@ def failure_message(run: ExecutionRun, node, attempt, verdict, choices: list[Mod
         *(["Earlier attempts of this step:", *earlier] if earlier else []),
         "Where the steps stand:", *_steps(run),
         "Models that can take this step:", *_models(choices, node),
+        *([f"Steps it builds on, which rework may send back: {', '.join(sorted(upstream))}"] if upstream else []),
         f"Decisions left: {left[0]} for this step, {left[1]} for the task; after that the task pauses for the user.",
         ("This task allows the internet." if run.allow_network else
          "This task does not allow the internet. If the step itself must reach it while it runs, "
@@ -237,9 +268,22 @@ def failure_message(run: ExecutionRun, node, attempt, verdict, choices: list[Mod
         "",
         ("Decide what to do with this step. You may look at the files in the working directory "
          f"({run.project_dir or settings.workspace_root / run.folder_id}) first."),
-        DECISION_FORMAT,
+        decision_format(rework=bool(upstream)),
     ]
     return "\n".join(lines)
+
+
+def limit_note(node, granted: dict) -> str:
+    """Added to a failure at a contract step's declared limit: what deciding to go on grants."""
+    contract = node.artifact_contract
+    outputs = ", ".join(item.path for item in contract.outputs)
+    return (f"This step stopped at its declared limit ({contract.max_turns} tool calls, "
+            f"${contract.max_cost_usd:g}); it has used {max(node.contract_turns, node.contract_tool_calls)} calls "
+            f"and ${node.contract_cost_usd:.4f}. Its declared outputs: {outputs}. Deciding retry, "
+            f"switch_model or replan grants it more: up to {granted['max_turns']} tool calls and "
+            f"${granted['max_cost_usd']:g} in all, keeping what it has written. Say in instructions what "
+            "it must finish first. To make the work smaller, replan into smaller steps; to stop, "
+            "decide unable.")
 
 
 def verification_message(run: ExecutionRun, verifier, verdict, choices: list[ModelProfile],
@@ -308,6 +352,21 @@ def overrun_message(node, turns: int, expected: int, evidence: str) -> str:
     ])
 
 
+def critical_overrun_message(node, model_id: str, minutes: float, expected: float, waiting: list[str],
+                             evidence: str) -> str:
+    """A step the rest of the task waits for, running far past its expected time on its model."""
+    return "\n".join([
+        (f"EVENT: step [{node.id}] {node.title} has run {minutes:.0f} minutes on {model_id}; about "
+         f"{expected:.0f} were expected. It is not stuck, but {len(waiting)} steps wait for it: "
+         + "; ".join(waiting[:8]) + "."),
+        f"What it has been doing:\n{evidence}",
+        ("Should it go on, or stop so that you can give it to a faster model (switch_model) or split it? "
+         "Its files stay in the working directory for the next attempt. Stop it only if it is slow or "
+         "off track, not when it is about to finish. End with exactly one line: `VERDICT: CONTINUE` or "
+         "`VERDICT: STOP: <why, in Chinese>`."),
+    ])
+
+
 def chat_message(text: str) -> str:
     """The user writing to the lead directly, not answering one of its questions."""
     return (
@@ -315,8 +374,57 @@ def chat_message(text: str) -> str:
         f"{text}\n\n"
         "Answer in Chinese, in a few sentences, as yourself: the lead who has followed this task. "
         "No decision JSON is needed here. If they ask for a change (to a step, the plan, or how you "
-        "decide), say what you will do; you will act on it at your next decisions."
+        "decide), say what you will do; you will act on it at your next decisions.\n"
+        "The platform engineer (平台工程师) changes Super Partner itself: its sandbox, tools, scheduler or "
+        "model channels. If the user asks for it, or you find that Super Partner itself is at fault or lacks "
+        "a capability the task needs, bring it into this conversation now, not at a later decision: end your "
+        "answer with one line\n"
+        'ENGINEER: {"kind": "repair or component", "request": "what to repair or add, why, and the evidence"}\n'
+        "A repair is applied once it passes its checks; a component waits for the user's approval. Its plan, "
+        "questions and progress appear in this conversation."
     )
+
+
+ENGINEER_LINE = re.compile(r"^\s*ENGINEER:\s*(\{.*\})\s*$", re.MULTILINE)
+
+
+def read_engineer(value) -> Optional[dict]:
+    """A call for the platform engineer ({"kind", "request"}), or None if it is not one."""
+    if not isinstance(value, dict) or not str(value.get("request") or "").strip():
+        return None
+    kind = str(value.get("kind") or "repair").strip()
+    return {"kind": kind if kind in {"repair", "component"} else "repair", "request": str(value["request"]).strip()[:6000]}
+
+
+def split_engineer(text: str) -> tuple[str, Optional[dict]]:
+    """A chat answer without its ENGINEER line, and the call that line makes."""
+    found = ENGINEER_LINE.search(text or "")
+    if not found:
+        return text, None
+    try:
+        call = read_engineer(json.loads(found.group(1)))
+    except json.JSONDecodeError:
+        call = None
+    return (text[:found.start()] + text[found.end():]).strip(), call
+
+
+ENGINEER_STATES = {
+    "queued": "queued", "planning": "writing its plan", "plan_ready": "plan written, waiting for the user's approval",
+    "needs_input": "waiting for the user's answer", "editing": "making the change in a copy",
+    "validating": "checking the change", "ready": "change checked, waiting for the user to apply it",
+    "applying": "being applied (Super Partner restarts)", "applied": "applied", "failed": "failed",
+    "rejected": "given up by the user", "cancelled": "cancelled",
+}
+
+
+def engineer_updates(jobs) -> str:
+    """What changed in the platform engineer's work for this task since the lead last heard."""
+    lines = ["UPDATE from the platform engineer (平台工程师) on its work for this task:"]
+    for job in jobs:
+        lines.append(f"- [{job.id}] {job.kind} \"{job.title}\": {ENGINEER_STATES.get(job.status, job.status)}")
+        if job.status in {"applied", "failed"} and (job.report or job.error):
+            lines.append(f"  {(job.error or job.report)[:600]}")
+    return "\n".join(lines) + "\n\n"
 
 
 MAX_REPAIR_REPORT = 3000
@@ -337,6 +445,35 @@ def repair_message(run: ExecutionRun, node, diagnosis, choices: list[ModelProfil
          "removed and checked (for example a login or command that now works); if the repair did not "
          "do that, do not send the step back to meet the same obstacle: repair again differently, ask "
          "the user, or mark it unable."),
+        DECISION_FORMAT,
+    ])
+
+
+ENGINEER_OUTCOMES = {
+    "applied": "It was built, checked and applied: Super Partner now has it.",
+    "failed": "It could not be built or applied.",
+    "rejected": "The user gave it up: it will not be added.",
+    "cancelled": "It was cancelled.",
+}
+
+
+def engineer_message(run: ExecutionRun, node, job, choices: list[ModelProfile], left: tuple[int, int]) -> str:
+    """The component the lead asked the platform engineer for is done with: its outcome."""
+    talk = [f"- {item.role}: {item.text[:400]}" for item in job.messages[-6:] if item.role in {"user", "engineer"}]
+    return "\n".join([
+        f"EVENT: the component you asked for, for step [{node.id}] {node.title}, is done with. "
+        + ENGINEER_OUTCOMES.get(job.status, f"It ended as {job.status}."),
+        f"What you asked for: {job.request[:800]}",
+        *([f"The plan:\n{job.plan[:MAX_REPAIR_REPORT]}"] if job.plan else []),
+        *([f"Its report:\n{job.report[:MAX_REPAIR_REPORT]}"] if job.report else []),
+        *([f"Why it failed: {job.error[:800]}"] if job.error else []),
+        *([f"Changed files: {', '.join(job.files[:30])}"] if job.files else []),
+        *(["What the user and the engineer said:", *talk] if talk else []),
+        "Where the steps stand:", *_steps(run),
+        "Models that can take this step:", *_models(choices, node),
+        f"Decisions left: {left[0]} for this step, {left[1]} for the task; after that the task pauses for the user.",
+        "",
+        "Decide what to do with the step now. Without the component, do not send the step back to the same wall.",
         DECISION_FORMAT,
     ])
 
@@ -376,6 +513,10 @@ def parse_decision(text: str, model_ids: set[str], targets: Optional[set[str]] =
         return None
     if clean["action"] == "ask_user" and not clean.get("question"):
         return None
+    if clean["action"] == "request_component" and not (clean.get("instructions") or clean.get("reason")):
+        return None
+    if call := read_engineer(payload.get("engineer")):
+        clean["engineer"] = call
     if clean["action"] == "rework":
         chosen = payload.get("targets") or sorted(targets or ())
         if not targets or not isinstance(chosen, list) or not set(map(str, chosen)) <= targets:

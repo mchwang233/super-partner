@@ -176,9 +176,46 @@ def test_planner_difficulty_sets_the_threshold_and_old_plans_derive_it():
     assert (saved.difficulty, saved.quality_threshold) == ("hard", 92)
 
 
+def test_a_result_is_checked_by_a_model_no_weaker_than_the_one_that_made_it():
+    """A cheap model scoring high on reliability alone (MiniMax M3 against DeepSeek Flash) is
+    not a fit judge of a generally stronger model's work."""
+    from super_partner.models import CapabilityScore, ModelProfile
+    from super_partner.routing import pick_reviewer
+
+    def api(model_id, overall, reliability, price):
+        scores = CapabilityScore(**{name: overall for name in ("coding", "planning", "research", "chinese",
+                                                              "tool_use", "structured_output")}, reliability=reliability)
+        return ModelProfile(id=model_id, provider=model_id.split(":")[0], display_name=model_id, context_window=1_000_000,
+                            input_per_million=price, output_per_million=price * 4, cached_input_per_million=price / 10,
+                            scores=scores)
+    flash, weak, strong, strongest = (api("deepseek:flash", 92, 87.5, 0.15), api("minimax:m3", 88, 93.5, 0.3),
+                                      api("glm:glm", 93, 92.4, 1.2), api("kimi:k3", 95, 89, 3.0))
+    models = [flash, weak, strong, strongest]
+    ids = {model.id for model in models}
+    # The cheapest one at least as capable as the model checked, not the most reliable.
+    assert pick_reviewer(models, ids, exclude="deepseek:flash", tokens=1000).id == "glm:glm"
+    # With no equally capable independent judge, use a fresh conversation with the producer.
+    assert pick_reviewer(models, ids, exclude="kimi:k3", tokens=1000).id == "kimi:k3"
+    assert pick_reviewer(models, ids - {"glm:glm", "kimi:k3"}, exclude="deepseek:flash", tokens=1000).id == "deepseek:flash"
+    assert pick_reviewer(models, {"minimax:m3"}, exclude="deepseek:flash", tokens=1000) is None
+
+
 def test_reviews_also_go_to_api_models_first():
     from super_partner.routing import pick_reviewer
     models = scored_models()
     configured = {"cli:claude", "openai:gpt-5.6-luna"}
     assert pick_reviewer(models, configured, exclude="openai:gpt-6", tokens=1000).id == "openai:gpt-5.6-luna"
     assert pick_reviewer(models, {"cli:claude"}, exclude=None, tokens=1000).id == "cli:claude"
+async def test_artifact_invalid_plan_is_returned_as_blocked_not_an_executable_fallback(task_api, monkeypatch):
+    from super_partner.contracts import ContractError
+
+    api, client = task_api
+
+    async def invalid(*args, **kwargs):
+        raise ContractError("missing accepted report dependency")
+
+    monkeypatch.setattr(api, "autonomous_plan", invalid)
+    response = await client.post("/api/tasks", json={"prompt": "Generate a coverage report", "budget_usd": 1})
+    assert response.status_code == 422
+    assert response.json()["detail"]["status"] == "blocked"
+    assert "report dependency" in response.json()["detail"]["reason"]

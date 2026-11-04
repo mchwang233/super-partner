@@ -1,51 +1,62 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { CAPABILITIES, Radar, score, type CapabilityKey, type Model } from "./model-profiles";
-import { formatUsd, statusLabel } from "./mission-history";
+import { formatUsd, nodeStatusLabel, statusLabel } from "./mission-history";
 import { MarkdownView } from "./markdown";
 
 export type PlanNode = {
   id: string; title: string; model_id: string; status: string; estimated_cost_usd: number;
+  employee_id?: string | null; delegation_parent_id?: string | null;
   capability?: string; dependencies?: string[]; needs_workspace?: boolean; result?: string;
-  difficulty?: string; quality_threshold?: number; routing_note?: string | null; started_at?: string | null;
+  difficulty?: string; quality_threshold?: number; routing_note?: string | null; started_at?: string | null; waiting_for_folder?: boolean; preparing?: boolean; head_start?: string;
   acceptance_criteria?: string; verifies?: string[]; attempts?: NodeAttempt[]; failed_attempts?: number;
   feedback?: string | null; unable_reason?: string | null; review_passed?: boolean | null; review?: string | null; summary?: string | null;
-  changed_files?: string[]; inputs?: { node_id: string; form: string; changed_files: number }[];
-  files?: string[]; reads?: string[]; provides?: string; check?: string;
+  changed_files?: string[]; folders?: string[]; inputs?: { node_id: string; form: string; changed_files: number }[];
+  files?: string[]; reads?: string[]; provides?: string; check?: string; part_id?: string | null;
 };
-type ToolCall = { turn: number; tool: string; detail?: string; ok?: boolean };
+type ToolCall = { turn: number; tool: string; detail?: string; ok?: boolean | null; output?: string; running?: boolean; status?: string; diagnostic?: string | null };
 type NodeAttempt = { model_id?: string | null; outcome: string; reason?: string | null; reviewer_model_id?: string | null; cost_usd: number; finished_at?: string;
-  turns?: number; turn_limit?: boolean; tool_calls?: ToolCall[] };
-const TOOL_LABELS: Record<string, string> = { list_dir: "列目录", read_file: "读文件", write_file: "写文件", edit_file: "改文件", run_command: "运行命令" };
+  turns?: number; turn_limit?: boolean; tool_calls?: ToolCall[]; result?: string | null; result_source?: string | null };
+const TOOL_LABELS: Record<string, string> = { Bash: "运行命令", Read: "读文件", Write: "写文件", Edit: "改文件", MultiEdit: "批量改文件",
+  Glob: "找文件", Grep: "搜索", LS: "列目录",
+  // Attempts recorded before the tools followed Claude Code's.
+  list_dir: "列目录", read_file: "读文件", write_file: "写文件", edit_file: "改文件", run_command: "运行命令",
+  // What a membership CLI does, as it prints it (activity.py).
+  command: "运行命令", file_change: "改文件", message: "说明", plan: "计划" };
 
 /** Where an API model's turns went: calls per tool, then every call, folded by default. */
-function ToolLog({ calls }: { calls: ToolCall[] }) {
+function ToolLog({ calls, open = false, title = "工具调用" }: { calls: ToolCall[]; open?: boolean; title?: string }) {
   const counts = new Map<string, [number, number]>();
   for (const call of calls) {
     const [n, bad] = counts.get(call.tool) ?? [0, 0];
     counts.set(call.tool, [n + 1, bad + (call.ok === false ? 1 : 0)]);
   }
-  return <details className="tool-log">
-    <summary>工具调用 {calls.length} 次：{[...counts].map(([tool, [n, bad]]) => `${TOOL_LABELS[tool] ?? tool} ${n}${bad ? `（失败 ${bad}）` : ""}`).join(" · ")}</summary>
+  return <details className="tool-log" open={open}>
+    <summary>{title} {calls.length} 次：{[...counts].map(([tool, [n, bad]]) => `${TOOL_LABELS[tool] ?? tool} ${n}${bad ? `（失败 ${bad}）` : ""}`).join(" · ")}</summary>
     <ol>{calls.map((call, index) => <li key={index} className={call.ok === false ? "bad" : undefined}>
-      <span className="tool-turn">第 {call.turn} 轮</span><span className="tool-name">{TOOL_LABELS[call.tool] ?? call.tool}</span><code>{call.detail}</code>{call.ok === false && <em>失败</em>}
+      {call.turn > 0 && <span className="tool-turn">第 {call.turn} 轮</span>}<span className="tool-name">{TOOL_LABELS[call.tool] ?? call.tool}</span><code title={call.detail}>{call.detail}</code>{call.running && <em className="running">运行中</em>}{call.ok === false && <em>失败</em>}{!call.running && call.ok == null && <em>{call.status === "incomplete" ? "未完成" : "未知"}</em>}
+      {call.diagnostic && <span>{call.diagnostic}</span>}
+      {call.output && <details className="tool-output"><summary>{call.running ? "到目前的输出" : "模型看到的输出"}</summary><pre>{call.output}</pre></details>}
     </li>)}</ol>
   </details>;
 }
 
-const OUTCOME_LABELS: Record<string, string> = { passed: "通过", rejected: "验收未通过", unverified: "尚未验证", superseded: "上游返工，结果失效", budget: "预算不足", cancelled: "已中止", error: "执行出错", verify_failed: "验证发现问题", quota: "额度用完", unavailable: "模型服务暂时不可用", unable: "无法完成" };
+const OUTCOME_LABELS: Record<string, string> = { stopped: "达到上限", blocked: "被阻塞", delegated: "已委派，等待子任务", passed: "通过", rejected: "验收未通过", unverified: "尚未验证", superseded: "上游返工，结果失效", budget: "预算不足", cancelled: "已中止", error: "执行出错", verify_failed: "验证发现问题", quota: "额度用完", unavailable: "模型服务暂时不可用", unable: "无法完成" };
 const INPUT_LABELS: Record<string, string> = { full: "完整结果", summary: "摘要", truncated: "截断的结果" };
 
 /** One line on the card saying where the node stands right now. */
-function nodeLine(node: PlanNode, nodes: PlanNode[], number: Map<string, string>): { tone: string; text: string } {
+export function nodeLine(node: PlanNode, nodes: PlanNode[], number: Map<string, string>): { tone: string; text: string } {
   const attempts = node.attempts ?? [], last = attempts[attempts.length - 1];
   if (node.status === "succeeded") return { tone: "ok", text: node.verifies?.length ? "✓ 验证通过" : node.review_passed ? "✓ 验收通过" : "✓ 完成" };
   if (node.status === "failed") return { tone: "bad", text: `✗ ${last ? OUTCOME_LABELS[last.outcome] ?? "失败" : "失败"}` };
   if (node.status === "unable") return { tone: "bad", text: "⊘ 当前环境无法完成" };
   if (node.status === "blocked") return { tone: "muted", text: "前置步骤无法完成，未执行" };
+  if (node.status === "running" && node.waiting_for_folder) return { tone: "muted", text: "排队中：等其他步骤用完工作目录" };
   if (node.status === "running") return { tone: node.feedback ? "warn" : "run", text: node.feedback ? `↻ 第 ${attempts.length + 1} 次尝试中` : "执行中…" };
   if (node.status === "cancelled") return { tone: "muted", text: "已取消" };
   if (node.feedback) return { tone: "warn", text: `↻ 待重做（${last ? OUTCOME_LABELS[last.outcome] ?? last.outcome : "返工"}）` };
   const waiting = (node.dependencies ?? []).filter(id => nodes.find(item => item.id === id)?.status !== "succeeded").map(id => number.get(id)).filter(Boolean);
+  if (node.preparing) return { tone: "run", text: `先行准备中：先做不需要 ${waiting.join("、")} 结果的部分` };
+  if (node.head_start && waiting.length) return { tone: "muted", text: `已先行准备，等待 ${waiting.join("、")}` };
   return { tone: "muted", text: waiting.length ? `等待 ${waiting.join("、")}` : "可以开始" };
 }
 
@@ -66,56 +77,68 @@ function selectionReason(node: PlanNode, model?: Model): string {
 const CAPABILITY_LABELS: Record<string, string> = Object.fromEntries(CAPABILITIES.map(({ key, label }) => [key, label]));
 
 /** Group nodes into stages: a node sits one stage after its latest dependency. */
-export function planStages(nodes: PlanNode[]): PlanNode[][] {
+export function planStages<T extends { id: string; dependencies?: string[] }>(nodes: T[]): T[][] {
   const byId = new Map(nodes.map(node => [node.id, node]));
   const depth = new Map<string, number>();
-  const visit = (node: PlanNode, trail: Set<string>): number => {
+  const visit = (node: T, trail: Set<string>): number => {
     if (depth.has(node.id)) return depth.get(node.id)!;
     if (trail.has(node.id)) return 0; // a cycle; the executor rejects it, keep the view usable
     trail.add(node.id);
-    const parents = (node.dependencies ?? []).map(id => byId.get(id)).filter((item): item is PlanNode => !!item);
+    const parents = (node.dependencies ?? []).map(id => byId.get(id)).filter((item): item is T => !!item);
     const value = parents.length ? Math.max(...parents.map(parent => visit(parent, trail))) + 1 : 0;
     trail.delete(node.id);
     depth.set(node.id, value);
     return value;
   };
-  const stages: PlanNode[][] = [];
+  const stages: T[][] = [];
   for (const node of nodes) (stages[visit(node, new Set())] ??= []).push(node);
   return stages.filter(Boolean);
 }
 
-export function PlanGraph({ apiBase, runId, runStatus, nodes, inProject, models, onOpenProfile, reworkRounds = 0 }: { apiBase: string; runId: string; runStatus: string; nodes: PlanNode[]; inProject: boolean; models: Model[]; onOpenProfile: (model: Model) => void; reworkRounds?: number }) {
-  const [active, setActive] = useState<string | null>(null), [openNode, setOpenNode] = useState<PlanNode | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  useEffect(() => setSelectedId(null), [runId]);
-  const stages = planStages(nodes);
-  const number = new Map(nodes.map((node, index) => [node.id, String(index + 1).padStart(2, "0")]));
-  const modelById = new Map(models.map(model => [model.id, model]));
-  const widest = Math.max(0, ...stages.map(stage => stage.length));
-  const activeNode = nodes.find(node => node.id === active);
-  const related = new Set(activeNode ? [activeNode.id, ...(activeNode.dependencies ?? []), ...nodes.filter(node => node.dependencies?.includes(activeNode.id)).map(node => node.id)] : []);
-  const retries = nodes.reduce((sum, node) => sum + Math.max(0, (node.attempts?.length ?? 0) - 1), 0);
-  const selected = nodes.find(node => node.id === selectedId);
-  // Dependency lines between cards, measured after layout and redrawn when the board resizes.
-  const board = useRef<HTMLDivElement>(null);
-  const [links, setLinks] = useState<{ id: string; from: string; to: string; d: string; done: boolean }[]>([]);
+export type Edge = { from: string; to: string; done: boolean };
+
+/** Only the edges no other path already implies: a -> c goes when a -> b -> c is there, so no line
+ * crosses behind the cards between them. */
+export function directEdges(edges: Edge[]): Edge[] {
+  const next = new Map<string, string[]>();
+  for (const edge of edges) next.set(edge.from, [...(next.get(edge.from) ?? []), edge.to]);
+  const reaches = (from: string, to: string, skip: string): boolean => {
+    const seen = new Set<string>(), stack = (next.get(from) ?? []).filter(item => item !== skip);
+    while (stack.length) {
+      const item = stack.pop()!;
+      if (item === to) return true;
+      if (seen.has(item)) continue;
+      seen.add(item);
+      stack.push(...(next.get(item) ?? []));
+    }
+    return false;
+  };
+  return edges.filter(edge => !reaches(edge.from, edge.to, edge.to));
+}
+
+/** Lines from card to card inside ``board``, for cards marked ``data-{attr}``; measured after layout
+ * and redrawn when ``shape`` changes or the board resizes. A line meets a card at the middle of its
+ * ``anchor`` element when it has one (a card's head, so it stays put when the card opens). */
+export function useLinks(board: React.RefObject<HTMLDivElement | null>, edges: Edge[], attr: string, shape: string, anchor?: string) {
+  const [links, setLinks] = useState<(Edge & { id: string; d: string })[]>([]);
   const [size, setSize] = useState({ width: 0, height: 0 });
-  const shape = nodes.map(node => `${node.id}:${node.status}:${(node.dependencies ?? []).join(",")}`).join("|");
   useLayoutEffect(() => {
     const element = board.current;
     if (!element) return;
     const draw = () => {
       const box = element.getBoundingClientRect();
-      const cards = new Map([...element.querySelectorAll<HTMLElement>("[data-node]")].map(card => [card.dataset.node!, card.getBoundingClientRect()]));
+      const cards = new Map([...element.querySelectorAll<HTMLElement>(`[data-${attr}]`)].map(card => {
+        const rect = card.getBoundingClientRect(), head = anchor ? card.querySelector(anchor)?.getBoundingClientRect() : undefined;
+        return [card.dataset[attr]!, { left: rect.left, right: rect.right, width: rect.width, middle: head ? head.top + head.height / 2 : rect.top + rect.height / 2 }];
+      }));
       const next = [];
-      for (const node of nodes) for (const dependency of node.dependencies ?? []) {
-        const from = cards.get(dependency), to = cards.get(node.id);
+      for (const edge of directEdges(edges)) {
+        const from = cards.get(edge.from), to = cards.get(edge.to);
         if (!from || !to || !from.width) continue;
-        const x1 = from.right - box.left + element.scrollLeft, y1 = from.top + from.height / 2 - box.top;
-        const x2 = to.left - box.left + element.scrollLeft, y2 = to.top + to.height / 2 - box.top;
+        const x1 = from.right - box.left + element.scrollLeft, y1 = from.middle - box.top;
+        const x2 = to.left - box.left + element.scrollLeft, y2 = to.middle - box.top;
         const middle = (x1 + x2) / 2;
-        next.push({ id: `${dependency}>${node.id}`, from: dependency, to: node.id, d: `M${x1},${y1} C${middle},${y1} ${middle},${y2} ${x2},${y2}`,
-          done: nodes.find(item => item.id === dependency)?.status === "succeeded" });
+        next.push({ ...edge, id: `${edge.from}>${edge.to}`, d: `M${x1},${y1} C${middle},${y1} ${middle},${y2} ${x2},${y2}` });
       }
       setLinks(next);
       // Size from the stages themselves; sizing from the scroll box would keep it from shrinking.
@@ -128,6 +151,27 @@ export function PlanGraph({ apiBase, runId, runStatus, nodes, inProject, models,
     window.addEventListener("resize", draw);
     return () => { observer?.disconnect(); window.removeEventListener("resize", draw); };
   }, [shape]);
+  return { links, size };
+}
+
+/** The tasks in ``nodes`` as stages of cards. ``all`` is the whole plan when ``nodes`` is one part of it: numbers and waits refer to it. */
+export function PlanGraph({ apiBase, runId, runStatus, nodes, all = nodes, inProject, models, onOpenProfile, reworkRounds = 0 }: { apiBase: string; runId: string; runStatus: string; nodes: PlanNode[]; all?: PlanNode[]; inProject: boolean; models: Model[]; onOpenProfile: (model: Model) => void; reworkRounds?: number }) {
+  const [active, setActive] = useState<string | null>(null), [openNode, setOpenNode] = useState<PlanNode | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  useEffect(() => setSelectedId(null), [runId]);
+  const stages = planStages(nodes);
+  const number = new Map(all.map((node, index) => [node.id, String(index + 1).padStart(2, "0")]));
+  const modelById = new Map(models.map(model => [model.id, model]));
+  const widest = Math.max(0, ...stages.map(stage => stage.length));
+  const activeNode = nodes.find(node => node.id === active);
+  const related = new Set(activeNode ? [activeNode.id, ...(activeNode.dependencies ?? []), ...nodes.filter(node => node.dependencies?.includes(activeNode.id)).map(node => node.id)] : []);
+  const retries = nodes.reduce((sum, node) => sum + Math.max(0, (node.attempts?.filter(a => a.outcome !== "delegated").length ?? 0) - 1), 0);
+  const selected = nodes.find(node => node.id === selectedId);
+  // Dependency lines between cards, measured after layout and redrawn when the board resizes.
+  const board = useRef<HTMLDivElement>(null);
+  const shape = nodes.map(node => `${node.id}:${node.status}:${(node.dependencies ?? []).join(",")}`).join("|");
+  const status = new Map(nodes.map(node => [node.id, node.status]));
+  const { links, size } = useLinks(board, nodes.flatMap(node => (node.dependencies ?? []).map(from => ({ from, to: node.id, done: status.get(from) === "succeeded" }))), "node", shape);
   if (!nodes.length) return null;
   return <div className="plan-graph">
     <div className="plan-summary" aria-label="计划概览">
@@ -154,14 +198,14 @@ export function PlanGraph({ apiBase, runId, runStatus, nodes, inProject, models,
             <div className="plan-stage-nodes">
               {stage.map(node => {
                 const model = modelById.get(node.model_id);
-                const line = nodeLine(node, nodes, number);
+                const line = nodeLine(node, all, number);
                 const state = active ? related.has(node.id) ? node.id === active ? "focus" : "related" : "dimmed" : "";
                 const open = () => setSelectedId(current => current === node.id ? null : node.id);
                 return <article key={node.id} data-node={node.id} className={`plan-node ${node.status} ${state} ${selectedId === node.id ? "selected" : ""}`}
                   onClick={open} onMouseEnter={() => setActive(node.id)} onMouseLeave={() => setActive(null)}>
                   <div className="plan-node-line"><span className="num">{number.get(node.id)}</span>
                     <button type="button" className="plan-node-title" aria-expanded={selectedId === node.id} onClick={event => { event.stopPropagation(); open(); }} onFocus={() => setActive(node.id)} onBlur={() => setActive(null)}>{node.title}</button>
-                    <span className={`state ${node.status}`}>{statusLabel(node.status)}</span></div>
+                    <span className={`state ${node.status}`}>{nodeStatusLabel(node)}</span></div>
                   <p className={`plan-check ${line.tone}`} title={node.review ?? undefined}>{line.text}</p>
                   <button type="button" className="plan-model" onClick={event => { event.stopPropagation(); setOpenNode(node); }} title={`${selectionReason(node, model)}点击查看模型能力图。`}>{model?.display_name ?? node.model_id ?? "未分配模型"}</button>
                 </article>;
@@ -171,7 +215,7 @@ export function PlanGraph({ apiBase, runId, runStatus, nodes, inProject, models,
         })}
       </ol>
     </div>
-    {selected && <NodeProgress apiBase={apiBase} runId={runId} runStatus={runStatus} node={selected} nodes={nodes} number={number}
+    {selected && <NodeProgress apiBase={apiBase} runId={runId} runStatus={runStatus} node={selected} nodes={all} number={number}
       model={modelById.get(selected.model_id)} onOpenModel={() => setOpenNode(selected)} onClose={() => setSelectedId(null)} />}
     {openNode && <ModelCapabilityDialog node={openNode} model={modelById.get(openNode.model_id)} onClose={() => setOpenNode(null)} onOpenProfile={model => { setOpenNode(null); onOpenProfile(model); }} />}
   </div>;
@@ -201,18 +245,38 @@ function describe(event: TimelineEvent, nodeId: string, number: Map<string, stri
   if (data.node_id !== nodeId) return null;
   switch (event.kind) {
     case "node.started": return `开始第 ${data.attempt ?? 1} 次执行${data.model_id ? `（${data.model_id}）` : ""}`;
+    case "node.queued": return "排队：等其他步骤用完工作目录";
+    case "node.dequeued": return "轮到它，开始工作";
+    case "node.head_start": return "先行准备：先做不需要前置步骤结果的部分";
+    case "node.head_started": return data.skipped ? "目录正被其他步骤使用，这次不先行准备，等前置步骤完成后正式执行" : data.error ? `先行准备结束：${data.error}` : "先行准备完成，等前置步骤完成后正式执行";
     case "node.succeeded": return `完成${data.used_model_id && data.used_model_id !== data.selected_model_id ? `（实际由 ${data.used_model_id} 完成）` : ""} · ${formatUsd(data.cost_usd ?? 0)}`;
+    case "node.delegated": return `已委派 ${(data.children ?? []).length} 个子任务，等待验收后继续：${data.reason ?? ""}`;
     case "node.retry": return `未通过，准备第 ${data.attempt} 次尝试${data.model_id ? `（换用 ${data.model_id}）` : ""}：${data.reason ?? ""}`;
     case "node.failed": return `失败：${data.error ?? ""}`;
+    case "node.blocked": return `停止：${data.reason ?? ""}`;
+    case "node.limit_extended": return `负责人追加额度：最多 ${data.max_turns} 次工具调用、${formatUsd(data.max_cost_usd ?? 0)}`;
+    case "node.model_switched": return `换用 ${data.next_model_id ?? "其他模型"}`;
+    case "node.progress_check": return data.stop ? `进度检查：判断卡住，停止（${data.reason ?? ""}）` : `进度检查（${data.minutes ?? 0} 分钟）：仍在推进`;
     default: return null;
   }
 }
 
 /** Live progress of one node: what it is doing now, its timeline, checks, inputs and output. */
-function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, onOpenModel, onClose }: { apiBase: string; runId: string; runStatus: string; node: PlanNode; nodes: PlanNode[]; number: Map<string, string>; model?: Model; onOpenModel: () => void; onClose: () => void }) {
+export function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, onOpenModel, onClose }: { apiBase: string; runId: string; runStatus: string; node: PlanNode; nodes: PlanNode[]; number: Map<string, string>; model?: Model; onOpenModel: () => void; onClose: () => void }) {
   const [events, setEvents] = useState<TimelineEvent[]>([]), [now, setNow] = useState(() => Date.now());
   const attempts = node.attempts ?? [], inputs = node.inputs ?? [], files = node.changed_files ?? [];
   const live = ACTIVE_RUN.has(runStatus);
+  const [activity, setActivity] = useState<{ total: number; calls: ToolCall[] } | null>(null);
+  useEffect(() => {
+    // What the step is doing right now: its tool calls, or a CLI's commands and messages.
+    if (node.status !== "running" && !node.preparing) { setActivity(null); return; }
+    let cancelled = false;
+    const load = () => fetch(`${apiBase}/api/tasks/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(node.id)}/activity`)
+      .then(r => r.ok ? r.json() : null).then(body => { if (!cancelled && body) setActivity(body); }).catch(() => {});
+    load();
+    const timer = window.setInterval(load, 3000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [apiBase, runId, node.id, node.status, node.preparing]);
   useEffect(() => {
     let cancelled = false;
     const load = () => fetch(`${apiBase}/api/tasks/${encodeURIComponent(runId)}/timeline`).then(r => r.ok ? r.json() : []).then(list => { if (!cancelled && Array.isArray(list)) setEvents(list); }).catch(() => {});
@@ -234,7 +298,9 @@ function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, o
   const ended = attempts.length ? new Date(attempts[attempts.length - 1].finished_at ?? "").getTime() : NaN;
   const waitingFor = (node.dependencies ?? []).filter(id => nodes.find(item => item.id === id)?.status !== "succeeded").map(id => number.get(id)).filter(Boolean);
   const now_text =
-    node.status === "running" ? `第 ${attempts.length + 1} 次执行中${started ? ` · 已运行 ${duration(now - started)}` : ""}`
+    node.status === "running" && node.waiting_for_folder ? `第 ${attempts.length + 1} 次执行排队中：等其他步骤用完工作目录${started ? ` · 已等 ${duration(now - started)}` : ""}`
+    : node.status === "running" ? `第 ${attempts.length + 1} 次执行中${started ? ` · 已运行 ${duration(now - started)}` : ""}`
+    : node.status === "pending" && node.preparing ? `先行准备中：先做不需要 ${waitingFor.join("、")} 结果的部分，之后等它们完成再正式执行`
     : node.status === "pending" ? (waitingFor.length ? `等待 ${waitingFor.join("、")} 完成` : node.feedback ? "等待重新执行" : live ? "等待空位或预算" : "尚未开始")
     : node.status === "succeeded" ? `已完成${started && !Number.isNaN(ended) ? ` · 本次用时 ${duration(ended - started)}` : ""}`
     : node.status === "failed" ? `已失败（共 ${attempts.length} 次尝试）`
@@ -243,10 +309,10 @@ function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, o
   return <section className={`node-progress drawer ${node.status}`} role="dialog" aria-label={`${node.title} 的进行情况`}>
     <div className="node-progress-head">
       <div><p className="eyebrow">子任务 {number.get(node.id)} · 进行情况</p><h4>{node.title}</h4></div>
-      <span className={`state ${node.status}`}>{statusLabel(node.status)}</span>
+      <span className={`state ${node.status}`}>{nodeStatusLabel(node)}</span>
       <button type="button" className="modal-close" onClick={onClose} aria-label="关闭进行情况">×</button>
     </div>
-    <p className={`node-progress-now ${node.status}`}>{node.status === "running" && <i className="pulse" aria-hidden="true" />}{now_text}</p>
+    <p className={`node-progress-now ${node.preparing ? "running" : node.status}`}>{(node.status === "running" || node.preparing) && <i className="pulse" aria-hidden="true" />}{now_text}</p>
     <dl className="node-progress-facts">
       <div><dt>模型</dt><dd><button type="button" className="plan-model" onClick={onOpenModel}>{model?.display_name ?? node.model_id ?? "未分配"}</button></dd></div>
       {node.difficulty && <div><dt>难度</dt><dd>{DIFFICULTY_LABELS[node.difficulty] ?? node.difficulty} · 门槛 {Math.round(node.quality_threshold ?? 0)}</dd></div>}
@@ -257,6 +323,12 @@ function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, o
       <div><dt>花费</dt><dd>{formatUsd(attempts.reduce((sum, attempt) => sum + attempt.cost_usd, 0))} / 预估 {formatUsd(node.estimated_cost_usd)}</dd></div>
     </dl>
     <p className="node-progress-reason">{selectionReason(node, model)}</p>
+    {((node.status === "running" && !node.waiting_for_folder) || (node.status === "pending" && node.preparing)) && <section className="node-activity" aria-live="polite"><h5>正在做</h5>
+      {activity?.calls.length ? <>
+        <ToolLog calls={activity.calls} open title={activity.total > activity.calls.length ? `最近的动作（共 ${activity.total} 次）` : "本次尝试的动作"} />
+        <p className="muted">每 3 秒刷新。{activity.calls[activity.calls.length - 1].running ? "最后一条命令还在运行。" : ""}</p>
+      </> : <p className="muted">{(node.model_id ?? "").startsWith("cli:") && node.model_id !== "cli:codex" ? "这个会员 CLI 只在结束时汇报，执行中看不到具体动作；可以看下面的时间线和改动的文件。" : "还没有动作，模型正在思考或等待回复。"}</p>}
+    </section>}
     <div className="node-progress-body">
       <section className="node-progress-timeline"><h5>时间线</h5>
         {lines.length ? <ol>{lines.map(({ event, text }) => <li key={event.id} className={event.kind.replace(".", "-")}><time>{clock(event.created_at)}</time><span>{text}</span></li>)}</ol> : <p className="muted">还没有执行记录。</p>}
@@ -264,12 +336,14 @@ function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, o
       <div className="node-progress-side">
         {node.unable_reason && <section className="unable-reason"><h5>无法完成的原因</h5><MarkdownView text={node.unable_reason} /></section>}
         {node.acceptance_criteria && <section><h5>验收标准</h5><p>{node.acceptance_criteria}</p></section>}
-        {!!(node.files?.length || node.reads?.length) && <section className="node-scope"><h5>工作范围</h5>
+        {!!(node.files?.length || node.reads?.length || node.folders?.length) && <section className="node-scope"><h5>工作范围</h5>
           {!!node.files?.length && <p>改动：{node.files.join("、")}</p>}
+          {!node.files?.length && !!node.folders?.length && <p>负责的目录：{node.folders.join("、")}</p>}
           {!!node.reads?.length && <p>参考：{node.reads.join("、")}</p>}
           {node.provides && <p>交付：{node.provides}</p>}
           {node.check && <p>检查：<code>{node.check}</code></p>}
         </section>}
+        {node.head_start && !node.preparing && <section className="node-head-start"><h5>依赖完成前已做的准备</h5><MarkdownView text={node.head_start} /></section>}
         {node.review && <section><h5>验收意见</h5><p>{node.review}</p></section>}
         {node.feedback && node.status !== "succeeded" && <section><h5>需要修改</h5><p>{node.feedback}</p></section>}
         {!!inputs.length && <section><h5>收到的上游结果</h5><p>{inputs.map(input => `${number.get(input.node_id) ?? "?"} 的${INPUT_LABELS[input.form] ?? input.form}${input.changed_files ? `（改动 ${input.changed_files} 个文件）` : ""}`).join("，")}</p></section>}
@@ -281,13 +355,17 @@ function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, model, o
       <small>{attempt.model_id ?? "未知模型"}{attempt.reviewer_model_id ? ` · 验收：${attempt.reviewer_model_id}` : ""} · {formatUsd(attempt.cost_usd)}{attempt.finished_at ? ` · ${clock(attempt.finished_at)}` : ""}
         {!!attempt.turns && <span className={`attempt-turns${attempt.turn_limit ? " limit" : ""}`}>{attempt.turns} 轮{attempt.turn_limit ? " · 轮次用完" : ""}</span>}</small>
       {attempt.reason && <p>{attempt.reason}</p>}
+      {attempt.result != null ? <details><summary>第 {index + 1} 次回答 · {attempt.result_source === "provider" ? "模型返回" : "来源未知"}</summary><MarkdownView text={attempt.result} /></details>
+        : <p className="muted">本次回答未记录，不能用历史输出代替。</p>}
       {!!attempt.tool_calls?.length && <ToolLog calls={attempt.tool_calls} />}
     </li>)}</ol></section>}
-    {node.result && <section className="node-progress-output"><h5>{node.status === "failed" ? "错误信息" : "输出"}</h5><MarkdownView text={node.result} markdown={node.status !== "failed"} /></section>}
+    {node.result && <section className="node-progress-output"><h5>{attempts.some(attempt => attempt.result === node.result)
+      ? "已保存的输出（各次回答见尝试记录）"
+      : "历史输出（尝试及来源未记录）"}</h5><MarkdownView text={node.result} markdown={node.status !== "failed"} /></section>}
   </section>;
 }
 
-function ModelCapabilityDialog({ node, model, onClose, onOpenProfile }: { node: PlanNode; model?: Model; onClose: () => void; onOpenProfile: (model: Model) => void }) {
+export function ModelCapabilityDialog({ node, model, onClose, onOpenProfile }: { node: PlanNode; model?: Model; onClose: () => void; onOpenProfile: (model: Model) => void }) {
   const id = node.model_id;
   useEffect(() => {
     const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };

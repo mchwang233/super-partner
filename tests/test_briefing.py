@@ -100,14 +100,15 @@ async def test_a_work_package_gets_its_own_files_and_not_the_project(database, t
     run = database.get_run("r")
     run.project_dir = str(root)
     node = run.plan.nodes[0]
-    node.needs_workspace, node.files, node.reads, node.check = True, ["app.py"], ["README.md"], "python -m pytest -q"
+    # The platform now executes the check: this fixture has an app but no pytest suite.
+    node.needs_workspace, node.files, node.reads, node.check = True, ["app.py"], ["README.md"], "python3 -m py_compile app.py"
     database.save_run(run)
     team = Team()
     await Executor(database, team, MODELS).execute("r")
     [prompt] = team.prompts
     assert "Change only these files (create them if they do not exist): app.py" in prompt
     assert "=== app.py (full text, current) ===" in prompt and "=== README.md" in prompt
-    assert "other.py" not in prompt and "Before you finish, run: python -m pytest -q" in prompt
+    assert "other.py" not in prompt and "Before you finish, run: python3 -m py_compile app.py" in prompt
     assert "at most 15 lines" in prompt
 
 

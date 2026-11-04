@@ -32,6 +32,9 @@ PLAN = json.dumps({"summary": "待办网页", "nodes": [
      "files": ["index.html"]},
     {"key": "b", "title": "检查", "instructions": "检查页面", "capability": "coding", "difficulty": "easy",
      "dependencies": ["a"], "files": ["test_index.py"], "reads": ["index.html"]}]})
+# The same plan as the lead makes it: major parts only, split into tasks when the task runs.
+OUTLINE = json.dumps({"summary": "待办网页", "parts": [{"key": "p", "title": "网页", "goal": "能用的待办网页",
+                                                     "provides": "index.html", "size": 2}]})
 
 
 def model(model_id, planning, channel="api"):
@@ -77,13 +80,15 @@ class Leads:
 
 async def test_the_lead_plans_in_the_conversation_it_keeps():
     session = SupervisorSession()
-    leads = Leads(["我先想想……", PLAN])
+    leads = Leads(["我先想想……", OUTLINE])
     plan = await autonomous_plan("写一个待办网页", MODELS, CONFIGURED, leads, session=session)
-    assert [node.title for node in plan.nodes] == ["页面", "检查"] and plan.planner_model_id == "cli:codex"
+    assert plan.nodes == [] and plan.planner_model_id == "cli:codex"
+    assert [(part.title, part.status, part.size) for part in plan.parts] == [("网页", "planned", 2)]
+    assert plan.request.startswith("写一个待办网页")
     assert (session.model_id, session.session_id) == ("cli:codex", "cli:codex-conversation")
     # It was told it leads the task, and asked again in the same conversation for a valid plan.
     (_, first_id, first), (_, second_id, second) = leads.messages
-    assert first.startswith(supervisor.ROLE) and "写一个待办网页" in first
+    assert first.startswith(supervisor.ROLE) and "写一个待办网页" in first and "By function" in first
     assert first_id is None and second_id == "cli:codex-conversation" and "not a valid plan" in second
 
 
@@ -170,12 +175,221 @@ async def test_an_api_lead_is_sent_its_conversation_and_kept_within_bounds(tmp_p
     assert sum(len(item["content"]) for item in session.history) <= supervisor.MAX_HISTORY_CHARS + 200
 
 
+async def test_api_refinement_effort_is_sent_and_default_lead_remains_unchanged(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    sent = []
+
+    def respond(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                                         "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    registry = ProviderRegistry()
+    await registry.client.aclose()
+    registry.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        await registry.converse(SupervisorSession(model_id="deepseek:deepseek-flash", reasoning_effort="low"), "split")
+        await registry.converse(SupervisorSession(model_id="deepseek:deepseek-flash"), "lead")
+    finally:
+        await registry.client.aclose()
+    assert sent[0]["reasoning_effort"] == "low"
+    assert sent[1]["reasoning_effort"] == settings.lead_reasoning_effort
+
+
+@pytest.mark.parametrize("model_id", ["cli:codex", "cli:claude"])
+async def test_cli_refinement_effort_survives_new_and_resumed_session(tmp_path, monkeypatch, model_id):
+    log = tmp_path / "args.log"
+    name = model_id.split(":")[1]
+    answer = ('{"result": "ok", "session_id": "s-1"}' if name == "claude" else
+              '{"type":"thread.started","thread_id":"s-1"}\n'
+              '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}')
+    fake_cli(tmp_path, monkeypatch, name, f'#!/bin/sh\necho "$@" >> {log}\ncat > /dev/null\n'
+             f"cat <<'ANSWER'\n{answer}\nANSWER\n")
+    registry = ProviderRegistry()
+    session = SupervisorSession(model_id=model_id, cwd=str(tmp_path), reasoning_effort="low")
+    try:
+        await registry.converse(session, "split")
+        await registry.converse(session, "correct dependency")
+    finally:
+        await registry.client.aclose()
+    for args in log.read_text().splitlines():
+        assert ('model_reasoning_effort="low"' if name == "codex" else "--effort low") in args
+        assert 'model_reasoning_effort="max"' not in args
+    assert session.session_id == "s-1"
+
+
 def fake_cli(tmp_path, monkeypatch, name, script):
     path = tmp_path / "bin" / name
     path.parent.mkdir(exist_ok=True)
     path.write_text(script)
     path.chmod(0o755)
     monkeypatch.setenv("PATH", f"{path.parent}:{os.environ['PATH']}")
+
+
+def delivery_prompt(files):
+    return ("用户约束：覆盖率100%\n"
+            "Current project deliveries, including your earlier work (inspect referenced files for details):\n"
+            + json.dumps([{"id": "bridge", "files": files, "status": "blocked",
+                           "result": "1,889 项候选尚未批准；APB16、AXI16/512/1024、地址12及33–64待裁定"}],
+                         ensure_ascii=False)
+            + "\nAcceptance criteria: 负责人最终验收\n追加文件正文：保持接口")
+
+
+@pytest.mark.parametrize("character", ["a", "中", "😀"])
+async def test_codex_final_input_boundary_reserves_envelope(tmp_path, monkeypatch, character):
+    from super_partner import cli_channels
+
+    sent = []
+
+    async def run(spec, command, cwd, stdin, *args, **kwargs):
+        sent.append(stdin)
+        return '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+
+    cli = CliChannelRegistry()
+    monkeypatch.setattr(cli, "_run", run)
+    monkeypatch.setattr(cli_channels, "codex_settings", lambda *args: [])
+    limit = cli_channels.CODEX_INPUT_LIMIT - cli_channels.CODEX_INPUT_RESERVE
+    prompt = character * (limit // len(character.encode()))
+    await cli._complete(cli_channels.CLI_SPECS["cli:codex"], "codex", ["exec"], False, None,
+                        prompt, tmp_path, 10, (), False, False, None, None)
+    assert sent == [prompt.encode()]
+    with pytest.raises(cli_channels.InputTooLarge):
+        await cli._complete(cli_channels.CLI_SPECS["cli:codex"], "codex", ["exec"], False, None,
+                            prompt + character, tmp_path, 10, (), False, False, None, None)
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("reject", [False, True, "always"])
+async def test_codex_compacts_final_input_and_retries_rejection_only_once(tmp_path, monkeypatch, reject):
+    from super_partner import calls, cli_channels
+
+    original = delivery_prompt([f"coverage/run.vdb/{i}-" + "x" * 100 for i in range(18000)])
+    sent = []
+
+    async def run(spec, command, cwd, stdin, *args, **kwargs):
+        sent.append(stdin.decode())
+        if reject == "always" or (reject and len(sent) == 1):
+            raise RuntimeError('codex failed: {"code":"input_too_large"}')
+        return '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+
+    cli = CliChannelRegistry()
+    monkeypatch.setattr(cli, "_run", run)
+    monkeypatch.setattr(cli_channels, "codex_settings", lambda *args: [])
+    record = {"warnings": []}
+    token = calls.current.set((None, record))
+    try:
+        async def invoke():
+            return await cli._complete(cli_channels.CLI_SPECS["cli:codex"], "codex", ["exec"], False, None,
+                                       original, tmp_path, 10, (), False, False, None, None)
+        if reject == "always":
+            with pytest.raises(cli_channels.InputTooLarge):
+                await invoke()
+        else:
+            assert await invoke() == "ok"
+    finally:
+        calls.current.reset(token)
+    assert len(sent) == (2 if reject else 1)
+    assert len(sent[0]) < len(original)
+    if reject:
+        assert len(sent[1]) < len(sent[0])
+    for prompt in sent:
+        assert len(prompt.encode()) <= cli_channels.CODEX_INPUT_LIMIT - cli_channels.CODEX_INPUT_RESERVE
+        for preserved in ("1,889 项候选尚未批准", "APB16、AXI16/512/1024、地址12及33–64待裁定",
+                          "用户约束：覆盖率100%", "负责人最终验收", "追加文件正文：保持接口"):
+            assert preserved in prompt
+    assert any(str(len(original)) in warning and str(len(sent[0])) in warning for warning in record["warnings"])
+
+
+@pytest.mark.parametrize("raw_error", [False, True])
+async def test_cli_input_too_large_never_falls_back_to_api(tmp_path, monkeypatch, raw_error):
+    from super_partner.cli_channels import InputTooLarge
+
+    registry = ProviderRegistry()
+    invoked = []
+
+    async def complete(*args, **kwargs):
+        invoked.append(args[0])
+        error = RuntimeError if raw_error else InputTooLarge
+        raise error("input_too_large: required instructions exceed input budget")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Input size is not quota or model unavailability")
+
+    monkeypatch.setattr(registry.cli, "complete", complete)
+    monkeypatch.setattr(registry.quota, "classify", unexpected)
+    try:
+        with pytest.raises(InputTooLarge):
+            await registry.complete("cli:codex", "must retain", tmp_path, allow_api_fallback=True)
+    finally:
+        await registry.client.aclose()
+    assert invoked == ["cli:codex"]
+
+
+async def test_codex_lead_rebuilds_rejected_input_without_changing_session(tmp_path, monkeypatch):
+    from super_partner import cli_channels
+
+    cli, sent = CliChannelRegistry(), []
+    monkeypatch.setattr(cli_channels.shutil, "which", lambda name: str(tmp_path / name))
+    monkeypatch.setattr(cli_channels, "codex_settings", lambda *args: [])
+    monkeypatch.setattr(cli_channels, "codex_step_permissions", lambda *args, **kwargs: [])
+
+    async def run(spec, command, cwd, stdin, *args, **kwargs):
+        sent.append((command, stdin))
+        if len(sent) == 1:
+            return '{"type":"turn.failed","error":{"code":"input_too_large"}}'
+        return '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+
+    monkeypatch.setattr(cli, "_run", run)
+    prompt = delivery_prompt([f"reports/{i}.txt" for i in range(500)])
+    assert await cli.converse("cli:codex", prompt, tmp_path, session_id="saved") == ("ok", "saved")
+    assert len(sent) == 2 and sent[0][0] == sent[1][0]
+    assert len(sent[1][1]) < len(sent[0][1])
+
+
+async def test_codex_rejection_with_no_removable_inventory_is_not_retried(tmp_path, monkeypatch):
+    from super_partner import cli_channels
+
+    cli, sent = CliChannelRegistry(), []
+
+    async def run(spec, command, cwd, stdin, *args, **kwargs):
+        sent.append(stdin)
+        raise RuntimeError("input_too_large")
+
+    monkeypatch.setattr(cli, "_run", run)
+    with pytest.raises(cli_channels.InputTooLarge):
+        await cli._run_input(cli_channels.CLI_SPECS["cli:codex"], ["codex"], tmp_path,
+                             "必须保留：1,889 项候选尚未批准", 10)
+    assert len(sent) == 1
+
+
+async def test_codex_resume_receives_config_in_its_own_option_scope(tmp_path, monkeypatch):
+    """Exec's -c flags before `resume` are not inherited by the resume parser."""
+    from super_partner import cli_channels
+
+    monkeypatch.setattr(cli_channels.shutil, "which", lambda name: str(tmp_path / name))
+    monkeypatch.setattr(cli_channels, "codex_servers", lambda: ["test_mcp"])
+    monkeypatch.setattr(settings, "codex_without_extras", True)
+    monkeypatch.setattr(settings, "codex_lead_service_tier", "fast")
+    cli, commands = CliChannelRegistry(), []
+
+    async def run(spec, command, cwd, stdin, timeout, idle=None):
+        commands.append(command)
+        return ('{"type":"thread.started","thread_id":"saved"}\n'
+                '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}')
+
+    monkeypatch.setattr(cli, "_run", run)
+    result, sid = await cli.converse("cli:codex", "plan", tmp_path, session_id="saved", effort="high")
+    assert (result, sid) == ("ok", "saved")
+    command = commands[0]
+    resumed = command[command.index("resume") + 1:]
+    # Check the receiving command scope, not just the presence of flags anywhere in argv.
+    assert 'model_reasoning_effort="high"' in resumed
+    assert 'service_tier="fast"' in resumed
+    assert 'mcp_servers.test_mcp.enabled=false' in resumed
+    # Read-only, with this account's home and the platform's data out of reach, after `resume` too.
+    assert f'default_permissions="{cli_channels.CODEX_LEAD_PROFILE}"' in resumed
+    assert f'permissions.{cli_channels.CODEX_LEAD_PROFILE}.extends=":read-only"' in resumed
+    assert all(resumed[resumed.index(feature) - 1] == "--disable" for feature in cli_channels.CODEX_EXTRAS)
 
 
 async def test_claude_and_codex_continue_their_own_conversations(tmp_path, monkeypatch):
@@ -193,10 +407,78 @@ async def test_claude_and_codex_continue_their_own_conversations(tmp_path, monke
     await cli.converse("cli:codex", "接下来？", tmp_path, "x-9")
     first, second, third, fourth = log.read_text().splitlines()
     assert "--session-id" in first and "--resume c-1" in second and "Edit,Write,NotebookEdit" in first
-    assert "--sandbox read-only" in third and "exec resume x-9" in fourth
+    assert 'extends=":read-only"' in third and "--sandbox" not in third
+    assert fourth.startswith("exec ") and "resume x-9" in fourth and 'extends=":read-only"' in fourth
+    # The lead thinks hardest, in both a new and a continued conversation.
+    assert 'model_reasoning_effort="max"' in third and 'model_reasoning_effort="max"' in fourth
+
+
+async def test_codex_runs_with_the_platforms_effort_and_without_the_users_extras(tmp_path, monkeypatch):
+    from super_partner import cli_channels
+    from super_partner.config import settings
+    home = tmp_path / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('model = "x"\n[mcp_servers.node_repl]\ncommand = "n"\n'
+                                      '[mcp_servers."my server"]\ncommand = "m"\n[mcp_servers.node_repl.env]\nA = "1"\n')
+    log = tmp_path / "args.log"
+    fake_cli(tmp_path, monkeypatch, "codex", f'#!/bin/sh\necho "$@" >> {log}\ncat > /dev/null\n'
+             'echo \'{"type":"thread.started","thread_id":"x-9"}\'\n'
+             'echo \'{"type":"item.completed","item":{"type":"agent_message","text":"收到"}}\'\n')
+    monkeypatch.setattr(settings, "codex_lead_service_tier", "fast")
+    cli = CliChannelRegistry()
+    await cli.converse("cli:codex", "规划", tmp_path)
+    await cli.complete("cli:codex", "做这一步", tmp_path, effort="low")
+    await cli.complete("cli:codex", "照旧", tmp_path)
+    lead, step, plain = log.read_text().splitlines()
+    assert 'model_reasoning_effort="max"' in lead and 'service_tier="fast"' in lead
+    assert 'model_reasoning_effort="low"' in step and "service_tier" not in step
+    assert "model_reasoning_effort" not in plain  # nothing asked: the user's own setting
+    for line in (lead, step, plain):
+        assert "--disable plugins" in line and "--disable apps" in line
+        # A -c key is split on dots with quotes taken literally (Codex then rejects the config): only
+        # plain names are turned off, and a name with a space is left alone.
+        assert "mcp_servers.node_repl.enabled=false" in line and "my server" not in line and '"node_repl"' not in line
+    assert cli_channels.codex_servers() == ["node_repl", "my server"]
+    monkeypatch.setattr(settings, "codex_without_extras", False)
+    assert cli_channels.codex_settings("high") == ["-c", 'model_reasoning_effort="high"']
 
 
 async def test_a_conversation_the_cli_no_longer_has_is_reported_as_lost(tmp_path, monkeypatch):
     fake_cli(tmp_path, monkeypatch, "claude", "#!/bin/sh\necho 'No conversation found with session ID: c-1' >&2\nexit 1\n")
     with pytest.raises(SessionLost):
         await CliChannelRegistry().converse("cli:claude", "接下来？", tmp_path, "c-1")
+
+
+async def test_codex_may_delete_files_in_its_folder_and_the_rule_is_gone_after(tmp_path, monkeypatch):
+    """Codex refuses rm -f as dangerous even in its sandbox; a rule in the step's folder allows it
+    for the call. A folder of the project's own stays; a repair, outside Codex's sandbox, gets none."""
+    from super_partner.cli_channels import CODEX_ALLOW, CODEX_RULES
+    seen = tmp_path / "seen.txt"
+    fake_cli(tmp_path, monkeypatch, "codex", f'#!/bin/sh\ncat > /dev/null\ncat {CODEX_RULES} >> {seen} 2>/dev/null '
+             f'|| echo none >> {seen}\necho done\n')
+    scratch, project = tmp_path / "scratch", tmp_path / "project"
+    scratch.mkdir()
+    (project / ".codex").mkdir(parents=True)
+    (project / ".codex" / "config.toml").write_text("# the project's own")
+    cli = CliChannelRegistry()
+    await cli.complete("cli:codex", "做这一步", scratch)
+    await cli.complete("cli:codex", "做这一步", project)
+    assert seen.read_text() == CODEX_ALLOW * 2
+    assert not (scratch / ".codex").exists()
+    assert not (project / CODEX_RULES).exists() and (project / ".codex" / "config.toml").exists()
+    monkeypatch.setattr("super_partner.cli_channels.repair_command", lambda executable, args: [executable, *args])
+    await cli.complete("cli:codex", "修环境", scratch, repair=True)
+    assert seen.read_text().endswith("none\n")
+
+
+async def test_a_lead_call_runs_while_codex_keeps_printing_and_stops_when_it_goes_quiet(tmp_path):
+    """A long refinement is not cut off at a fixed time; one that prints nothing for long is."""
+    import sys
+    from types import SimpleNamespace
+    registry, spec = CliChannelRegistry(), SimpleNamespace(executable="codex")
+    busy = "import time\nfor i in range(8):\n    print(i, flush=True); time.sleep(0.1)\nprint('done')"
+    output = await registry._run(spec, [sys.executable, "-c", busy], tmp_path, b"", timeout=30, idle=0.5)
+    assert output.strip().endswith("done")  # 0.8 s in all, never 0.5 s quiet
+    quiet = "import time\nprint('thinking', flush=True)\ntime.sleep(5)"
+    with pytest.raises(RuntimeError, match="no output for 0.3s"):
+        await registry._run(spec, [sys.executable, "-c", quiet], tmp_path, b"", timeout=30, idle=0.3)

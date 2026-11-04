@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from super_partner import quality
 from super_partner.config import settings
 from super_partner.db import Database
@@ -154,3 +155,72 @@ def test_a_step_is_told_which_work_belongs_to_other_steps():
     prompt, _ = quality.node_prompt(nodes[0], run, 4000)
     assert "Other steps of this task, not yours: 部署上线" in prompt and "Judge only this step" in prompt
     assert "only this task" in quality.review_prompt(nodes[0], "x", [], "", False)
+
+
+@pytest.mark.parametrize("claim", [
+    "none", "NONE", "  None.  ", "no", "null", "false", "n/a", "N/A.", "not applicable",
+    "no blockers", "No blocking issues.", "无", "无。", "没有", "不适用",
+    "无阻塞", "无阻塞项", "没有阻塞", "没有阻塞项",
+])
+def test_unable_claim_ignores_explicit_no_blocker_declarations(claim):
+    assert quality.unable_claim(f"本步骤已完成。\nUNABLE: {claim}\n") is None
+
+
+@pytest.mark.parametrize("reason", [
+    "No credentials are available; deployment requires a key.",
+    "none of the required services are reachable",
+    "N/A: the required server is unavailable",
+    "无权限连接服务器，尚未部署。",
+    "没有凭据，无法发布。",
+    "无阻塞项是上次的结论；本次缺少许可证。",
+    "none; deployment still needs credentials",
+])
+def test_unable_claim_preserves_real_reasons_including_negative_words(reason):
+    assert quality.unable_claim(f"准备工作已完成。\nUNABLE: {reason}") == reason
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("UNABLE: none\nUNABLE: missing credentials", "missing credentials"),
+    ("UNABLE: missing credentials\nUNABLE: none", None),
+    ("Report mentions UNABLE: none in passing.", None),
+])
+def test_unable_claim_keeps_last_declaration_semantics(text, expected):
+    assert quality.unable_claim(text) == expected
+
+
+@pytest.mark.parametrize("acceptance", [True, False])
+@pytest.mark.parametrize("claim, unable", [
+    ("none", False), ("N/A", False), ("no blockers", False), ("无阻塞项", False),
+    ("No credentials are available; deployment requires a key.", True),
+    ("没有凭据，无法发布。", True),
+])
+async def test_worker_unable_claim_controls_outcome_in_both_acceptance_modes(
+    tmp_path, monkeypatch, acceptance, claim, unable,
+):
+    database = configure(tmp_path, monkeypatch, review=True)
+    monkeypatch.setattr(settings, "acceptance", acceptance)
+    reviewed = []
+
+    def review(prompt):
+        reviewed.append(prompt)
+        return {"passed": True, "reason": "ok"}
+
+    result = f"本步骤的执行报告。\nUNABLE: {claim}"
+    workers = Workers(deploy=result, review=review)
+    await Executor(database, workers, MODELS).execute("r")
+    run = database.get_run("r")
+    nodes = {item.id: item for item in run.plan.nodes}
+    deploy = nodes["deploy"]
+
+    assert run.status == (RunStatus.INCOMPLETE if unable else RunStatus.SUCCEEDED)
+    assert deploy.status == (NodeStatus.UNABLE if unable else NodeStatus.SUCCEEDED)
+    assert nodes["check"].status == (NodeStatus.BLOCKED if unable else NodeStatus.SUCCEEDED)
+    assert ("检查线上页面" in workers.calls) is (not unable)
+    assert workers.calls.count("部署上线") == 1
+    assert [attempt.outcome for attempt in deploy.attempts] == ["unable" if unable else "passed"]
+    assert deploy.attempts[0].result == result
+    assert any(result in prompt for prompt in reviewed) is (acceptance and not unable)
+    if unable:
+        assert claim in deploy.unable_reason
+    else:
+        assert deploy.unable_reason is None

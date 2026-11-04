@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { detailText } from "./mission-history";
 
 type Suggestion = { path: string; name: string; source: "recent" | "found" };
 type Inspection = { path: string; git: boolean; branch?: string | null; uncommitted_files?: number };
@@ -33,7 +34,7 @@ function useInspection(apiBase: string, value: string) {
       try {
         const response = await fetch(`${apiBase}/api/projects/inspect?${new URLSearchParams({ path })}`, { signal: controller.signal });
         const body = await response.json();
-        if (!response.ok) throw new Error(body.detail || `无法检查目录（${response.status}）`);
+        if (!response.ok) throw new Error(detailText(body.detail) || `无法检查目录（${response.status}）`);
         setState({ path, result: body, loading: false });
       } catch (e) { if (!controller.signal.aborted) setState({ path, error: errorText(e), loading: false }); }
     }, 350);
@@ -125,7 +126,7 @@ function BrowseButton({ apiBase, start, onPick, onError }: { apiBase: string; st
     try {
       const query = start ? `?${new URLSearchParams({ start })}` : "";
       const response = await fetch(`${apiBase}/api/projects/native-picker${query}`, { method: "POST" }); const body = await response.json();
-      if (!response.ok) throw new Error(body.detail || `无法打开文件夹对话框（${response.status}）`);
+      if (!response.ok) throw new Error(detailText(body.detail) || `无法打开文件夹对话框（${response.status}）`);
       if (body.path) onPick(body.path);
     } catch (e) { onError(errorText(e)); } finally { setWaiting(false); }
   }

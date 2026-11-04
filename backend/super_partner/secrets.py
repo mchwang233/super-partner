@@ -1,8 +1,12 @@
+import contextlib
 import json
 import logging
 import os
 import subprocess
 import sys
+import tempfile
+import time
+from pathlib import Path
 from typing import Optional
 
 import keyring
@@ -93,44 +97,127 @@ def _change_keyring(action: str) -> int:
 
 
 def _read_provider_keys() -> dict[str, str]:
-    values = {}
+    """Saved keys; raises KeyringError if no read worked (a locked or missing keyring), so it is
+    not mistaken for a keyring holding no keys."""
+    values, asked, failed = {}, 0, 0
     for provider, env_name in SECRET_ENV.items():
         if env_name not in os.environ:
+            asked += 1
             try:
                 value = keyring.get_password(SERVICE, provider)
             except KeyringError:
+                failed += 1
                 value = None
             if value:
                 values[env_name] = value
+    if asked and failed == asked:
+        raise KeyringError("keyring unavailable")
     return values
 
 
-def hydrate_provider_keys(timeout: float = 10.0) -> None:
-    """Load saved keys without letting a locked desktop keyring block startup."""
-    if all(env_name in os.environ for env_name in SECRET_ENV.values()):
-        return
+@contextlib.contextmanager
+def _one_at_a_time(wait: float):
+    """Let processes of this user read the keyring one after another: several at once make a
+    desktop keyring slow enough to time out. After ``wait`` seconds a process goes ahead anyway."""
     try:
-        # A separate process can be killed and reaped if the keyring waits for an
-        # unlock dialog. Keep credentials in pipes, never in logs or on disk.
-        result = subprocess.run(
-            [sys.executable, "-m", "super_partner.secrets"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            timeout=timeout, check=True,
-        )
+        import fcntl
+    except ImportError:  # no flock (Windows): read as before
+        yield
+        return
+    path = Path(tempfile.gettempdir()) / f"super-partner-keyring-{os.getuid()}.lock"
+    try:
+        handle = path.open("a")
+    except OSError:
+        yield
+        return
+    with handle:
+        deadline, locked = time.monotonic() + wait, False
+        while not locked and time.monotonic() < deadline:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if locked:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _read_in_child(timeout: float) -> dict:
+    """The saved keys, read by a separate process that can be killed and reaped if the keyring
+    waits for an unlock dialog; it is tried once more, given twice the time, if it is only slow.
+    Credentials stay in pipes, never in logs or on disk."""
+    for limit in (timeout, timeout * 2):
+        with _one_at_a_time(limit * 3):
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "super_partner.secrets"],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                    timeout=limit, check=True,
+                )
+            except subprocess.TimeoutExpired:
+                continue
         values = json.loads(result.stdout)
         if not isinstance(values, dict):
             raise TypeError("Invalid keyring response")
+        return values
+    raise subprocess.TimeoutExpired("keyring", timeout * 3)
+
+
+# Set when the last read of the keyring failed (locked, missing or too slow): saved keys may
+# exist that are not loaded yet. `keep_loading_keys` tries again until a read succeeds.
+_keyring_unavailable = False
+KEYRING_RETRY_SECONDS = 30.0
+
+
+def keyring_unavailable() -> bool:
+    return _keyring_unavailable
+
+
+def hydrate_provider_keys(timeout: float = 10.0) -> list[str]:
+    """Load saved keys without letting a locked desktop keyring block startup. Returns the
+    providers whose key was loaded by this call."""
+    global _keyring_unavailable
+    if all(env_name in os.environ for env_name in SECRET_ENV.values()):
+        _keyring_unavailable = False
+        return []
+    try:
+        values = _read_in_child(timeout)
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         # Exception output may contain credentials, so only log a fixed message.
-        logger.warning(
-            "OS keyring unavailable or timed out; continuing with environment credentials. "
-            "Unlock the keyring and restart to load saved API keys."
-        )
-        return
-    for env_name in SECRET_ENV.values():
+        if not _keyring_unavailable:
+            logger.warning(
+                "OS keyring unavailable or timed out; continuing with environment credentials. "
+                "Unlock the keyring: saved API keys are loaded on the next retry (every %d s).",
+                KEYRING_RETRY_SECONDS,
+            )
+        _keyring_unavailable = True
+        return []
+    _keyring_unavailable = False
+    loaded = []
+    for provider, env_name in SECRET_ENV.items():
         value = values.get(env_name)
-        if isinstance(value, str) and value:
-            os.environ.setdefault(env_name, value)
+        if isinstance(value, str) and value and env_name not in os.environ:
+            os.environ[env_name] = value
+            loaded.append(provider)
+    return loaded
+
+
+async def keep_loading_keys(on_loaded=None, interval: Optional[float] = None, timeout: float = 5.0) -> None:
+    """While the keyring is unavailable, read it again every ``interval`` seconds, so keys
+    saved there work once it is unlocked, without a restart. ``on_loaded(providers)`` is told
+    which keys arrived."""
+    import asyncio
+
+    while _keyring_unavailable:
+        await asyncio.sleep(KEYRING_RETRY_SECONDS if interval is None else interval)
+        loaded = await asyncio.to_thread(hydrate_provider_keys, timeout)
+        if loaded:
+            logger.info("Loaded saved API keys from the OS keyring: %s", ", ".join(loaded))
+            if on_loaded:
+                on_loaded(loaded)
 
 
 def configured_providers() -> list[str]:
@@ -140,4 +227,7 @@ def configured_providers() -> list[str]:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in {"set", "delete"}:
         sys.exit(_change_keyring(sys.argv[1]))
-    print(json.dumps(_read_provider_keys()))
+    try:
+        print(json.dumps(_read_provider_keys()))
+    except KeyringError:
+        sys.exit(3)

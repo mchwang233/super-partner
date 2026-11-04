@@ -16,6 +16,180 @@ from super_partner.quota import ModelUnavailable
 from super_partner.routing import estimate, route_node
 
 
+async def test_artifact_pipeline_generates_own_missing_outputs_and_audits_only_accepted_reports(tmp_path, monkeypatch):
+    from artifact_helpers import mock_acceptance, setup_executor
+
+    checks = []
+    mock_acceptance(monkeypatch, checks)
+    executor, db, providers = setup_executor(tmp_path, monkeypatch)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.SUCCEEDED, run.error
+    assert providers.calls == ["vdb", "report", "audit"]
+    assert all(n.artifact_evidence.accepted for n in run.plan.nodes)
+    assert [c[0] for c in checks] == ["validate coverage.vdb", "validate report.txt", "validate audit.txt"]
+    assert run.actual_cost_usd == pytest.approx(0.006)
+    assert all(n.contract_turns == 1 for n in run.plan.nodes)
+
+
+async def test_artifact_missing_external_input_blocks_without_model_calls_or_downstream_audit(tmp_path, monkeypatch):
+    from artifact_helpers import coverage_nodes, setup_executor
+
+    _, report, audit = coverage_nodes()
+    report.dependencies = []
+    report.artifact_contract.inputs[0].source = "external"
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [report, audit])
+    monkeypatch.setattr(settings, "auto_diagnose", True)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.INCOMPLETE and providers.calls == []
+    assert all(n.status == NodeStatus.BLOCKED for n in run.plan.nodes)
+    assert run.plan.nodes[0].attempts[0].outcome == "blocked"
+    assert "coverage.vdb" in run.diagnoses[0].report
+    assert run.actual_cost_usd == 0
+
+
+async def test_a_membership_cli_runs_a_contract_step_bounded_by_time(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, mock_acceptance, setup_executor
+
+    node = contract_node()
+    node.model_id = "cli:codex"
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [node])
+    executor.model_lookup[node.model_id] = executor.model_lookup["test:worker"].model_copy(
+        update={"id": node.model_id, "provider": "cli", "channel": "cli"})
+    run = db.get_run("artifacts")
+    run.use_cli = True
+    db.save_run(run)
+    mock_acceptance(monkeypatch, [])
+    await executor.execute("artifacts")
+    node = db.get_run("artifacts").plan.nodes[0]
+    # The lead's assignment holds: no switch to an API model that can count tool calls.
+    assert [a.model_id for a in node.attempts] == ["cli:codex"]
+    assert not [e for e in db.events("artifacts") if e.kind == "node.model_switched"]
+
+
+async def test_a_cli_contract_step_stops_past_the_time_its_calls_allow(tmp_path, monkeypatch):
+    import super_partner.executor as module
+    from artifact_helpers import contract_node, setup_executor
+
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [contract_node()])
+    run = db.get_run("artifacts")
+    checked = []
+
+    async def fine(evidence):
+        checked.append(evidence)
+
+    monkeypatch.setattr(executor, "_progress_watch", lambda *a: fine)
+    watch = executor._timed_watch(run, run.plan.nodes[0], "cli:codex")
+    assert await watch("busy") is None and checked == ["busy"]
+    monkeypatch.setattr(module, "CLI_MINUTES_PER_TOOL_CALL", 0)
+    watch = executor._timed_watch(run, run.plan.nodes[0], "cli:codex")
+    assert "用时上限" in await watch("busy")
+    # An API model counts its calls: no time limit.
+    assert await executor._timed_watch(run, run.plan.nodes[0], "test:worker")("busy") is None
+
+
+@pytest.mark.parametrize("declaration", [{}, {"counting_unit": "request", "hard_limit": True},
+                                         {"counting_unit": "tool_call", "hard_limit": False}])
+async def test_tool_limit_admission_blocks_before_dispatch_with_structured_evidence(tmp_path, monkeypatch, declaration):
+    from artifact_helpers import setup_executor
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch)
+    providers.capabilities["test:worker"] = declaration
+
+    async def must_not_start(*args):
+        pytest.fail("incompatible work was dispatched")
+
+    monkeypatch.setattr(executor, "_execute_node", must_not_start)
+    await executor.execute("artifacts")
+    run = db.get_run("artifacts")
+    assert run.status == RunStatus.INCOMPLETE
+    assert providers.calls == providers.actual_calls == []
+    assert all(n.status == NodeStatus.BLOCKED and not n.attempts and n.started_at is None for n in run.plan.nodes)
+    events = db.events(run.id)
+    assert not any(e.kind == "node.started" for e in events)
+    data = next(e.data for e in events if e.kind == "node.blocked")
+    assert data["started"] is False and data["code"] == "tool_limit_incompatible"
+    assert data["required_capabilities"] == {"counting_unit": "tool_call", "hard_limit": True}
+    assert data["channels"][0]["declared_capabilities"] == declaration
+    assert data["actual_counts"]["vdb"] == {"requests": 0, "tool_calls": 0, "cost_usd": 0, "limit": 3}
+    assert data["affected_dependencies"] == ["audit", "report"]
+    assert run.actual_cost_usd == 0
+
+
+async def test_tool_limit_admission_rechecks_after_final_channel_changes(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [contract_node()])
+
+    def incompatible_after_spreading(run, node):
+        providers.capabilities[node.model_id] = {"counting_unit": "request", "hard_limit": False}
+
+    monkeypatch.setattr(executor, "_spread", incompatible_after_spreading)
+    await executor.execute("artifacts")
+    node = db.get_run("artifacts").plan.nodes[0]
+    assert node.status == NodeStatus.BLOCKED and node.attempts == [] and node.started_at is None
+    assert providers.calls == providers.actual_calls == []
+    assert not any(e.kind == "node.started" for e in db.events("artifacts"))
+
+
+async def test_compatible_consumer_does_not_start_without_upstream_acceptance(tmp_path, monkeypatch):
+    from artifact_helpers import setup_executor
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch)
+    run = db.get_run("artifacts")
+    run.plan.nodes[0].status = NodeStatus.SUCCEEDED  # a status alone is not accepted evidence
+    db.save_run(run)
+    await executor.execute(run.id)
+    saved = db.get_run(run.id)
+    assert saved.status == RunStatus.INCOMPLETE and providers.calls == []
+    assert saved.plan.nodes[0].status == NodeStatus.SUCCEEDED
+    assert all(n.status == NodeStatus.BLOCKED and n.attempts == [] and n.started_at is None
+               for n in saved.plan.nodes[1:])
+    assert not any(e.kind == "node.started" for e in db.events(run.id))
+
+
+async def test_artifact_worker_blocked_result_preserves_cost_and_log_without_automatic_recovery(tmp_path, monkeypatch):
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.providers import ProviderResult
+
+    async def blocked(node, workspace, kwargs):
+        kwargs["tool_log"].append({"turn": 1, "tool": "Bash", "detail": "check license", "ok": False, "output": "license missing"})
+        return ProviderResult("BLOCKED: license missing", 1000, 1000, "test:worker", turns=1)
+
+    executor, db, providers = setup_executor(tmp_path, monkeypatch, [contract_node()], blocked)
+    monkeypatch.setattr(settings, "auto_diagnose", True)
+    await executor.execute("artifacts")
+    node = db.get_run("artifacts").plan.nodes[0]
+    assert providers.calls == ["vdb"] and node.status == NodeStatus.BLOCKED
+    assert node.attempts[0].cost_usd == pytest.approx(0.002)
+    assert node.attempts[0].tool_calls[0].output == "license missing"
+
+
+async def test_artifact_blocked_claim_never_runs_downstream_audit(tmp_path, monkeypatch):
+    from super_partner.providers import ProviderResult
+
+    class BlockedWorker:
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, model_id, prompt, workspace=None, **kwargs):
+            self.calls.append(prompt)
+            return ProviderResult("BLOCKED: upstream evidence missing", 0, 0, model_id)
+
+    node = TaskNode(id="report", title="Report", instructions="Generate text", capability="research", model_id="mock:local")
+    audit = TaskNode(id="audit", title="Audit", instructions="Audit delivery", capability="research", model_id="mock:local", dependencies=["report"])
+    db = Database(tmp_path / "blocked.db")
+    db.save_run(ExecutionRun(id="blocked", prompt="delivery", status=RunStatus.QUEUED, budget_usd=1,
+                             plan=TaskPlan(summary="delivery", nodes=[node, audit])))
+    providers = BlockedWorker()
+    executor = Executor(db, providers, {model.id: model for model in builtin_models()})
+    await executor.execute("blocked")
+    assert db.get_run("blocked").status == RunStatus.INCOMPLETE
+    assert len(providers.calls) == 1
+    assert db.get_run("blocked").plan.nodes[1].status == NodeStatus.BLOCKED
+
+
 @pytest.fixture(autouse=True)
 def execution_only(monkeypatch):
     # Scheduler doubles do not supply reviewers; acceptance is tested in test_quality.py.
@@ -105,6 +279,16 @@ def wide_run(
 
 
 @pytest.mark.asyncio
+async def test_every_ready_step_starts_at_once_by_default(tmp_path: Path):
+    assert settings.max_parallel_nodes == 0
+    database = Database(tmp_path / "test.db")
+    run = wide_run(database, width=8, cost=0, budget=1)
+    providers = SlowProviders(delay=0.1)
+    await Executor(database, providers, {model.id: model for model in builtin_models()}).execute(run.id)
+    assert database.get_run(run.id).status == RunStatus.SUCCEEDED and providers.peak == 8
+
+
+@pytest.mark.asyncio
 async def test_executor_respects_parallel_limit(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "max_parallel_nodes", 2)
     database = Database(tmp_path / "test.db")
@@ -151,6 +335,41 @@ async def test_cancel_stops_running_nodes(tmp_path: Path):
     assert providers.active == 0
     assert result.status == RunStatus.CANCELLED
     assert {node.status for node in result.plan.nodes} == {NodeStatus.CANCELLED}
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_attempt_keeps_its_turns_tool_calls_and_trace(tmp_path: Path, monkeypatch):
+    """What an attempt did is kept however it ends, so the task can be looked back on."""
+    monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
+    database = Database(tmp_path / "test.db")
+    run = wide_run(database, width=1, cost=0, budget=1)
+    started = asyncio.Event()
+
+    class Working:
+        async def complete(self, model_id, prompt, workspace=None, tool_log=None, tool_trace=None, **kwargs):
+            tool_log.append({"turn": 3, "tool": "Bash", "detail": "make test", "ok": False, "output": "1 failed"})
+            tool_trace.parent.mkdir(parents=True, exist_ok=True)
+            tool_trace.write_text('{"turn": 3, "tool": "Bash", "output": "the whole output"}\n')
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError as exc:
+                exc.usage = ProviderResult("", 100, 20, model_id, turns=7)
+                raise
+
+    executor = Executor(database, Working(), {model.id: model for model in builtin_models()})
+    executor.start(run.id)
+    await started.wait()
+    cancelled = database.get_run(run.id)
+    cancelled.status = RunStatus.CANCELLED
+    database.save_run(cancelled)
+    executor.cancel(run.id)
+    with pytest.raises(asyncio.CancelledError):
+        await executor.tasks[run.id]
+    [attempt] = database.get_run(run.id).plan.nodes[0].attempts
+    assert attempt.turns == 7 and [call.detail for call in attempt.tool_calls] == ["make test"]
+    assert attempt.trace and "the whole output" in Path(attempt.trace).read_text()
+    assert Path(attempt.trace).is_relative_to(tmp_path / "data")
 
 
 @pytest.mark.asyncio
@@ -269,3 +488,24 @@ async def test_finished_work_is_kept_when_used_model_left_the_catalog(tmp_path: 
     assert result.status == RunStatus.SUCCEEDED
     assert result.plan.nodes[0].result == "out only"
     assert result.actual_cost_usd == 0.25
+
+
+async def test_a_cli_contract_call_gets_cost_limits_but_no_call_counting(tmp_path, monkeypatch):
+    # The provider refuses a call that must count tool calls on a channel that cannot.
+    from artifact_helpers import contract_node, setup_executor
+    from super_partner.providers import ProviderResult
+
+    executor, db, _ = setup_executor(tmp_path, monkeypatch, [contract_node()])
+    run = db.get_run("artifacts")
+    seen = {}
+
+    async def call(budget):
+        seen[budget.context["purpose"]] = budget
+        return ProviderResult("ok", 1, 1, "x")
+
+    await executor._charged(run, run.plan.nodes[0], "cli:codex", call, work=True)
+    cli = seen.pop("work")
+    assert cli.turn_remaining is None and cli.begin_tool is None and cli.tool_remaining is None
+    assert cli.step_remaining is not None
+    await executor._charged(run, run.plan.nodes[0], "test:worker", call, work=True)
+    assert seen["work"].turn_remaining is not None and seen["work"].begin_tool is not None

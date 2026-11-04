@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-from . import quality, replan, supervisor
+from . import contracts, quality, replan, supervisor
 from .budget import BudgetExceeded
 from .config import settings
 from .models import (
@@ -68,13 +68,30 @@ class Leading:
             return
         choices = self._choices(run, node)
         verifying = outcome == Outcome.VERIFY_FAILED
-        targets = self._targets(run, node) if verifying else None
+        blocked = outcome == Outcome.BLOCKED
+        # A blocked step may need work it builds on redone (a coverage gap, a missing output).
+        targets = (self._targets(run, node) if verifying
+                   else self._upstream(run, node) if blocked else None)
         prompt = (supervisor.verification_message(run, node, verdict, choices, left) if verifying
-                  else supervisor.failure_message(run, node, node.attempts[-1], verdict, choices, left))
+                  else supervisor.failure_message(run, node, node.attempts[-1], verdict, choices, left,
+                                                  upstream=targets))
+        limited = outcome == Outcome.STOPPED and node.artifact_contract is not None
+        if limited:
+            prompt += "\n" + supervisor.limit_note(node, contracts.extension(node))
+        if blocked:
+            prompt += "\n" + supervisor.BLOCKED_NOTE
+        limited = limited or blocked
         event = "verify_failed" if verifying else "attempt_failed"
         decision = await self._ask_for_decision(run_id, node_id, prompt, {item.id for item in choices}, targets,
                                                 event=event)
-        if decision is None:
+        if decision is None and limited:
+            # Nobody decided to give it more: it stops at its limit as declared.
+            async with self.locks.setdefault(run_id, asyncio.Lock()):
+                latest = self.db.get_run(run_id)
+                step = next(item for item in latest.plan.nodes if item.id == node_id)
+                self._stop_contract(latest, step, verdict.reason, Outcome.STOPPED)
+                self._save(latest)
+        elif decision is None:
             await self._record_fallback(run_id, node_id)
             if verifying:
                 # As before the lead: the findings send the verified work back, within the usual rounds.
@@ -86,6 +103,11 @@ class Leading:
                 await self._repair(run_id, node_id, verdict, outcome)
         elif decision != "budget":
             await self._apply_decision(run_id, node_id, decision, verdict, outcome, event)
+
+    @staticmethod
+    def _upstream(run, node) -> set[str]:
+        """The finished steps ``node`` builds on, which the lead may send back."""
+        return {item.id for item in contracts.ancestors(node, run.plan.nodes) if item.status == NodeStatus.SUCCEEDED}
 
     @staticmethod
     def _targets(run, node) -> set[str]:
@@ -157,7 +179,7 @@ class Leading:
         """Why a plan change cannot be made, tried on a copy of the task; None if it can."""
         try:
             self._change_plan(self.db.get_run(run_id).model_copy(deep=True), change, deciding)
-        except (replan.PlanError, AttributeError, TypeError, KeyError) as exc:
+        except (replan.PlanError, ValueError, AttributeError, TypeError, KeyError) as exc:
             # A malformed change (not the shape asked for) is as unusable as an impossible one.
             return str(exc) or type(exc).__name__
         return None
@@ -175,8 +197,16 @@ class Leading:
 
     async def _final_review(self, run_id: str) -> bool:
         """Every step has finished: the lead checks the whole result against the request. True if
-        it sent work back or changed the plan, so the task goes on; False to finish it."""
+        it sent work back or changed the plan, so the task goes on; False to finish it. It is
+        the one acceptance kept when steps are not accepted one by one (settings.acceptance)."""
         run = self.db.get_run(run_id)
+        for node in run.plan.nodes:
+            try:
+                contracts.accepted(run, node)
+            except contracts.ArtifactBlocked as exc:
+                self._stop_contract(run, node, str(exc))
+                self._save(run)
+                return True
         if not self._can_lead() or not (run.supervisor and run.supervisor.model_id):
             return False
         counted = [item for item in run.decisions if item.action != "fallback"
@@ -229,6 +259,18 @@ class Leading:
             node = next(item for item in run.plan.nodes if item.id == node_id)
             if run.status == RunStatus.CANCELLED or node.status not in {NodeStatus.RUNNING, NodeStatus.PENDING}:
                 return
+            if node.artifact_contract and action in {"accept", "retry", "switch_model", "replan"}:
+                try:
+                    if action == "accept":
+                        contracts.accepted(run, node)
+                    elif self._contract_limit_reason(node):
+                        # Running it again is the lead granting it more calls (supervisor.limit_note).
+                        granted = contracts.extend(node)
+                        self.emit(run_id, "node.limit_extended", node_id=node_id, **granted)
+                except contracts.ArtifactBlocked as exc:
+                    self._stop_contract(run, node, str(exc))
+                    self._save(run)
+                    return
             made = Decision(
                 node_id=node_id, event=event, action=action, reason=reason, instructions=instructions,
                 model_id=decision.get("model_id"), targets=decision.get("targets", []),
@@ -244,6 +286,12 @@ class Leading:
                 node.status = NodeStatus.PENDING
                 self.emit(run_id, "node.retry", node_id=node_id, reason="lead", model_id=node.model_id,
                           attempt=len(node.attempts) + 1)
+            elif action == "rework" and not node.verifies:
+                # A blocked step: what it builds on is redone, then it and everything after it.
+                run.rework_rounds += 1
+                reopened = self._reopen(run, set(decision["targets"]), instructions or reason)
+                self.emit(run_id, "run.rework", verifier=node_id, round=run.rework_rounds, reopened=reopened,
+                          problems=instructions or reason)
             elif action == "rework":
                 self._send_back(run, node, verdict, set(decision["targets"]), instructions, limited=False)
             elif action == "replan":
@@ -260,6 +308,14 @@ class Leading:
             elif action == "unable":
                 self._mark_unable(run, node, reason or verdict.unable or verdict.reason,
                                   user_action=decision.get("user_action"))
+            elif action == "request_component":
+                job = self._engineer_for_lead(run, node, instructions or reason, made.id)
+                if job:
+                    made.engineer_job_id = job.id
+                    self.emit(run_id, "run.engineer_requested", node_id=node_id, job_id=job.id)
+                else:
+                    self._mark_unable(run, node, f"这一步需要 Super Partner 新增能力，但平台工程师当前不可用：{instructions or reason}",
+                                      user_action="启用平台自修复后，可以在负责人对话里点“拉平台工程师进来”提出这个需求。")
             elif action == "ask_user":
                 question = Diagnosis(
                     id=uuid4().hex[:8], trigger="lead", node_id=node_id,
@@ -274,7 +330,12 @@ class Leading:
                 run.error, run.waiting_diagnosis_id = question.question, question.id
                 self.emit(run_id, "run.diagnosis_question", diagnosis_id=question.id,
                           question=question.question, choices=question.choices)
-            else:
+            if (call := decision.get("engineer")) and action not in {"request_component", "repair_platform"}:
+                # Something in Super Partner itself the lead found on the way: the engineer takes it
+                # in the background, whatever this decision does with the step.
+                job, _ = self.engineer_join(run_id, call, "lead", node_id, made.id)
+                made.engineer_job_id = job.id if job else None
+            if action in {"repair_environment", "repair_platform"}:
                 # A repair session with access to this machine (or a platform source repair) does
                 # the work; its outcome comes back to the lead (_after_repair) before the step runs.
                 node.status = NodeStatus.RUNNING
@@ -329,8 +390,14 @@ class Leading:
         return True
 
     async def _lead_chat(self, run_id: str, text: str, reply_id: str) -> None:
+        job = None
         try:
             answer, status = await self.ask_lead(run_id, supervisor.chat_message(text)), "done"
+            # The lead may bring the platform engineer in at once.
+            answer, call = supervisor.split_engineer(answer)
+            if call:
+                job, problem = self.engineer_join(run_id, call, "lead")
+                answer += f"\n\n（已请平台工程师加入：{job.title}）" if job else f"\n\n（没能请平台工程师加入：{problem}）"
         except asyncio.CancelledError:
             answer, status = "这条回复被中断了，请重新提问。", "failed"
             raise
@@ -342,6 +409,7 @@ class Leading:
                 reply = next((item for item in run.lead_messages if item.id == reply_id), None) if run else None
                 if reply:
                     reply.text, reply.status = answer, status
+                    reply.engineer_job_id = job.id if job else None
                     self._save(run)
         self.emit(run_id, "run.lead_message", role="lead", status=status)
 
@@ -382,7 +450,8 @@ class Leading:
         """A task paused for the lead's question goes on once nothing else holds it."""
         async with self.locks.setdefault(run_id, asyncio.Lock()):
             run = self.db.get_run(run_id)
-            if run.status != RunStatus.PAUSED or run.waiting_diagnosis_id or run.maintenance_id:
+            if (run.status != RunStatus.PAUSED or run.waiting_diagnosis_id or run.maintenance_id
+                    or run.engineer_job_id):
                 return
             required = run.actual_cost_usd + sum(node.estimated_cost_usd for node in run.plan.nodes
                                                  if node.status != NodeStatus.SUCCEEDED)

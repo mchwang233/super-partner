@@ -49,6 +49,28 @@ export function statusLabel(status: string): string {
   return STATUS_LABELS[status] ?? status.replaceAll("_", " ");
 }
 
+/** A step's status; a running step still waiting for another to leave its folder is queued. */
+export function nodeStatusLabel(node: { status: string; waiting_for_folder?: boolean; preparing?: boolean }): string {
+  if (node.status === "pending" && node.preparing) return "先行准备中";
+  return node.status === "running" && node.waiting_for_folder ? "排队中" : statusLabel(node.status);
+}
+
+/** An API error's `detail` as text: a message, a {reason} object, or a list of validation errors. */
+export function detailText(detail: unknown): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) return detail.map(item => detailText(item)).filter(Boolean).join("；");
+  if (detail && typeof detail === "object") {
+    const item = detail as Record<string, unknown>;
+    const text = item.reason ?? item.message ?? item.msg ?? item.detail;
+    if (text !== undefined) {
+      const where = Array.isArray(item.loc) ? item.loc.filter(part => part !== "body").join(".") : "";
+      return where ? `${where}：${detailText(text)}` : detailText(text);
+    }
+    return JSON.stringify(detail);
+  }
+  return detail == null ? "" : String(detail);
+}
+
 /** Dollar amounts: tiny API charges stay readable without padding every value to 6 places. */
 export function formatUsd(value: number): string {
   if (value === 0) return "$0";

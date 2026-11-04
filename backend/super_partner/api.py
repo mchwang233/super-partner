@@ -18,11 +18,12 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field
 
 from . import attachments as files
-from . import briefing, publish
+from . import briefing, cli_quota, folders, learning, publish, retrospect, skills, team
 from . import diagnosis as diagnosis_module
 from .benchmarks import BenchmarkCatalog
 from .catalog_sync import CatalogSync, seed_catalog
 from .config import settings
+from .contracts import ContractError
 from .db import Database
 from .executor import Executor
 from .models import (
@@ -31,10 +32,12 @@ from .models import (
     DiagnosisMessage,
     Event,
     ExecutionRun,
+    LearningSettings,
     NodeStatus,
     RunStatus,
     SupervisorSession,
 )
+from .outline import INTERNET_NOTE
 from .planner import autonomous_plan
 from .projects import (
     NativePickerError,
@@ -47,7 +50,15 @@ from .projects import (
     resolve_project_dir,
 )
 from .providers import ProviderError, ProviderRegistry
-from .routing import NoEligibleModelError, brief_writer, eligible_for_node, estimate, route_node
+from .routing import (
+    NoEligibleModelError,
+    brief_writer,
+    eligible_for_node,
+    estimate,
+    fit_and_route,
+    part_estimate,
+    route_node,
+)
 from .scoring import AA_SOURCE, rescore
 from .secrets import (
     PROVIDER_ENV,
@@ -55,6 +66,8 @@ from .secrets import (
     configured_providers,
     delete_provider_key,
     hydrate_provider_keys,
+    keep_loading_keys,
+    keyring_unavailable,
     set_provider_key,
 )
 
@@ -115,6 +128,7 @@ catalog_sync = CatalogSync(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    db.interrupt_model_calls()
     catalog_sync.start()
     for run in db.list_runs():
         # An interrupted run may have left a project half-edited; resume only once confirmed.
@@ -132,9 +146,18 @@ async def lifespan(_: FastAPI):
         if interrupted:
             db.save_run(run)
     executor.restore_platform()
+    executor.restore_engineer()
+    executor.restore_learning()
+    # Keys saved in a keyring that was locked at startup: load them once it is unlocked.
+    keys = asyncio.create_task(keep_loading_keys(
+        lambda loaded: [providers.quota.clear_provider(item) for item in loaded]))
+    # Membership CLIs priced by their subscription: refresh their price and quota pressure.
+    usage = asyncio.create_task(cli_quota.keep_applying(models, providers.quota))
     try:
         yield
     finally:
+        keys.cancel()
+        usage.cancel()
         await executor.shutdown()
         await catalog_sync.close()
         await providers.client.aclose()
@@ -180,6 +203,7 @@ async def local_only(request: Request, call_next):
 def health():
     return {
         "status": "ok", "pid": os.getpid(), "configured_providers": configured_providers() + ["mock"],
+        "keyring_unavailable": keyring_unavailable(),
         "available_cli_channels": sorted(providers.cli.available_model_ids()),
         "exhausted_models": providers.quota.public(),
     }
@@ -206,6 +230,71 @@ def reset_model_quota(model_id: str):
     """The user knows the quota is back (or topped up the account): use the model again."""
     providers.quota.clear(model_id)
     return providers.quota.public()
+
+
+class EngineerRequest(BaseModel):
+    request: str = Field(min_length=1, max_length=20_000)
+    kind: str = Field(default="component", pattern="^(repair|component)$")
+    budget_usd: Optional[float] = Field(default=None, ge=0, le=100)
+
+
+class EngineerReply(BaseModel):
+    text: str = Field(default="", max_length=20_000)
+    choice: Optional[str] = Field(default=None, max_length=300)
+
+
+def _engineer(action):
+    from .engineer import EngineerError
+
+    try:
+        return action()
+    except EngineerError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/engineer")
+def engineer_overview(run_id: Optional[str] = None):
+    """The platform engineer (engineer.py): its jobs, newest first, and what it is working on;
+    with ``run_id``, only the jobs of that task."""
+    return executor.engineer_overview(run_id=run_id)
+
+
+@app.post("/api/tasks/{run_id}/engineer", status_code=201)
+async def engineer_join(run_id: str, body: EngineerRequest):
+    """The user brings the platform engineer into the task's conversation with its lead."""
+    get_task(run_id)
+    job, problem = executor.engineer_join(run_id, {"request": body.request, "kind": body.kind}, "user")
+    if not job:
+        raise HTTPException(409, problem)
+    return job
+
+
+@app.post("/api/engineer/jobs", status_code=201)
+async def engineer_request(body: EngineerRequest):
+    """Ask the platform engineer for a repair (applied once checked) or a component (planned
+    first; applied once the user approves the checked change)."""
+    return _engineer(lambda: executor.engineer_request(body.request, body.kind, budget_usd=body.budget_usd))
+
+
+@app.post("/api/engineer/jobs/{job_id}/reply")
+async def engineer_reply(job_id: str, body: EngineerReply):
+    return _engineer(lambda: executor.engineer_reply(job_id, body.text, body.choice))
+
+
+@app.post("/api/engineer/jobs/{job_id}/approve")
+async def engineer_approve(job_id: str):
+    """Approve the plan (the engineer then makes the change) or the checked change (applied)."""
+    return _engineer(lambda: executor.engineer_approve(job_id))
+
+
+@app.post("/api/engineer/jobs/{job_id}/reject")
+async def engineer_reject(job_id: str):
+    from .engineer import EngineerError
+
+    try:
+        return await executor.engineer_reject(job_id)
+    except EngineerError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/channels/cli")
@@ -273,13 +362,16 @@ def store_provider_key(provider: str, body: ProviderKey):
 @app.get("/api/providers")
 def list_providers():
     configured = set(configured_providers())
+    locked = keyring_unavailable()
     labels = {
         "openai": "OpenAI", "anthropic": "Anthropic Claude", "google": "Google Gemini",
         "deepseek": "DeepSeek", "qwen": "通义千问", "doubao": "豆包",
         "glm": "智谱 GLM", "minimax": "MiniMax", "kimi": "Kimi（月之暗面）",
     }
     return [
-        {"id": provider, "name": labels[provider], "configured": provider in configured}
+        {"id": provider, "name": labels[provider], "configured": provider in configured,
+         # Its key may be saved in the keyring, which is locked: it loads once unlocked.
+         "keyring_locked": provider not in configured and locked}
         for provider in PROVIDER_ENV
     ]
 
@@ -387,6 +479,37 @@ async def create_task(body: CreateTask):
 async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> ExecutionRun:
     """Plan, route and save a task awaiting confirmation. With ``parent`` it is a requirement
     change that continues that task in its folder (see follow_up_task)."""
+    plan, session, attached, project_dir, background, lessons = await _make_plan(body, parent)
+    run = ExecutionRun(
+        id=str(uuid4()), prompt=body.prompt, status=RunStatus.AWAITING_CONFIRMATION,
+        plan=plan, budget_usd=body.budget_usd, use_cli=body.use_cli, allow_network=body.allow_network,
+        project_dir=str(project_dir) if project_dir else None, attachments=attached,
+        actual_cost_usd=plan.planning_cost_usd, background=background,
+        parent_run_id=parent.id if parent else None, workspace_id=parent.folder_id if parent else None,
+        supervisor=session if session.model_id else None,
+        improvement_uses=lessons,
+    )
+    if not parent and not project_dir:
+        # A readable folder, not the task's id: 20261021-1441-async-fifo-uvm.
+        run.folder_name = await asyncio.to_thread(folders.task_folder, plan.folder or plan.summary or body.prompt)
+    db.save_run(run)
+    db.add_event(Event(
+        run_id=run.id, kind="plan.created",
+        data={
+            "estimate": plan.estimate.model_dump(), "use_cli": body.use_cli, "allow_network": body.allow_network,
+            "project_dir": run.project_dir, "parent_run_id": run.parent_run_id,
+            "planning_method": plan.planning_method,
+            "planner_model_id": plan.planner_model_id,
+            "planning_note": plan.planning_note,
+        },
+    ))
+    return run
+
+
+async def _make_plan(body: CreateTask, parent: Optional[ExecutionRun] = None, decided: str = ""):
+    """The routed and estimated plan of ``body`` (see _new_task), and what it was made with:
+    (plan, lead session, attachments, project folder, background, lessons). ``decided``: the
+    user's answers to an earlier plan's open choices (replan_with_choices)."""
     configured = providers.configured_models(list(models))
     if not body.use_cli:
         configured = {model_id for model_id in configured if not model_id.startswith("cli:")}
@@ -403,62 +526,115 @@ async def _new_task(body: CreateTask, parent: Optional[ExecutionRun] = None) -> 
     needs_vision = any(item.kind == "image" for item in attached)
     background = change_background(parent) if parent else None
     request = body.prompt + files.describe(attached, with_paths=False)
+    if decided:
+        request += "\n\n" + decided
+    if body.allow_network:
+        # The lead plans within what the steps' sandbox allows (planner.WORK_RULES).
+        request += "\n\n" + INTERNET_NOTE
+    executor.sync_improvements()
+    lessons = learning.selected(db, request)
+    if note := learning.instruction(lessons):
+        request += "\n\n" + note
     # The lead plans from the project brief, so it can cut the work into scoped packages.
     root = Path(project_dir) if project_dir else settings.workspace_root / parent.folder_id if parent else None
     brief, brief_cost = None, 0.0
     if root and root.is_dir() and any(root.iterdir()):
         writer = brief_writer(list(models.values()), configured) if settings.project_brief else None
         brief, brief_cost = await briefing.planning_brief(root, settings.data_dir, providers, writer)
-    plan = await autonomous_plan(
-        f"{background}\n\n新需求：\n{request}" if background else request, list(models.values()), configured, providers,
-        project_context=await asyncio.to_thread(project_context, project_dir) if project_dir else None,
-        session=(session := SupervisorSession()), brief=brief,
-    )
+    try:
+        plan = await autonomous_plan(
+            f"{background}\n\n新需求：\n{request}" if background else request, list(models.values()), configured, providers,
+            project_context=await asyncio.to_thread(project_context, project_dir) if project_dir else None,
+            session=(session := SupervisorSession()), brief=brief,
+        )
+    except ContractError as exc:
+        raise HTTPException(422, {"status": "blocked", "reason": str(exc)}) from exc
     plan.planning_cost_usd = round(plan.planning_cost_usd + brief_cost, 6)
+    catalog = list(models.values())
+    if parent:
+        plan.in_project = True
     try:
         for node in plan.nodes:
             if parent:
                 # Every step changes files the earlier task left, so it needs a model that can act.
                 node.needs_workspace = True
-            available = eligible_for_node(node, list(models.values()), configured, needs_vision)
-            if available:
-                best_score = max(
-                    model.scores.score_for(node.capability) for model in available
-                )
-                if node.quality_threshold > best_score:
-                    original = node.quality_threshold
-                    node.quality_threshold = best_score
-                    adjustment = (
-                        f"Adjusted {node.title} {node.capability} threshold "
-                        f"from {original:g} to {best_score:g} for available models"
-                    )
-                    plan.planning_note = (
-                        f"{plan.planning_note}; {adjustment}" if plan.planning_note else adjustment
-                    )
-            route_node(node, list(models.values()), configured, needs_vision)
+            if plan.employees:
+                team.route(node, plan, catalog, configured, needs_vision)
+            elif note := fit_and_route(node, catalog, configured, needs_vision):
+                plan.planning_note = f"{plan.planning_note}; {note}" if plan.planning_note else note
+        for part in plan.parts:
+            if part.status == "planned":
+                assigned = next((e for e in plan.employees if e.id == part.employee_id), None)
+                pool = [m for m in catalog if m.id == assigned.model_id] if assigned else catalog
+                part.estimated_cost_usd = part_estimate(part, plan.in_project, pool, configured, needs_vision)
     except NoEligibleModelError as exc:
         raise HTTPException(422, str(exc)) from exc
-    plan.estimate = estimate(plan.nodes, body.budget_usd, plan.planning_cost_usd)
-    run = ExecutionRun(
-        id=str(uuid4()), prompt=body.prompt, status=RunStatus.AWAITING_CONFIRMATION,
-        plan=plan, budget_usd=body.budget_usd, use_cli=body.use_cli, allow_network=body.allow_network,
-        project_dir=str(project_dir) if project_dir else None, attachments=attached,
-        actual_cost_usd=plan.planning_cost_usd, background=background,
-        parent_run_id=parent.id if parent else None, workspace_id=parent.folder_id if parent else None,
-        supervisor=session if session.model_id else None,
-    )
-    db.save_run(run)
-    db.add_event(Event(
-        run_id=run.id, kind="plan.created",
-        data={
-            "estimate": plan.estimate.model_dump(), "use_cli": body.use_cli, "allow_network": body.allow_network,
-            "project_dir": run.project_dir, "parent_run_id": run.parent_run_id,
-            "planning_method": plan.planning_method,
-            "planner_model_id": plan.planner_model_id,
-            "planning_note": plan.planning_note,
-        },
-    ))
-    return run
+    plan.estimate = estimate(plan.nodes, body.budget_usd, plan.planning_cost_usd, plan.unsplit_cost())
+    return plan, session, attached, project_dir, background, lessons
+
+
+class ChoiceAnswers(BaseModel):
+    # One per choice of the plan, in order: "assumed", "alternative", or the user's own answer.
+    picks: list[str] = Field(min_length=1, max_length=5)
+
+
+# Tasks being planned again with the user's choices (one replanning at a time per task).
+REPLANNING: set[str] = set()
+
+
+def decided_choices(choices, picks: list[str]) -> str:
+    """The user's answers to a plan's open choices, said to the lead; "" when every answer is
+    what the lead had assumed (nothing to plan again)."""
+    lines, changed = [], False
+    for choice, pick in zip(choices, picks):
+        pick = pick.strip()
+        if pick == "alternative" and choice.alternative:
+            answer, changed = choice.alternative, True
+        elif pick and pick not in {"assumed", "alternative"}:
+            answer, changed = pick[:1000], True
+        else:
+            answer = choice.assumed
+        lines.append(f"- {choice.question} → {answer}")
+    if not changed:
+        return ""
+    return ("The user has decided these scope questions; plan exactly by these answers and do not list "
+            "them as choices again:\n" + "\n".join(lines))
+
+
+@app.post("/api/tasks/{run_id}/choices", response_model=ExecutionRun)
+async def replan_with_choices(run_id: str, body: ChoiceAnswers):
+    """The user answered the plan's open choices (TaskPlan.choices) before confirming: when an
+    answer differs from what the lead assumed, the task is planned again with the answers, in
+    place. Its id, folder, budget and settings stay."""
+    run = get_task(run_id)
+    if run.status != RunStatus.AWAITING_CONFIRMATION:
+        raise HTTPException(409, "只有待确认的任务可以按选择重新规划。")
+    if len(body.picks) != len(run.plan.choices):
+        raise HTTPException(422, "每条取舍都要有一个选择。")
+    decided = decided_choices(run.plan.choices, body.picks)
+    if not decided:
+        return run
+    if run_id in REPLANNING:
+        raise HTTPException(409, "正在按你的选择重新规划，请稍候。")
+    REPLANNING.add(run_id)
+    try:
+        parent = db.get_run(run.parent_run_id) if run.parent_run_id else None
+        request = CreateTask(prompt=run.prompt, attachments=[item.id for item in run.attachments],
+                             budget_usd=run.budget_usd, use_cli=run.use_cli, project_dir=run.project_dir,
+                             allow_network=run.allow_network)
+        plan, session, _, _, _, lessons = await _make_plan(request, parent, decided)
+    finally:
+        REPLANNING.discard(run_id)
+    latest = get_task(run_id)
+    if latest.status != RunStatus.AWAITING_CONFIRMATION:
+        raise HTTPException(409, "任务在重新规划期间已改变状态，新计划未采用。")
+    latest.plan, latest.improvement_uses = plan, lessons
+    latest.supervisor = session if session.model_id else latest.supervisor
+    latest.actual_cost_usd = round(latest.actual_cost_usd + plan.planning_cost_usd, 6)
+    db.save_run(latest)
+    db.add_event(Event(run_id=run_id, kind="plan.replanned",
+                       data={"decided": decided, "estimate": plan.estimate.model_dump() if plan.estimate else None}))
+    return latest
 
 
 class FollowUp(BaseModel):
@@ -514,6 +690,105 @@ def list_tasks():
     return db.list_runs()
 
 
+@app.get("/api/retrospectives/recurring")
+async def recurring_problems(min_runs: int = 2):
+    """Problems that came up in at least ``min_runs`` finished tasks, most frequent first."""
+    return await asyncio.to_thread(retrospect.recurring, db, max(1, min_runs))
+
+
+@app.get("/api/retrospectives/topics")
+async def problem_topics(min_runs: int = 1):
+    """Problems across tasks grouped by what they are about (retrospect.topics)."""
+    return await asyncio.to_thread(retrospect.topics, db, max(1, min_runs))
+
+
+@app.get("/api/tasks/{run_id}/retrospective")
+async def task_retrospective(run_id: str):
+    """A finished task's look back: each step's estimate against its cost and turns, and its problems."""
+    body = db.retrospective(run_id) or await asyncio.to_thread(retrospect.record, db, run_id)
+    if body is None:
+        raise HTTPException(404, "Task not found or not finished")
+    return body
+
+
+@app.get("/api/tasks/{run_id}/calls")
+async def task_model_calls(run_id: str):
+    if not db.get_run(run_id):
+        raise HTTPException(404, "Task not found")
+    records = [item for item in db.model_calls(run_id) if not item.get("delegated")]
+    return {"calls": records, "limit": 1000,
+            "summary": {"calls": len(records), "requests": sum(item["requests"] for item in records),
+                        "unknown_usage": sum(not item["usage_known"] for item in records),
+                        "observed_cost_usd": sum(item["cost_usd"] for item in records),
+                        "input_tokens": sum(item["input_tokens"] for item in records),
+                        "output_tokens": sum(item["output_tokens"] for item in records),
+                        "cached_input_tokens": sum(item["cached_input_tokens"] for item in records),
+                        "retries": sum(item["retries"] for item in records)}}
+
+
+@app.get("/api/improvements/settings", response_model=LearningSettings)
+def learning_settings():
+    return learning.preferences(db)
+
+
+@app.put("/api/improvements/settings", response_model=LearningSettings)
+def set_learning_settings(body: LearningSettings):
+    db.save_learning_settings(body.model_dump())
+    return body
+
+
+def improvement_view(item):
+    job = db.get_engineer_job(item.engineer_job_id) if item.engineer_job_id else None
+    return {**item.model_dump(mode="json"), "effects": db.improvement_effects(item.id),
+            "engineer_job": job.model_dump(mode="json") if job else None}
+
+
+@app.get("/api/improvements")
+def list_improvements():
+    executor.sync_improvements()
+    return [improvement_view(item) for item in db.improvements()]
+
+
+@app.get("/api/tasks/{run_id}/learning")
+def task_learning(run_id: str):
+    run = get_task(run_id)
+    executor.sync_improvements()
+    return {"review": db.learning_review(run_id),
+            "automatic_eligible": run.status in retrospect.AUTOMATIC,
+            "automatic_skip_reason": "任务已手动取消，不自动复盘。" if run.status == RunStatus.CANCELLED else None,
+            "retrospective": db.retrospective(run_id) or (
+                retrospect.record(db, run_id) if run.status in retrospect.AUTOMATIC else None),
+            "improvements": [improvement_view(item) for item in db.improvements(run_id)],
+            "applied": [{"id": use["id"], "title": use["title"], "node_ids": use.get("node_ids", []),
+                         "planning": use.get("planning", False), "source_run_id": use["run_id"]}
+                        for use in run.improvement_uses]}
+
+
+@app.post("/api/tasks/{run_id}/learning", status_code=202)
+async def start_task_learning(run_id: str):
+    get_task(run_id)
+    try:
+        return executor.start_learning(run_id, manual=True)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/improvements/{item_id}/disable")
+def disable_improvement(item_id: str):
+    item = db.improvement(item_id)
+    if not item:
+        raise HTTPException(404, "找不到改进项。")
+    if item.kind == "platform":
+        raise HTTPException(409, "已应用的平台改动需要通过平台工程师回退；未应用的工作可在工程师中放弃。")
+    if item.status != "active":
+        raise HTTPException(409, "只能停用已生效的 Skill 或执行规则。")
+    item.status = "disabled"
+    if item.kind == "skill":
+        skills.remove_lesson(item.id)
+    db.save_improvement(item)
+    return item
+
+
 @app.get("/api/tasks/{run_id}", response_model=ExecutionRun)
 def get_task(run_id: str):
     run = db.get_run(run_id)
@@ -524,9 +799,13 @@ def get_task(run_id: str):
 
 @app.delete("/api/tasks/{run_id}", status_code=204)
 async def delete_task(run_id: str):
-    if any(task and not task.done() for task in (executor.tasks.get(run_id), executor.diagnosing.get(run_id))):
+    if any(task and not task.done() for task in (executor.tasks.get(run_id), executor.diagnosing.get(run_id),
+                                               executor.learning_tasks.get(run_id))):
         raise HTTPException(409, "任务仍在执行或结束处理中，请稍后再删除。")
     existing = db.get_run(run_id)
+    if any(job.run_id == run_id and job.improvement_id and job.status not in {"applied", "failed", "rejected", "cancelled"}
+           for job in db.engineer_jobs(1000)):
+        raise HTTPException(409, "该任务的改进仍由平台工程师处理，请完成或放弃后再删除。")
     deleted_attachments = existing.attachments if existing else []
     try:
         deleted = db.delete_run(run_id)
@@ -534,7 +813,9 @@ async def delete_task(run_id: str):
         raise HTTPException(409, str(exc)) from exc
     if not deleted:
         raise HTTPException(404, "Task not found")
+    shutil.rmtree(Path(settings.data_dir) / "traces" / run_id, ignore_errors=True)
     executor.tasks.pop(run_id, None)
+    executor.learning_tasks.pop(run_id, None)
     executor.locks.pop(run_id, None)
     executor.reservations.pop(run_id, None)
     executor.budget_events.pop(run_id, None)
@@ -562,6 +843,8 @@ async def confirm_task(run_id: str, body: ConfirmTask):
     run = get_task(run_id)
     if run.waiting_diagnosis_id or run.maintenance_id:
         raise HTTPException(409, "请先回复诊断问题，或等待平台修复自动生效。")
+    if run.engineer_job_id:
+        raise HTTPException(409, "任务在等平台工程师添加组件：请在负责人对话里的平台工程师卡片上批准或放弃这项工作。")
     diagnosis = executor.diagnosing.get(run_id)
     if diagnosis and not diagnosis.done():
         raise HTTPException(409, "诊断或修复仍在进行，完成后会自动继续；也可以取消任务。")
@@ -577,12 +860,15 @@ async def confirm_task(run_id: str, body: ConfirmTask):
         for node in run.plan.nodes:
             if node.status in {NodeStatus.SUCCEEDED, NodeStatus.RUNNING}:
                 continue
+            if run.plan.employees:
+                team.route(node, run.plan, list(models.values()), configured, any(a.kind == "image" for a in run.attachments))
+                continue
             available = eligible_for_node(node, list(models.values()), configured, any(a.kind == "image" for a in run.attachments))
             if not any(model.id == node.model_id for model in available):
                 route_node(node, list(models.values()), configured, any(a.kind == "image" for a in run.attachments))
     except NoEligibleModelError as exc:
         raise HTTPException(422, str(exc)) from exc
-    required = run.actual_cost_usd + sum(
+    required = run.actual_cost_usd + run.plan.unsplit_cost() + sum(
         node.estimated_cost_usd for node in run.plan.nodes if node.status != NodeStatus.SUCCEEDED
     )
     if required > budget:
@@ -718,6 +1004,8 @@ async def resume_task(run_id: str, body: ConfirmTask):
     run = get_task(run_id)
     if run.waiting_diagnosis_id or run.maintenance_id:
         raise HTTPException(409, "请先回复诊断问题，或等待平台修复自动生效。")
+    if run.engineer_job_id:
+        raise HTTPException(409, "任务在等平台工程师添加组件：请在负责人对话里的平台工程师卡片上批准或放弃这项工作。")
     diagnosis = executor.diagnosing.get(run_id)
     if diagnosis and not diagnosis.done():
         raise HTTPException(409, "诊断或修复仍在进行，完成后会自动继续；也可以取消任务。")
@@ -748,7 +1036,7 @@ async def resume_task(run_id: str, body: ConfirmTask):
     except NoEligibleModelError as exc:
         raise HTTPException(422, str(exc)) from exc
     budget = body.budget_usd if body.budget_usd is not None else run.budget_usd
-    required = run.actual_cost_usd + sum(
+    required = run.actual_cost_usd + run.plan.unsplit_cost() + sum(
         node.estimated_cost_usd for node in run.plan.nodes if node.status != NodeStatus.SUCCEEDED
     )
     if required > budget:
@@ -775,6 +1063,8 @@ async def cancel_task(run_id: str):
     run.status = RunStatus.CANCELLED
     run.waiting_diagnosis_id = None
     run.maintenance_id = None
+    # A component the lead asked for stays with the platform engineer; the user decides on it there.
+    run.engineer_job_id = None
     db.save_run(run)
     db.add_event(Event(run_id=run.id, kind="run.cancelled"))
     executor.cancel(run.id)
@@ -872,6 +1162,18 @@ def task_timeline(run_id: str, after: int = 0):
     if not db.get_run(run_id):
         raise HTTPException(404, "Task not found")
     return [event.model_dump(mode="json") for event in db.events(run_id, after)]
+
+
+@app.get("/api/tasks/{run_id}/nodes/{node_id}/activity")
+def node_activity(run_id: str, node_id: str, limit: int = 200):
+    """What a running step has done so far in this attempt (activity.py): an API model's tool
+    calls, or a CLI's commands, file changes and messages; empty when it is not running."""
+    run = db.get_run(run_id)
+    if not run or not any(node.id == node_id for node in run.plan.nodes):
+        raise HTTPException(404, "Step not found")
+    calls = list(executor.tool_logs.get((run_id, node_id)) or [])
+    return {"running": (run_id, node_id) in executor.tool_logs, "total": len(calls),
+            "calls": calls[-max(1, min(limit, 400)):]}
 
 
 @app.get("/api/tasks/{run_id}/events")

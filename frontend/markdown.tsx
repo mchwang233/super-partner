@@ -1,18 +1,16 @@
-import React, { useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkBreaks from "remark-breaks";
-import remarkGfm from "remark-gfm";
+import React, { Suspense, lazy, useState } from "react";
 
-/** Model output and .md files rendered as Markdown. Raw HTML is never rendered, links open in a
- * new tab, and react-markdown drops unsafe URLs such as javascript:. */
+// The renderer is loaded on its own, right after the page, so the page shows sooner.
+const loadRenderer = () => import("./markdown-render");
+const MarkdownRender = lazy(loadRenderer);
+if (typeof window !== "undefined") setTimeout(() => { void loadRenderer(); }, 0);
+
+/** Model output and .md files rendered as Markdown; plain text until the renderer has loaded. */
 export function Markdown({ text, onLink }: { text: string; onLink?: (href: string) => boolean }) {
   return <div className="markdown-body">
-    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} skipHtml
-      components={{ a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener"
-        // A link to one of the task's own files opens it in place instead of a broken URL.
-        onClick={event => { if (props.href && onLink?.(props.href)) event.preventDefault(); }} /> }}>
-      {text}
-    </ReactMarkdown>
+    <Suspense fallback={<div className="markdown-loading">{text}</div>}>
+      <MarkdownRender text={text} onLink={onLink} />
+    </Suspense>
   </div>;
 }
 
