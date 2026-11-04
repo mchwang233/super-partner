@@ -1,3 +1,7 @@
+<p align="center"><img src="docs/images/banner.svg" alt="Super Partner" width="100%"></p>
+
+<p align="center"><b>English</b> | <a href="README.zh-CN.md">简体中文</a></p>
+
 # Super Partner
 
 Local-first multi-model orchestration for software and research tasks. It plans work as a dependency graph, routes each node to the cheapest capable configured model, estimates cost, asks for one confirmation, then executes autonomously with an audit trail and budget circuit breaker.
@@ -5,6 +9,60 @@ Local-first multi-model orchestration for software and research tasks. It plans 
 Task planning uses the configured model with the strongest planning and reliability scores to generate a validated JSON dependency graph. Invalid, unavailable, or cyclic model plans fall back to the deterministic planner. Each resulting node is independently assigned to the lowest-cost enabled model that meets its capability and context requirements, while authenticated membership CLIs retain priority.
 
 Planning may use a membership CLI, but subtasks and their reviews go to API models first: a CLI takes a subtask only when no enabled API model can do it (none reaches the capability threshold, or none can act on the project). Each node records why its model was chosen. `SUPER_PARTNER_SUBTASKS_PREFER_API=false` restores CLI-first routing. At startup the app safely detects Codex CLI, Claude Code, Gemini CLI, and Qwen Code without exposing account details. A CLI failure falls back to the matching API only when its API key is configured, that API model is enabled, and its estimated cost fits the remaining budget.
+
+**Highlights**
+
+- One strong model leads each task: it plans a dependency graph, decides what to do after each failure, and checks the whole result before the task ends.
+- Every step goes to the cheapest model that is good enough for it, chosen from public benchmark scores. Membership CLIs (Claude Code, Codex, Gemini CLI, Qwen Code) and API models from nine providers can work together.
+- Steps run in a sandbox, and another model reviews each result against its acceptance criteria.
+- Failures get a diagnosis: missing tools are installed, a model out of quota is replaced, and defects in Super Partner itself can be repaired and tested automatically.
+- A budget limit, a single confirmation before the task runs, and a full audit trail.
+
+## Screenshots
+
+| Confirm the plan and budget | Steps finished (dark theme) |
+|---|---|
+| ![Plan confirmation](docs/images/plan-confirm.png) | ![Task progress](docs/images/progress-dark.png) |
+
+![Model profile with routing scores](docs/images/model-profile.png)
+
+<sub>Screenshots use the built-in offline demo model (`mock:local`), so the task finishes instantly at almost no cost.</sub>
+
+## How it works
+
+```mermaid
+flowchart TD
+    A["Describe the task"] --> B["Lead model plans a dependency graph"]
+    B --> C["Route each step to the cheapest capable model"]
+    C --> D(["Confirm plan and budget"])
+    D --> E["Run ready steps in parallel"]
+    E --> F{"Review / verification"}
+    F -- fail --> J["Lead decides: retry, switch model,<br/>replan, ask the user, or repair"]
+    J -. "environment repair /<br/>platform self-repair" .-> E
+    J --> E
+    F -- pass --> H{"All steps done?<br/>Lead checks the whole result"}
+    H -- "rework / replan" --> E
+    H -- done --> I["Result: files, ZIP, GitHub"]
+```
+
+```mermaid
+flowchart TB
+    UI["Web console<br/>(React + Vite)"] -- "HTTP / SSE" --> API["FastAPI service"]
+    CLI["super-partner CLI"] --> API
+    API --> PL["Planner and routing"]
+    API --> EX["Executor"]
+    EX --> LEAD["Task lead"]
+    EX --> REV["Review and verification"]
+    EX --> DIAG["Diagnosis and repair"]
+    EX --> PROV["Providers"]
+    PROV --> MCLI["Membership CLIs<br/>Claude Code · Codex · Gemini · Qwen"]
+    PROV --> APIM["API models<br/>OpenAI · Anthropic · Google · DeepSeek · ..."]
+    APIM --> SB["Sandboxed tools (bwrap)<br/>read, write, edit, run commands"]
+    EX --> DB[("SQLite")]
+    CAT["Catalog and benchmark sync<br/>Models.dev · Artificial Analysis · BFCL · SuperCLUE"] --> PL
+```
+
+Module-level details are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Run locally
 
