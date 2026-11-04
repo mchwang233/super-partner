@@ -35,3 +35,6 @@ secrets.json
 
 # Generated EDA tool output from local diagnostics
 /verdiLog/
+
+# Logs and scratch output from local tool runs
+*.log

@@ -601,3 +601,7 @@ task's difficulty and threshold, and the model chip explains why that model was 
 - `GET /api/providers` lists API connection states without returning secrets.
 - `PUT` or `DELETE /api/providers/{provider}/key` manages an OS-keyring credential.
 - `POST /api/providers/{provider}/test` verifies credentials against the provider model-list API.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
