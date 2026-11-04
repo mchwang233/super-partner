@@ -4,19 +4,125 @@
 
 # Super Partner
 
-Local-first multi-model orchestration for software and research tasks. It plans work as a dependency graph, routes each node to the cheapest capable configured model, estimates cost, asks for one confirmation, then executes autonomously with an audit trail and budget circuit breaker.
+Super Partner gives each task a small team of AI models and lets them work it through on your
+machine. A lead plans the work and makes the calls, workers do the steps, a reviewer checks every
+result, and when something goes wrong a diagnostician or a platform engineer steps in. You describe
+the task and confirm the plan and budget once; after that the team comes back to you only when it
+needs you.
 
-Task planning uses the configured model with the strongest planning and reliability scores to generate a validated JSON dependency graph. Invalid, unavailable, or cyclic model plans fall back to the deterministic planner. Each resulting node is independently assigned to the lowest-cost enabled model that meets its capability and context requirements, while authenticated membership CLIs retain priority.
+## Meet the team
 
-Planning may use a membership CLI, but subtasks and their reviews go to API models first: a CLI takes a subtask only when no enabled API model can do it (none reaches the capability threshold, or none can act on the project). Each node records why its model was chosen. `SUPER_PARTNER_SUBTASKS_PREFER_API=false` restores CLI-first routing. At startup the app safely detects Codex CLI, Claude Code, Gemini CLI, and Qwen Code without exposing account details. A CLI failure falls back to the matching API only when its API key is configured, that API model is enabled, and its estimated cost fits the remaining budget.
+<p align="center"><img src="docs/images/team.svg" alt="The team: you, the lead, workers, reviewer, progress checker, diagnostician, platform engineer, retrospective" width="100%"></p>
 
-**Highlights**
+Every role is played by a model you have set up: a membership CLI you already pay for (Claude
+Code, Codex, Gemini CLI, Qwen Code) or an API model from one of nine providers. The code only
+keeps the guardrails: the budget, the sandbox and permissions, the network switch, and limits on
+how often anything can be retried.
 
-- One strong model leads each task: it plans a dependency graph, decides what to do after each failure, and checks the whole result before the task ends.
-- Every step goes to the cheapest model that is good enough for it, chosen from public benchmark scores. Membership CLIs (Claude Code, Codex, Gemini CLI, Qwen Code) and API models from nine providers can work together.
-- Steps run in a sandbox, and another model reviews each result against its acceptance criteria.
-- Failures get a diagnosis: missing tools are installed, a model out of quota is replaced, and defects in Super Partner itself can be repaired and tested automatically.
-- A budget limit, a single confirmation before the task runs, and a full audit trail.
+### The lead
+
+The model with the best planning scores takes the task and keeps it until the end, in one
+conversation (a CLI session that is resumed, or an API history stored with the task). It writes
+the plan. After every failed attempt it gets the evidence and makes one decision, with its reason:
+retry with instructions, switch to another model, accept the result, mark the step as not possible
+here, ask you, change the plan, or call in the diagnostician or the platform engineer. When every
+step is done it checks the whole result against your request before the task ends. You can talk
+to it at any time in the task's **负责人** (lead) panel.
+More: [The task's lead](#the-tasks-lead) · [design](docs/design/supervisor.md)
+
+### Workers
+
+Each step goes to the cheapest model that is good enough for it, judged by public benchmark
+scores. API models work through sandboxed tools (Bash, Read, Write, Edit, MultiEdit, Glob, Grep,
+LS); membership CLIs run in their own sandboxes. With `SUPER_PARTNER_EMPLOYEE_TEAMS=true` the lead
+first forms a team of named employees, one per module or area (up to 8), each with its model and
+skills. An employee that finds new subtasks can hand them to colleagues (`DELEGATE_TASKS`), and the
+task's **员工** (employees) tab shows who does what.
+More: [API models act through tools](#api-models-act-through-tools) · [design](docs/design/project-team.md)
+
+### Reviewer
+
+After every attempt a different model checks the result against the step's acceptance criteria
+and answers pass or fail, with the reason and what to fix; for project work it also sees the diff.
+Verification steps in the plan check the work they depend on and end with a `VERDICT` line. The
+reviewer gives opinions and evidence; what happens after a failure is the lead's call.
+More: [How nodes hand off and check work](#how-nodes-hand-off-and-check-work)
+
+### Progress checker
+
+Steps have no fixed timeout. Every 10 minutes of a long attempt
+(`SUPER_PARTNER_PROGRESS_CHECK_MINUTES`) another model looks at what it has been doing: an API
+model's latest tool calls, or the files a CLI changed and the processes it runs. Work that keeps
+moving goes on; only an attempt that is stuck (repeating itself, waiting for something that will
+not come) is stopped.
+
+### Diagnostician
+
+When a step is blocked by something outside the task (missing software, a license, sandbox limits,
+an unreachable service), the diagnostician looks into it on the host, without sudo. It installs
+tools into a shared folder every step can use, records the variables and local ports that step
+sandboxes need, and reports with one status line: `FIXED`, `RETRY`, `UNABLE`, `BLOCKED` (needs you)
+and others. It also recognizes a model that is out of quota or down, so the step moves to another
+model. Without a lead able to decide, it handles failures on its own.
+More: [Environment repair](#how-nodes-hand-off-and-check-work)
+
+### Platform engineer
+
+The platform engineer works on Super Partner itself, not on any one task. It takes two kinds of
+job: a **repair** (a defect) or a **component** (a new model channel, tool, skill, page or step in
+the flow). Work reaches it three ways: you ask it (the 🛠 bubble at the bottom right, or
+`@平台工程师` in a task's lead chat), the lead asks it, or a diagnosis finds a defect in the
+platform. It edits an isolated copy of the source and must add tests; independent checks then run
+the syntax check, database compatibility, backend and frontend tests and the build. A repair that
+passes is applied on its own; a component first shows you a plan to approve, and waits for you to
+apply it. Applying waits for running model calls, restarts the service, rolls back if the health
+check fails, and commits the changed files to git (without pushing). Its own budget is
+`SUPER_PARTNER_ENGINEER_BUDGET_USD` (default $2).
+More: [Repairing Super Partner itself](#how-nodes-hand-off-and-check-work) · [design](docs/design/platform-engineer.md)
+
+### Retrospective
+
+Every finished task is summed up without a model call, so a problem that keeps coming back across
+tasks gets one name and a count (the **重复问题** page). With learning turned on (off by default:
+**复盘与改进 → 自动改进设置** on the result page, or `SUPER_PARTNER_LEARNING_ENABLED=true`), the
+strongest available model also looks back on each task that ended by itself. It writes its
+conclusions and at most three improvements, each tied to real steps; they are checked separately
+before use. Skills and work rules then apply to matching later work, and source changes go to the
+platform engineer. Learning has its own budget (default $0.50 per task).
+More: [design](docs/design/continuous-improvement.md)
+
+### You
+
+You describe the task, pick an answer where the plan lists open scope choices, and confirm the plan
+and budget once. The team then works alone. It comes back when it needs you: a question only you
+can answer, more budget, root access or credentials, or your approval of a platform component.
+
+## How a failure gets handled
+
+An example of the roles working together on one task:
+
+```mermaid
+sequenceDiagram
+    actor U as You
+    participant L as Lead
+    participant W as Worker
+    participant R as Reviewer
+    participant D as Diagnostician
+    participant E as Platform engineer
+    U->>L: Run the regression for this RTL project
+    L->>W: Step 3: run the simulation
+    W->>R: Simulation log: license checkout failed
+    R-->>L: Fail, with the evidence
+    L->>D: Repair the environment: the sandbox cannot reach the license server
+    D-->>L: FIXED: license ports opened for step sandboxes
+    L->>W: Retry (not counted as a failure)
+    W->>R: Coverage report
+    R-->>L: Pass
+    Note over L,E: Along the way the lead noticed a platform defect
+    L->>E: Repair: progress checks stop long simulations too early
+    E-->>L: Fixed in an isolated copy, tests passed, applied
+    L-->>U: Done: result, files and cost
+```
 
 ## Screenshots
 
@@ -28,22 +134,7 @@ Planning may use a membership CLI, but subtasks and their reviews go to API mode
 
 <sub>Screenshots use the built-in offline demo model (`mock:local`), so the task finishes instantly at almost no cost.</sub>
 
-## How it works
-
-```mermaid
-flowchart TD
-    A["Describe the task"] --> B["Lead model plans a dependency graph"]
-    B --> C["Route each step to the cheapest capable model"]
-    C --> D(["Confirm plan and budget"])
-    D --> E["Run ready steps in parallel"]
-    E --> F{"Review / verification"}
-    F -- fail --> J["Lead decides: retry, switch model,<br/>replan, ask the user, or repair"]
-    J -. "environment repair /<br/>platform self-repair" .-> E
-    J --> E
-    F -- pass --> H{"All steps done?<br/>Lead checks the whole result"}
-    H -- "rework / replan" --> E
-    H -- done --> I["Result: files, ZIP, GitHub"]
-```
+## Architecture
 
 ```mermaid
 flowchart TB
@@ -51,18 +142,21 @@ flowchart TB
     CLI["super-partner CLI"] --> API
     API --> PL["Planner and routing"]
     API --> EX["Executor"]
-    EX --> LEAD["Task lead"]
-    EX --> REV["Review and verification"]
-    EX --> DIAG["Diagnosis and repair"]
+    EX --> LEAD["Lead"]
+    EX --> REV["Reviewer and progress checker"]
+    EX --> DIAG["Diagnostician"]
     EX --> PROV["Providers"]
+    LEAD --> ENG["Platform engineer<br/>isolated source copy, checks, activation"]
+    DIAG --> ENG
     PROV --> MCLI["Membership CLIs<br/>Claude Code · Codex · Gemini · Qwen"]
     PROV --> APIM["API models<br/>OpenAI · Anthropic · Google · DeepSeek · ..."]
-    APIM --> SB["Sandboxed tools (bwrap)<br/>read, write, edit, run commands"]
+    APIM --> SB["Sandboxed tools (bwrap)"]
     EX --> DB[("SQLite")]
     CAT["Catalog and benchmark sync<br/>Models.dev · Artificial Analysis · BFCL · SuperCLUE"] --> PL
 ```
 
-Module-level details are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Module-level details are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The sections after
+"Run locally" are the detailed reference.
 
 ## Run locally
 
@@ -325,9 +419,9 @@ off.
 
 ## API models act through tools
 
-When a node runs on an API model, the model gets five tools and works in a loop until it
-answers without calling one: `list_dir`, `read_file`, `write_file`, `edit_file` and
-`run_command`. The loop uses each provider's own tool calling (OpenAI-compatible
+When a node runs on an API model, the model gets eight tools and works in a loop until it
+answers without calling one: `Bash`, `Read`, `Write`, `Edit`, `MultiEdit`, `Glob`, `Grep` and
+`LS`. The loop uses each provider's own tool calling (OpenAI-compatible
 `tools`/`tool_calls`, Anthropic `tool_use`/`tool_result`, Gemini `functionCall`/
 `functionResponse`), so API models can change projects and run checks like the CLIs.
 
@@ -338,7 +432,7 @@ deepest; `none` turns thinking off). Deeper thinking is slower and spends more o
 
 - File tools resolve every path inside the working directory (symlinks included) and
   refuse anything outside it.
-- `run_command` runs under bubblewrap: the system is read-only, the home folder is replaced
+- `Bash` runs under bubblewrap: the system is read-only, the home folder is replaced
   by an empty in-memory one with only the working directory mounted writable, `/tmp` is
   private, there is no network, and the environment is cleared, so API keys never reach a
   command. Without `bwrap` the tool is not offered.
@@ -374,7 +468,7 @@ deepest; `none` turns thinking off). Deeper thinking is slower and spends more o
   `SUPER_PARTNER_API_AGENT_MAX_TURNS` sets an optional limit (×1 easy, ×1.5 normal, ×2 hard):
   five turns before it the model is told to wrap up, and at it the model answers with a
   progress summary that is reviewed and reaches the next attempt. Tool loops nobody checks
-  (diagnoses) stop at 40 turns. `read_file` returns up to 1200 lines per call.
+  (diagnoses) stop at 40 turns. `Read` returns up to 2000 lines by default (at most 5000 per call).
 - **Tool-call log.** Every tool call of an attempt is recorded on it (turn, tool, file or
   command, whether it went through) and shown, folded, under the attempt in the plan view;
   diagnoses get a per-tool count and the latest attempt's calls.
@@ -390,8 +484,8 @@ Planning and review calls stay single requests without tools.
 
 ## How nodes hand off and check work
 
-Ready nodes (all dependencies succeeded) start as soon as there is room, at most
-`max_parallel_nodes` at a time, within the budget. Each node's prompt carries its
+Ready nodes (all dependencies succeeded) start at once, within the budget; `max_parallel_nodes`
+can cap how many run together (0, the default, means no limit). Each node's prompt carries its
 acceptance criteria, any findings it must fix, and, for every direct dependency, its result
 — or, when longer than `handoff_max_chars` (4000), the reviewer's summary of it — plus the
 files that dependency changed. The plan view records which form each node received.
@@ -489,7 +583,7 @@ unreachable services. It gets the plan, every attempt and recent events, and is 
 step's commands are restricted. Its own commands run on the host as the user with network
 access, but under bubblewrap, whose `no_new_privs` blocks sudo and other setuid programs
 (Claude Code runs with its sandbox off and `bypassPermissions`, Codex with
-`--dangerously-bypass-approvals-and-sandbox`; API models get a host-mode `run_command` without
+`--dangerously-bypass-approvals-and-sandbox`; API models get a host-mode `Bash` without
 API keys in its environment). It does not do the step's work.
 
 Repairs go in a shared tools folder, `<data_dir>/tools`, so every step sees them: `bin/` is
@@ -500,10 +594,9 @@ PATH, PYTHONPATH and variables. Anything that needs root becomes exact commands 
 
 API step commands first source the scripts this machine lists (the `sandbox_profiles` setting,
 or `"profiles"` in `sandbox.json`), for example an EDA tool setup, so the tools and license
-variables it sets are available without a manual `source` in each call; none by default. `run_command` returns combined stdout/stderr, including output produced
-before a timeout. The working directory is writable and persists across calls. `/tmp`
-(`TMPDIR`) is writable but starts fresh for each command: create and use scratch files in
-one call, and keep files needed by later calls in the working directory. Other host paths
+variables it sets are available without a manual `source` in each call; none by default. `Bash` returns combined stdout/stderr, including output produced
+before a timeout. The working directory is writable and persists across calls, and `/tmp`
+(`TMPDIR`) is kept for the whole attempt. Other host paths
 remain read-only; file tools only access the working directory.
 
 Its answer ends with one status line:
@@ -619,6 +712,10 @@ models receive images as image inputs and text files inline; binary files are on
 Tasks with images route only to CLIs and to API models not marked as lacking vision.
 
 ## Routing scores
+
+Task planning uses the configured model with the strongest planning and reliability scores to generate a validated JSON dependency graph. Invalid, unavailable, or cyclic model plans fall back to the deterministic planner. Each resulting node is independently assigned to the lowest-cost enabled model that meets its capability and context requirements, while authenticated membership CLIs retain priority.
+
+Planning may use a membership CLI, but subtasks and their reviews go to API models first: a CLI takes a subtask only when no enabled API model can do it (none reaches the capability threshold, or none can act on the project). Each node records why its model was chosen. `SUPER_PARTNER_SUBTASKS_PREFER_API=false` restores CLI-first routing. At startup the app safely detects Codex CLI, Claude Code, Gemini CLI, and Qwen Code without exposing account details. A CLI failure falls back to the matching API only when its API key is configured, that API model is enabled, and its estimated cost fits the remaining budget.
 
 The seven routing scores come only from Artificial Analysis; there are no hand-written
 presets. Each AA metric is converted by rank: a model's percentile among every AA-scored

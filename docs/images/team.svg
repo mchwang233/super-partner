@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-label="The Super Partner team: you, the lead, workers, reviewer, progress checker, diagnostician, platform engineer, retrospective">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#0d1b1a"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#5eead4"/>
+    </marker>
+    <style>
+      .t { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+      .name { font-size: 20px; font-weight: 700; fill: #f1f5f9; }
+      .desc { font-size: 14.5px; fill: #cbd5e1; }
+      .note { font-size: 13px; fill: #94a3b8; }
+      .card { fill: #111c2b; stroke: #2b3a4f; stroke-width: 1.5; }
+      .edge { fill: none; stroke: #5eead4; stroke-opacity: .55; stroke-width: 2; }
+    </style>
+  </defs>
+  <rect width="1280" height="560" rx="24" fill="url(#bg)"/>
+
+  <!-- 一个任务内 -->
+  <rect x="36" y="168" width="1208" height="364" rx="18" fill="#0f2a24" fill-opacity=".35" stroke="#3ddc97" stroke-opacity=".45" stroke-dasharray="6 6"/>
+  <text x="58" y="196" class="t note" fill="#3ddc97" style="fill:#3ddc97">Inside one task</text>
+
+  <!-- edges -->
+  <path class="edge" d="M640 122 L640 200" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text x="652" y="166" class="t note">questions, answers, approval</text>
+  <path class="edge" d="M350 92 C 420 92, 400 250, 436 250" stroke-dasharray="5 5" marker-end="url(#arrow)"/>
+  <text x="300" y="158" class="t note">looks back on finished tasks</text>
+  <path class="edge" d="M930 92 C 860 92, 880 250, 844 250" stroke-dasharray="5 5" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text x="862" y="158" class="t note">joins the chat, builds components</text>
+  <g class="edge" marker-end="url(#arrow)">
+    <path d="M600 318 C 600 350, 190 340, 190 384" marker-end="url(#arrow)"/>
+    <path d="M625 318 C 625 350, 490 345, 490 384" marker-end="url(#arrow)"/>
+    <path d="M655 318 C 655 350, 790 345, 790 384" marker-end="url(#arrow)"/>
+    <path d="M680 318 C 680 350, 1090 340, 1090 384" marker-end="url(#arrow)"/>
+  </g>
+
+  <g class="t">
+    <!-- 复盘员 -->
+    <rect class="card" x="50" y="22" width="300" height="122" rx="14"/>
+    <circle cx="86" cy="56" r="20" fill="#3b2f63"/><text x="86" y="62" text-anchor="middle" font-size="17" font-weight="700" fill="#c4b5fd">R</text>
+    <text x="118" y="63" class="name">Retrospective</text>
+    <text x="70" y="96" class="desc">After a task ends, turns evidence</text>
+    <text x="70" y="118" class="desc">into lessons for later tasks</text>
+
+    <!-- 你 -->
+    <rect class="card" x="490" y="30" width="300" height="92" rx="14" style="stroke:#94a3b8"/>
+    <circle cx="526" cy="64" r="20" fill="#334155"/><text x="526" y="70" text-anchor="middle" font-size="17" font-weight="700" fill="#f1f5f9">U</text>
+    <text x="558" y="71" class="name">You</text>
+    <text x="510" y="104" class="desc">Describe the task, approve the budget</text>
+
+    <!-- 平台工程师 -->
+    <rect class="card" x="930" y="22" width="300" height="122" rx="14"/>
+    <circle cx="966" cy="56" r="20" fill="#5a3a12"/><text x="966" y="62" text-anchor="middle" font-size="17" font-weight="700" fill="#fbbf24">E</text>
+    <text x="998" y="63" class="name">Platform engineer</text>
+    <text x="950" y="96" class="desc">Changes Super Partner itself: fixes</text>
+    <text x="950" y="118" class="desc">bugs, adds components, tested first</text>
+
+    <!-- 负责人 -->
+    <rect x="436" y="200" width="408" height="118" rx="16" fill="#10261f" stroke="#3ddc97" stroke-width="2.5"/>
+    <circle cx="476" cy="236" r="22" fill="#14532d"/><text x="476" y="243" text-anchor="middle" font-size="19" font-weight="700" fill="#3ddc97">L</text>
+    <text x="510" y="244" class="name" style="font-size:22px">The lead</text>
+    <text x="456" y="278" class="desc">Plans the task, decides after every failure, checks</text>
+    <text x="456" y="302" class="desc">the whole result. One conversation, start to end.</text>
+
+    <!-- 员工 -->
+    <rect class="card" x="50" y="384" width="280" height="122" rx="14"/>
+    <circle cx="86" cy="418" r="20" fill="#1e3a5f"/><text x="86" y="424" text-anchor="middle" font-size="17" font-weight="700" fill="#93c5fd">W</text>
+    <text x="118" y="425" class="name">Workers</text>
+    <text x="70" y="458" class="desc">Do their steps with tools in a</text>
+    <text x="70" y="480" class="desc">sandbox; can hand off new subtasks</text>
+
+    <!-- 验收者 -->
+    <rect class="card" x="350" y="384" width="280" height="122" rx="14"/>
+    <circle cx="386" cy="418" r="20" fill="#1e3a5f"/><text x="386" y="424" text-anchor="middle" font-size="17" font-weight="700" fill="#93c5fd">R</text>
+    <text x="418" y="425" class="name">Reviewer</text>
+    <text x="370" y="458" class="desc">A different model checks each</text>
+    <text x="370" y="480" class="desc">result against its acceptance criteria</text>
+
+    <!-- 进度检查员 -->
+    <rect class="card" x="650" y="384" width="280" height="122" rx="14"/>
+    <circle cx="686" cy="418" r="20" fill="#1e3a5f"/><text x="686" y="424" text-anchor="middle" font-size="17" font-weight="700" fill="#93c5fd">P</text>
+    <text x="718" y="425" class="name">Progress checker</text>
+    <text x="670" y="458" class="desc">Looks in on long steps every 10</text>
+    <text x="670" y="480" class="desc">minutes, stops only the stuck ones</text>
+
+    <!-- 诊断员 -->
+    <rect class="card" x="950" y="384" width="280" height="122" rx="14"/>
+    <circle cx="986" cy="418" r="20" fill="#1e3a5f"/><text x="986" y="424" text-anchor="middle" font-size="17" font-weight="700" fill="#93c5fd">D</text>
+    <text x="1018" y="425" class="name">Diagnostician</text>
+    <text x="970" y="458" class="desc">Finds what blocks a step outside</text>
+    <text x="970" y="480" class="desc">the task (tools, licenses) and fixes it</text>
+  </g>
+</svg>
