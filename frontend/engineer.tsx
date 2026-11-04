@@ -1,4 +1,5 @@
 import React, { FormEvent, useEffect, useRef, useState } from "react";
+import { detailText } from "./mission-history";
 import { MarkdownView } from "./markdown";
 import { Composer, when, type Diagnosis } from "./diagnosis";
 
@@ -24,6 +25,11 @@ export const ENGINEER_STATUS: Record<string, { label: string; tone: string }> = 
 const KIND = { repair: "修复", component: "组件" } as const;
 const ORIGIN = { user: "你提出", lead: "负责人请求", diagnosis: "任务诊断发起", retrospective: "任务复盘改进" } as const;
 const SPEAKER: Record<string, string> = { user: "你", engineer: "平台工程师", lead: "负责人", system: "系统" };
+
+/** A job's title as plain text: titles come from the first line of a request or report, which may be Markdown. */
+function plainTitle(job: EngineerJob) {
+  return (job.title || job.request.slice(0, 60) || "平台改动").replace(/[*_`#>]+/g, "").replace(/\s+/g, " ").trim();
+}
 
 /** Jobs waiting for the user: a plan to approve, a change to apply, or a question. */
 export function waitingJobs(jobs: EngineerJob[] = []) {
@@ -58,7 +64,7 @@ export function EngineerPage({ apiBase, runs, focusId, onOpenRun }: {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body ?? {}),
       });
       const result = await response.json().catch(() => ({}));
-      if (!response.ok) return result.detail || `操作失败（${response.status}）`;
+      if (!response.ok) return detailText(result.detail) || `操作失败（${response.status}）`;
       revision.current++;
       if (result?.id) {
         setData(current => current ? { ...current, jobs: current.jobs.some(job => job.id === result.id)
@@ -71,22 +77,29 @@ export function EngineerPage({ apiBase, runs, focusId, onOpenRun }: {
   };
   return <div className="engineer-page">
     <section className="panel engineer-intro">
-      <div>
-        <h2>平台工程师</h2>
-        <p className="muted">专门修改 Super Partner 自身：修复缺陷，或添加组件（模型和渠道、工具和技能、界面功能、调度和流程）。
-          它在一份隔离的源码副本里修改，独立跑完测试和构建才会生效；组件要先由你批准方案，生效前再由你确认改动。生效后会在本地提交到 git，不会推送。</p>
+      <div className="engineer-intro-head">
+        <span className="dx-avatar engineer-avatar" aria-hidden="true">🛠</span>
+        <div>
+          <h2>平台工程师</h2>
+          <p className="muted">修复 Super Partner 自身的缺陷，或给它添加组件：模型和渠道、工具和技能、界面功能、调度和流程。</p>
+        </div>
       </div>
+      <ul className="engineer-rules" aria-label="工作方式">
+        <li>在隔离的源码副本里修改，测试和构建都通过才生效</li>
+        <li>组件先由你批准方案，生效前再确认改动</li>
+        <li>生效后在本地提交 git，不会推送</li>
+      </ul>
       {data && !data.available && <p className="error">平台工程师不可用：平台自修复未启用，或当前安装没有可编辑的 Super Partner 源码。</p>}
       {error && <p className="error" role="alert">{error}</p>}
       {data?.available && <RequestForm act={act} />}
     </section>
     <div className="engineer-layout">
       <nav className="panel engineer-list" aria-label="平台工程师的工作">
-        <h3>工作记录</h3>
+        <h3>工作记录{!!jobs.length && <small>{jobs.length}</small>}</h3>
         {!jobs.length && <p className="empty">还没有记录。</p>}
         {jobs.map(job => <button type="button" key={job.id} aria-pressed={selected?.id === job.id} onClick={() => setSelectedId(job.id)}>
-          <span className="engineer-list-title">{job.title || job.request.slice(0, 40)}</span>
-          <span className="engineer-list-meta"><StatusChip status={job.status} /> {KIND[job.kind]} · {ORIGIN[job.origin]} · {when(job.created_at)}</span>
+          <span className="engineer-list-title">{plainTitle(job)}</span>
+          <span className="engineer-list-meta"><StatusChip status={job.status} /><span>{KIND[job.kind]} · {ORIGIN[job.origin]} · {when(job.created_at)}</span></span>
         </button>)}
       </nav>
       {selected ? <JobDetail job={selected} working={data?.working_on === selected.id} runs={runs} act={act} onOpenRun={onOpenRun} />
@@ -141,14 +154,17 @@ function JobDetail({ job, working, runs, act, onOpenRun }: {
   }
   const reply = (_id: string, body: { text: string; choice?: string }) => act(`jobs/${encodeURIComponent(job.id)}/reply`, body);
   const open = !["applied", "failed", "rejected", "cancelled", "applying"].includes(job.status);
+  // The first message usually repeats the request shown above.
+  const history = (job.messages ?? []).filter(message => message.text.trim() !== job.request.trim());
   return <section className="panel engineer-job" aria-label="工作详情">
     <div className="engineer-job-head">
-      <h3>{job.title || "平台改动"}</h3>
-      <StatusChip status={job.status} />
-      <span className="lead-model">{KIND[job.kind]} · {ORIGIN[job.origin]}{job.model_id ? ` · ${job.model_id}` : ""} · 花费 ${job.cost_usd.toFixed(4)}</span>
+      <div className="engineer-job-title"><h3 title={plainTitle(job)}>{plainTitle(job)}</h3><StatusChip status={job.status} /></div>
+      <p className="engineer-job-meta">{KIND[job.kind]} · {ORIGIN[job.origin]}{job.model_id ? ` · ${job.model_id}` : ""} · 花费 ${job.cost_usd.toFixed(4)}</p>
+      {job.run_id && <p className="engineer-job-source"><span>来自任务</span>
+        {run ? <button type="button" className="link" title={run.plan.summary} onClick={() => onOpenRun(job.run_id!)}>{run.plan.summary}</button> : <em>已删除（{job.run_id}）</em>}
+        {job.origin === "lead" && <small>结束后结果会交回负责人，由它决定那一步怎么办。</small>}</p>}
     </div>
-    {job.run_id && <p className="muted">来自任务{run ? <button type="button" className="link" onClick={() => onOpenRun(job.run_id!)}>「{run.plan.summary}」</button> : `（${job.run_id}，已删除）`}{job.origin === "lead" ? "，结束后结果会交回负责人决定那一步怎么办。" : ""}</p>}
-    <details className="lead-instructions" open={!job.plan}><summary>需求</summary><p>{job.request}</p></details>
+    <details className="engineer-request-text" open={!job.plan}><summary>需求</summary><div className="engineer-request-body"><MarkdownView text={job.request} /></div></details>
     {working && <p className="diagnosis-running"><span className="dx-typing" aria-hidden="true"><i /><i /><i /></span>
       {job.status === "planning" ? "平台工程师正在读代码、写方案…" : job.status === "validating" ? "正在独立运行测试和构建…" : "平台工程师正在修改源码副本…"}</p>}
     {job.plan && <div className="engineer-section"><h4>方案</h4><div className="dx-report"><MarkdownView text={job.plan} /></div></div>}
@@ -168,8 +184,8 @@ function JobDetail({ job, working, runs, act, onOpenRun }: {
     {job.commit && <p className="muted">已提交到 git：<code>{job.commit.slice(0, 8)}</code>（没有推送）</p>}
     {job.error && <p className="error">{job.error}</p>}
     {error && <p className="error" role="alert">{error}</p>}
-    {!!job.messages?.length && <div className="engineer-section"><h4>经过</h4><ol className="engineer-thread">
-      {job.messages.map((message, index) => <li key={index} className={`engineer-msg ${message.role}`}>
+    {!!history.length && <div className="engineer-section"><h4>经过</h4><ol className="engineer-history">
+      {history.map((message, index) => <li key={index} className={`engineer-msg ${message.role}`}>
         <small>{SPEAKER[message.role] ?? message.role} · {when(message.created_at)}</small>
         <div>{message.role === "engineer" ? <MarkdownView text={message.text} /> : <p>{message.text}</p>}</div>
       </li>)}

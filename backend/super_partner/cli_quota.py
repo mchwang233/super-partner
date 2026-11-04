@@ -18,13 +18,20 @@ outlives deleted tasks; sessions in the leads' folders are the platform's too an
 Only CLIs listed in `settings.cli_plans` are priced; without it nothing changes. Tokens are
 weighted as their prices are: uncached input and output 1, input read from cache CACHED_WEIGHT.
 The session files are not a published interface: anything unreadable leaves the CLI as it was.
+They are written only while Codex works, so once it is stopped they say nothing new, and Codex can
+reset a window before the time it gave. When the last reading is older than STALE_MINUTES, the
+reader asks Codex's app server for the quota now (`account/rateLimits/read`: no model call, no
+quota used), at most every ASK_MINUTES.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import shutil
+import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +47,9 @@ WEEKS_PER_MONTH = 52 / 12
 # the last good calibration is kept instead.
 MIN_CALIBRATION_PERCENT = 2.0
 REFRESH_SECONDS = 60
+STALE_MINUTES = 10
+ASK_MINUTES = 10
+ASK_TIMEOUT_SECONDS = 60
 
 
 @dataclass
@@ -121,12 +131,77 @@ def _events(path: Path, platform: Path):
         return
 
 
-class CodexReader:
-    """Codex's quota from its session files; each file is parsed again only when it changes."""
+def _window(item) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+    return {"used_percent": item.get("usedPercent"), "window_minutes": item.get("windowDurationMins"),
+            "resets_at": item.get("resetsAt")}
 
-    def __init__(self, home: Optional[Path] = None):
+
+def ask_codex(home: Optional[Path] = None, timeout: float = ASK_TIMEOUT_SECONDS) -> Optional[dict]:
+    """Codex's quota now, from its app server, in the session files' form; None if it cannot say."""
+    from .cli_channels import CLI_SPECS
+
+    executable = shutil.which(CLI_SPECS["cli:codex"].executable)
+    if not executable:
+        return None
+    env = {**os.environ, **({"CODEX_HOME": str(home)} if home else {})}
+    messages = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"clientInfo": {"name": "super-partner", "version": "1"}}},
+                {"jsonrpc": "2.0", "method": "initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read"}]
+    try:
+        process = subprocess.Popen([executable, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True, env=env)
+    except OSError:
+        return None
+    timer = threading.Timer(timeout, process.kill)
+    timer.start()
+    try:
+        process.stdin.write("".join(json.dumps(message) + "\n" for message in messages))
+        process.stdin.flush()
+        for line in process.stdout:
+            try:
+                answer = json.loads(line)
+            except ValueError:
+                continue
+            if answer.get("id") != 2:
+                continue
+            limits = (answer.get("result") or {}).get("rateLimits") or {}
+            found = {"plan_type": limits.get("planType"), "primary": _window(limits.get("primary")),
+                     "secondary": _window(limits.get("secondary"))}
+            if (answer.get("result") or {}).get("ordinaryUsageAllowed") is False and found["primary"]:
+                found["primary"]["used_percent"] = 100.0  # Codex itself says no more ordinary use
+            return found
+        return None
+    except (OSError, ValueError, AttributeError):
+        return None
+    finally:
+        timer.cancel()
+        process.kill()
+        process.wait()
+
+
+class CodexReader:
+    """Codex's quota from its session files; each file is parsed again only when it changes.
+    ``ask`` gives the quota now when the files are stale (ask_codex)."""
+
+    def __init__(self, home: Optional[Path] = None, ask=None):
         self.home = home
+        self.ask = ask
         self._parsed: dict[Path, tuple] = {}
+        self._asked: Optional[tuple] = None  # (when, monotonic time, limits or None)
+
+    def _ask(self, now: datetime):
+        """The quota from ``ask``, at most every ASK_MINUTES: (time, limits) or None."""
+        if self._asked is None or time.monotonic() - self._asked[1] >= ASK_MINUTES * 60:
+            try:
+                limits = self.ask(self.home)
+            except Exception:  # a broken app server leaves the files' reading
+                logger.exception("asking Codex for its quota failed")
+                limits = None
+            self._asked = (now, time.monotonic(), limits)
+        return (self._asked[0], self._asked[2]) if self._asked[2] else None
 
     def sessions(self) -> Path:
         home = self.home or Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
@@ -169,6 +244,9 @@ class CodexReader:
                     latest, latest_at = limits, at
         for path in [item for item in self._parsed if not item.exists()]:
             del self._parsed[path]
+        stale = latest_at is None or (now - latest_at).total_seconds() > STALE_MINUTES * 60
+        if self.ask and stale and (asked := self._ask(now)) and (latest_at is None or asked[0] > latest_at):
+            latest_at, latest = asked
         if not latest:
             return None
         usage = Usage(windows=_windows(latest), plan=str(latest.get("plan_type") or ""))
@@ -189,7 +267,7 @@ class CodexReader:
         return usage
 
 
-READERS = {"cli:codex": CodexReader()}
+READERS = {"cli:codex": CodexReader(ask=ask_codex)}
 STOP_LINE = "达到停用线"
 _warned: set = set()
 

@@ -21,6 +21,7 @@ from super_partner.models import (
 from super_partner.planner import autonomous_plan
 from super_partner.providers import ProviderResult
 from super_partner.quality import node_prompt
+from super_partner.routing import NoEligibleModelError
 
 
 def models():
@@ -64,6 +65,9 @@ async def test_team_is_decided_before_any_parts_are_planned(monkeypatch):
     plan = await autonomous_plan("实现模块", models(), {m.id for m in models()}, Planner(), session=SupervisorSession())
     assert len(messages) == 2
     assert "TEAM_SETUP" in messages[0] and "Do not split" in messages[0]
+    # Staffed by module and responsibility, not cut down to the fewest people.
+    assert "one employee for each module or area of responsibility" in messages[0]
+    assert "smallest" not in messages[0]
     assert "builder" in messages[1] and "tester" in messages[1]
     assert [e.model_id for e in plan.employees] == ["test:build", "test:verify"]
     assert plan.parts[0].employee_id == "builder"
@@ -316,3 +320,20 @@ async def test_already_finished_node_cannot_publish_a_second_child_graph(tmp_pat
     assert len(restored.plan.nodes) == 1
     assert restored.plan.nodes[0].status == NodeStatus.SUCCEEDED
 
+
+
+def test_the_leads_assignment_stands_when_its_own_bar_is_above_the_employees_model():
+    catalog = models()
+    catalog[0].scores.coding = 85.8  # the builder's model; the verifier's stays at 95
+    run = run_with_team()
+    node = run.plan.nodes[0]
+    node.quality_threshold = 90
+    team.route(node, run.plan, catalog, {m.id for m in catalog})
+    assert node.model_id == "test:build" and node.quality_threshold == 85.8
+    assert "门槛从 90 调到该模型的 85.8" in node.routing_note
+    try:
+        team.route(node, run.plan, catalog, {"test:verify"})
+    except NoEligibleModelError as exc:
+        assert "开发" in str(exc)  # a model that cannot run at all still needs the lead
+    else:
+        raise AssertionError("an unconfigured model was accepted")

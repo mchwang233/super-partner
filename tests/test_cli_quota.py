@@ -147,3 +147,35 @@ def test_a_starting_price_is_charged_until_the_quota_calibrates_one(codex, monke
     models = {"cli:codex": codex_model()}
     cli_quota.apply(models, now=NOW)
     assert (models["cli:codex"].input_per_million, models["cli:codex"].output_per_million) == (0.6, 2.4)
+
+
+def test_a_stale_full_reading_is_checked_with_codex_and_a_window_reset_early_lets_it_work_again(codex, monkeypatch):
+    asked = []
+
+    def ask(home):
+        asked.append(home)
+        return {"plan_type": "pro", "primary": {"used_percent": 14, "window_minutes": 10080,
+                                                 "resets_at": int((RESETS + timedelta(days=2)).timestamp())}}
+
+    monkeypatch.setitem(cli_quota.READERS, "cli:codex", cli_quota.CodexReader(home=codex / "codex", ask=ask))
+    models, tracker = {"cli:codex": codex_model()}, QuotaTracker()
+    session(codex, "user.jsonl", codex / "project", [(0, 0, 0, 0, 92.0)])
+    cli_quota.apply(models, tracker, now=NOW)
+    assert tracker.exhausted("cli:codex") and asked == []  # a fresh reading needs no question
+
+    # Stopped, Codex writes nothing new; its window reset before the time it gave.
+    cli_quota.apply(models, tracker, now=NOW + timedelta(minutes=cli_quota.STALE_MINUTES + 1))
+    assert not tracker.exhausted("cli:codex") and len(asked) == 1
+    assert "14%" in models["cli:codex"].usage_note
+
+    cli_quota.apply(models, tracker, now=NOW + timedelta(minutes=cli_quota.STALE_MINUTES + 2))
+    assert len(asked) == 1  # asked again only after ASK_MINUTES
+
+
+def test_when_codex_cannot_say_the_last_reading_stands(codex, monkeypatch):
+    monkeypatch.setitem(cli_quota.READERS, "cli:codex",
+                        cli_quota.CodexReader(home=codex / "codex", ask=lambda home: None))
+    models, tracker = {"cli:codex": codex_model()}, QuotaTracker()
+    session(codex, "user.jsonl", codex / "project", [(0, 0, 0, 0, 92.0)])
+    cli_quota.apply(models, tracker, now=NOW + timedelta(hours=1))
+    assert tracker.exhausted("cli:codex")

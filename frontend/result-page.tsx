@@ -1,7 +1,7 @@
 import React, { FormEvent, useEffect, useRef, useState } from "react";
 import { fileSize } from "./attachments";
 import { isMarkdownFile, MarkdownView } from "./markdown";
-import { statusLabel } from "./mission-history";
+import { statusLabel, detailText } from "./mission-history";
 import { RetrospectivePanel } from "./retrospective";
 import { CallInsights } from "./call-insights";
 
@@ -18,7 +18,7 @@ function errorText(e: unknown) { return e instanceof Error ? e.message : String(
 async function request(url: string, init?: RequestInit) {
   const response = await fetch(url, init);
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || `请求失败（${response.status}）`);
+  if (!response.ok) throw new Error(detailText(body.detail) || `请求失败（${response.status}）`);
   return body;
 }
 

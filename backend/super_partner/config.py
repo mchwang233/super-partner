@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # Steps of one task running at once; 0: no limit, every step whose inputs are ready starts
     # (steps changing the same files still take turns, scopes.py).
     max_parallel_nodes: int = Field(default=0, ge=0)
+    # A step whose inputs are not ready yet starts early on what does not need them (a testbench from
+    # the interface contract, its own files), for at most head_start_minutes, then waits for them.
+    # Only steps whose files or folders are known: an unscoped one would hold the whole folder. Off by default.
+    head_start: bool = False
+    head_start_minutes: float = Field(default=30, gt=0)
     # New projects form a durable team before planning. Existing records keep their workflow.
     employee_teams: bool = False
     # New plans contain executable tasks immediately, with no subsequent part refinement.

@@ -61,8 +61,11 @@ its verifies are keys it checks, and every such key must also be listed in its d
 transitive prerequisites. Assign employee_id from the team when a team is supplied.
 Choose difficulty easy/normal/hard for execution, and estimate the complete work item's token use.
 For file work, list known files it owns and reads, relative to the workspace. Do not invent unknown
-paths or split work solely to meet a file/turn count. If the scope is unknown, leave files/reads empty;
-the existing workspace lock will serialize such work. Set needs_workspace=true when accessing the
+paths or split work solely to meet a file/turn count. If its files are not known yet, give "folders" instead:
+the folders that task alone creates and changes files in, ending with "/" (for example "rtl/core/",
+"tests/core/"), including its tests, logs and build output. Tasks that can run at the same time must not
+share folders or nest one in another. A task that writes files but names neither files nor folders has
+the whole workspace to itself, so it runs alone. Set needs_workspace=true when accessing the
 target project. Workers can edit files and run sandboxed commands; internet requires task permission,
 and root/system installation is unavailable. requires contains only commands checking essential tools.
 """ + CHOICES_RULE + """
@@ -71,7 +74,7 @@ Return JSON only with 1-""" + str(MAX_NODES) + """ nodes (usually far fewer), no
 {"key":"build","title":"short title","employee_id":"chosen employee","instructions":"matters to handle",
 "capability":"coding|planning|research|chinese|tool_use|structured_output","difficulty":"normal",
 "dependencies":[],"acceptance_criteria":"checkable result","provides":"handoff to dependent tasks",
-"verifies":[],"needs_workspace":false,"files":[],"reads":[],"check":"validation command if known",
+"verifies":[],"needs_workspace":false,"files":[],"reads":[],"folders":[],"check":"validation command if known",
 "estimated_input_tokens":6000,"estimated_output_tokens":3000}]}
 Retain explicit artifact evidence and limits when applicable:
 """ + contracts.RULES + "\nUser request and context:\n"
@@ -91,8 +94,12 @@ async def plan_tasks(say, opening: str, roster: TaskPlan = None, artifact_work: 
         for node, raw in zip(plan.nodes, payload["nodes"]):
             if not node.acceptance_criteria:
                 raise ValueError(f"{node.title}: describe how its result will be accepted")
-            if any(not contracts.safe_name(path) for path in node.files + node.reads):
-                raise ValueError(f"{node.title}: file scope must use safe relative paths")
+            # A folder named as a file or read is in scope as a whole (scopes.py), so "rtl/" is "rtl".
+            node.files, node.reads = ([path.rstrip("/") or path for path in paths] for paths in (node.files, node.reads))
+            if bad := [path for path in node.files + node.reads if not contracts.safe_name(path)]:
+                raise ValueError(f"{node.title}: these files/reads are not allowed: {', '.join(bad)}. Use plain "
+                                 "paths relative to the working directory, without wildcards, '..', absolute paths "
+                                 "or private files (.env, keys, .git); leave out what you cannot name")
             verifies = raw.get("verifies") or []
             ancestors = {upstream.id for upstream in contracts.ancestors(node, plan.nodes)}
             if not isinstance(verifies, list) or any(not isinstance(key, str) or key not in by_key

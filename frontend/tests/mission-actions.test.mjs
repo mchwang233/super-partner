@@ -281,7 +281,11 @@ async function setup(t, records = [mission("finished-task", "succeeded"), missio
       state.deletes.push(id);
       return state.deleteResponse(id, options.signal);
     }
-    if (path === "/api/tasks" && options.method === "POST") { state.taskPosts++; state.taskBodies.push(JSON.parse(options.body)); return json(state.records[0]); }
+    if (path === "/api/tasks" && options.method === "POST") {
+      state.taskPosts++; state.taskBodies.push(JSON.parse(options.body));
+      if (state.createError) return new Response(JSON.stringify({ detail: state.createError }), { status: 422, headers: { "content-type": "application/json" } });
+      return json(state.records[0]);
+    }
     if (path === "/api/projects/discover") return json({ projects: [{ name: "shop", path: "/home/me/prj/shop" }], truncated: false });
     if (path === "/api/projects/inspect") {
       const target = new URL(url).searchParams.get("path");
@@ -889,6 +893,54 @@ test("each task shows its check result, and clicking it shows its progress", asy
   assert.match(panel.querySelector(".node-progress-timeline").textContent, /验证未通过，第 1 轮返工/);
   await click(panel.querySelector('[aria-label="关闭进行情况"]'));
   assert.equal(document.querySelector(".node-progress"), null);
+});
+
+test("a step waiting for its inputs shows it is starting early, and later what it prepared", async t => {
+  const run = mission("head-start", "running");
+  run.plan.nodes = [
+    { id: "rtl", title: "RTL", capability: "coding", dependencies: [], model_id: "test:a", status: "running", estimated_cost_usd: 0 },
+    { id: "tb", title: "Testbench", capability: "coding", dependencies: ["rtl"], model_id: "test:b", status: "pending", estimated_cost_usd: 0,
+      preparing: true, folders: ["tb/"] },
+    { id: "lint", title: "Lint", capability: "coding", dependencies: ["rtl"], model_id: "test:b", status: "pending", estimated_cost_usd: 0,
+      head_start: "搭好了 **tb_top.sv**，只差接上 RTL" },
+  ];
+  const { state, document, click } = await setup(t, [run]);
+  state.timeline = [{ id: 1, kind: "node.head_start", data: { node_id: "tb" }, created_at: "2026-10-28T03:00:00Z" }];
+  const [, tb, lint] = [...document.querySelectorAll(".plan-node")];
+  assert.equal(tb.querySelector(".state").textContent, "先行准备中");
+  assert.match(tb.querySelector(".plan-check").textContent, /先行准备中：先做不需要 01 结果的部分/);
+  assert.match(lint.querySelector(".plan-check").textContent, /已先行准备，等待 01/);
+  await click(tb.querySelector(".plan-node-title"));
+  let panel = document.querySelector(".node-progress");
+  assert.match(panel.querySelector(".node-progress-now").textContent, /先行准备中.*之后等它们完成再正式执行/);
+  assert.ok(panel.querySelector(".node-activity"));
+  assert.match(panel.querySelector(".node-progress-timeline").textContent, /先行准备：先做不需要前置步骤结果的部分/);
+  await click(panel.querySelector('[aria-label="关闭进行情况"]'));
+  await click(lint.querySelector(".plan-node-title"));
+  panel = document.querySelector(".node-progress");
+  assert.match(panel.querySelector(".node-head-start").textContent, /依赖完成前已做的准备.*tb_top\.sv/s);
+});
+
+test("a running step still waiting for another to leave the folder shows as queued", async t => {
+  const run = mission("queued-step", "running");
+  run.plan.nodes = [
+    { id: "core", title: "Core", capability: "coding", dependencies: [], model_id: "test:a", status: "running", estimated_cost_usd: 0,
+      started_at: new Date(Date.now() - 65000).toISOString() },
+    { id: "periph", title: "Peripherals", capability: "coding", dependencies: [], model_id: "test:b", status: "running", estimated_cost_usd: 0,
+      waiting_for_folder: true, folders: ["rtl/periph/"], started_at: new Date(Date.now() - 65000).toISOString() },
+  ];
+  const { state, document, click } = await setup(t, [run]);
+  state.timeline = [{ id: 1, kind: "node.queued", data: { node_id: "periph" }, created_at: "2026-10-27T07:00:00Z" }];
+  const [core, periph] = [...document.querySelectorAll(".plan-node")];
+  assert.equal(core.querySelector(".state").textContent, "运行中");
+  assert.equal(periph.querySelector(".state").textContent, "排队中");
+  assert.match(periph.querySelector(".plan-check").textContent, /排队中/);
+  await click(periph.querySelector(".plan-node-title"));
+  const panel = document.querySelector(".node-progress");
+  assert.match(panel.querySelector(".node-progress-now").textContent, /排队中：等其他步骤用完工作目录 · 已等 1 分/);
+  assert.equal(panel.querySelector(".node-activity"), null);
+  assert.match(panel.querySelector(".node-scope").textContent, /负责的目录：rtl\/periph\//);
+  assert.match(panel.querySelector(".node-progress-timeline").textContent, /排队：等其他步骤用完工作目录/);
 });
 
 test("a failed task continues from the failed step with the budget entered there", async t => {
@@ -1766,4 +1818,24 @@ test("attempt answers and unknown tool outcomes retain their provenance", async 
   assert.match(attempts[1].textContent, /No completion event/);
   assert.equal(attempts[1].querySelectorAll("li.bad").length, 0);
   assert.match(document.querySelector(".node-progress-output h5").textContent, /历史输出.*来源未记录/);
+});
+
+test("a task that cannot be planned says why, whatever form the reason comes in", async t => {
+  const { state, window, document, act } = await setup(t);
+  const textarea = document.querySelector(".composer textarea");
+  const submit = async detail => {
+    state.createError = detail;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set.call(textarea, "做一个飞控 MCU");
+      textarea.dispatchEvent(new window.Event("input", { bubbles: true }));
+    });
+    await act(async () => document.querySelector(".composer form").requestSubmit());
+    await settle(act, 0);
+    return document.querySelector(".form-error").textContent;
+  };
+  assert.equal(await submit({ status: "blocked", reason: "实现飞控软件链路: these files/reads are not allowed: fw/*.c" }),
+    "实现飞控软件链路: these files/reads are not allowed: fw/*.c");
+  assert.equal(await submit([{ loc: ["body", "budget_usd"], msg: "Input should be greater than 0" }]),
+    "budget_usd：Input should be greater than 0");
+  assert.doesNotMatch(document.querySelector(".form-error").textContent, /object Object/);
 });

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { MarkdownView } from "./markdown";
-import { statusLabel } from "./mission-history";
+import { nodeStatusLabel } from "./mission-history";
 import { CAPABILITIES, type Model } from "./model-profiles";
 import { NodeProgress, type PlanNode } from "./plan-graph";
 import type { PlanPart } from "./plan-parts";
@@ -31,7 +31,7 @@ export function TeamPage({ apiBase, runId, runStatus, employees = [], nodes, par
     const parent = node.delegation_parent_id ? byId.get(node.delegation_parent_id) : undefined;
     const waiting = node.status === "pending" ? waitingChildren(node) : [];
     const failedChild = waiting.some(n => ["blocked", "unable", "failed"].includes(n.status));
-    const label = active && waiting.length ? failedChild ? "子任务受阻" : "等待子任务" : statusLabel(node.status);
+    const label = active && waiting.length ? failedChild ? "子任务受阻" : "等待子任务" : nodeStatusLabel(node);
     return <li key={node.id}>
       <div className="team-task-line"><button type="button" className="link-button" onClick={() => setSelectedId(node.id)}>{node.title}</button>
         <span className={`state ${node.status}`}>{label}</span></div>

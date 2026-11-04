@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { detailText } from "./mission-history";
 
 /** A file stored by the API (`POST /api/attachments`). */
 export type Attachment = { id: string; name: string; size: number; kind: "image" | "text" | "file"; media_type: string };
@@ -34,7 +35,7 @@ export function useAttachments(apiBase: string) {
       try {
         const response = await fetch(`${apiBase}/api/attachments?${new URLSearchParams({ name })}`, { method: "POST", body: file });
         const body = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(body.detail || `上传失败（${response.status}）`);
+        if (!response.ok) throw new Error(detailText(body.detail) || `上传失败（${response.status}）`);
         update(key, { status: "ready", stored: body });
       } catch (e) { update(key, { status: "error", error: errorText(e) }); }
     });

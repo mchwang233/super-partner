@@ -54,6 +54,14 @@ from .routing import (
 )
 from .self_repair import SelfRepair
 
+# What a step started early (Executor._head_start) is called among the tasks at work.
+HEAD = "head:"
+
+
+class FolderBusy(Exception):
+    """A head start found its folder in use, so it does not wait for it (Executor._head_start)."""
+
+
 # How a model call that ran out of turns reads in an attempt's reason (providers.TURN_LIMIT_MARK).
 TURN_LIMIT_HINT = "轮工具调用后仍未完成"
 
@@ -93,6 +101,8 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         self.lead_tasks: dict[str, asyncio.Task] = {}
         # Steps working in one folder at once (scopes.py).
         self.folder_locks: dict[str, scopes.FolderLock] = {}
+        # Files a step changed outside its own that a step alongside it reads (Scope.intrusions).
+        self.intrusions: dict[tuple[str, str], list[tuple[str, str]]] = {}
         self.node_tasks: dict[tuple[str, str], asyncio.Task] = {}
         # Tool calls of each node's attempt in progress, written onto the attempt when it ends.
         self.tool_logs: dict[tuple[str, str], list[dict]] = {}
@@ -176,6 +186,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         for node in run.plan.nodes:
             if node.status == NodeStatus.RUNNING:
                 node.status = NodeStatus.PENDING
+            node.preparing = False
         for part in run.plan.parts:
             if part.status == "refining":
                 part.status = "planned"
@@ -297,10 +308,12 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         return True if budget held any back."""
         self._split_parts(run, running)
         in_flight = set(running.values())
+        # Steps at work, including those started early (_head_start).
+        started = {item.removeprefix(HEAD) for item in in_flight}
         completed = {node.id for node in run.plan.nodes if node.status == NodeStatus.SUCCEEDED}
         ready = [
             node for node in run.plan.nodes
-            if node.status == NodeStatus.PENDING and node.id not in in_flight
+            if node.status == NodeStatus.PENDING and node.id not in started
             and set(node.dependencies) <= completed and not outline.waits_on_unsplit(run.plan, node)
         ]
         reserved = run.actual_cost_usd + sum(
@@ -308,21 +321,25 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
         )
         held_back = False
         provider_load = Counter(self.model_lookup[n.model_id].provider for n in run.plan.nodes
-                                if n.id in in_flight and n.model_id in self.model_lookup)
+                                if n.id in started and n.model_id in self.model_lookup)
+
+        def at_capacity(model) -> bool:
+            if run.plan.employees and model:
+                # An employee is a role, not a worker: its independent tasks run at the same time,
+                # each in a session of its own; only a provider's capacity holds them back.
+                cap = settings.provider_limits.get(model.provider, {}).get("concurrency", 0)
+                if cap and provider_load[model.provider] >= cap:
+                    return True
+            # Splits at work do not count: they are the lead's conversations, not steps.
+            limit = settings.max_parallel_nodes
+            return bool(limit) and sum(not item.startswith(PREFIX) for item in running.values()) >= limit
+
         for node in ready:
             if node.status != NodeStatus.PENDING or not self._admit_tool_channel(run, node, reserved):
                 continue
             model = self.model_lookup.get(node.model_id)
-            if run.plan.employees:
-                provider_cap = settings.provider_limits.get(model.provider, {}).get("concurrency", 0) if model else 0
-                # An employee is a role, not a worker: its independent tasks run at the same time,
-                # each in a session of its own; only a provider's capacity holds them back.
-                if provider_cap and provider_load[model.provider] >= provider_cap:
-                    continue
-            # Splits at work do not count: they are the lead's conversations, not steps.
-            limit = settings.max_parallel_nodes
-            if limit and sum(not item.startswith(PREFIX) for item in running.values()) >= limit:
-                break
+            if at_capacity(model):
+                continue
             if node.estimated_cost_usd and reserved + node.estimated_cost_usd > run.budget_usd:
                 held_back = True
                 continue
@@ -330,7 +347,86 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             if model:
                 provider_load[model.provider] += 1
             running[asyncio.create_task(self._execute_node(run.id, node.id))] = node.id
+            started.add(node.id)
+        # With room left, steps still waiting for their inputs start on what does not need them.
+        for node in run.plan.nodes:
+            if not self._can_head_start(run, node, started):
+                continue
+            model = self.model_lookup.get(node.model_id)
+            if at_capacity(model) or reserved + node.estimated_cost_usd > run.budget_usd:
+                continue
+            provider_load[model.provider] += 1
+            started.add(node.id)
+            running[asyncio.create_task(self._head_start(run.id, node.id))] = HEAD + node.id
         return held_back
+
+    def _can_head_start(self, run: ExecutionRun, node, started: set) -> bool:
+        """Whether ``node`` may start early: on, its first time in this generation, waiting only for
+        steps still to do or at work, on a model that edits files, with files or folders of its own
+        (an unscoped step would hold the whole folder and stop the steps it waits for)."""
+        if (not settings.head_start or node.status != NodeStatus.PENDING or node.id in started or node.attempts
+                or node.head_start_generation == node.generation or outline.waits_on_unsplit(run.plan, node)):
+            return False
+        by_id = {item.id: item for item in run.plan.nodes}
+        waiting = [by_id[dep] for dep in node.dependencies if dep in by_id and by_id[dep].status != NodeStatus.SUCCEEDED]
+        if not waiting or any(dep.status not in {NodeStatus.PENDING, NodeStatus.RUNNING} for dep in waiting):
+            return False
+        model = self.model_lookup.get(node.model_id or "")
+        if not model or self._out_of_quota(node.model_id) or not (node.model_id.startswith("cli:") or can_act(model)):
+            return False
+        scope = scopes.of(node)
+        if scope.everything or not scope.writes:
+            return False
+        # Waiting for the folder would hold a place and start only once its inputs are ready.
+        folder = self.folder_locks.get(str(self._folder(run, node)))
+        return not (folder and folder.busy(scope))
+
+    @staticmethod
+    def _folder(run: ExecutionRun, node) -> Path:
+        return Path(run.project_dir) if run.project_dir and node.needs_workspace else settings.workspace_root / run.folder_id
+
+    async def _head_start(self, run_id: str, node_id: str) -> None:
+        """Start a step early, while steps it depends on are at work, on what does not need their
+        results. Not reviewed and not an attempt; its report goes into the step's first attempt."""
+        lock = self.locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            run = self.db.get_run(run_id)
+            node = next((item for item in run.plan.nodes if item.id == node_id), None) if run else None
+            if (not node or run.status != RunStatus.RUNNING or self.platform_pending
+                    or not self._can_head_start(run, node, set())):
+                return
+            node.preparing, node.head_start_generation = True, node.generation
+            self._save(run)
+        self.emit(run_id, "node.head_start", node_id=node_id, model_id=node.model_id)
+        report, error, skipped = "", None, False
+        try:
+            prompt = quality.head_start_prompt(node, run, settings.handoff_max_chars)
+            result, *_ = await asyncio.wait_for(
+                self._work(run, node, node.model_id, prompt, False, head_start=True),
+                settings.head_start_minutes * 60)
+            report = (result.text or "").strip()
+        except asyncio.TimeoutError:
+            error = f"准备到了 {settings.head_start_minutes:g} 分钟的时限，已停下，可能有没做完的文件。"
+            report = f"(Stopped at the {settings.head_start_minutes:g}-minute limit; some files may be unfinished.)"
+        except FolderBusy:
+            skipped = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # the step itself still runs once its inputs are ready
+            error = str(exc)[:500]
+        finally:
+            async with lock:
+                latest = self.db.get_run(run_id)
+                current = next((item for item in latest.plan.nodes if item.id == node_id), None) if latest else None
+                if current:
+                    current.preparing = False
+                    if skipped and current.head_start_generation == node.generation:
+                        current.head_start_generation = None  # may start early once the folder is free
+                    if report and current.generation == node.generation:
+                        current.head_start = report
+                    self._save(latest)
+            self._release_log(run_id, node_id)
+        self.emit(run_id, "node.head_started", node_id=node_id, error=error, skipped=skipped)
 
     @staticmethod
     def _contract_limit_reason(node):
@@ -455,6 +551,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 return
             node.status = NodeStatus.RUNNING
             node.started_at = datetime.now(timezone.utc)
+            node.waiting_for_folder = False
             self._save(run)
         self.emit(run_id, "node.started", node_id=node.id, model_id=node.model_id,
                   attempt=len(node.attempts) + 1)
@@ -472,6 +569,7 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 self._conversation(run, node),
             )
             work_accounted = result.accounted_cost_usd
+            intruded = self.intrusions.pop((run_id, node_id), None)
             latest = self.db.get_run(run_id)
             stale = latest and next(n for n in latest.plan.nodes if n.id == node_id).generation != generation
             if run.plan.employees and result.text.lstrip().startswith(team.DELEGATE):
@@ -483,6 +581,12 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                     verdict = quality.Verdict(False, f"委派请求未通过校验：{exc}", fix=str(exc))
             else:
                 verdict = quality.Verdict(False, "上游已返工，本次结果失效。") if stale else await self._check(run, node, result.text, changed, workspace)
+            if intruded and not stale:
+                paths = "、".join(path for path, _ in intruded[:5])
+                verdict = quality.Verdict(
+                    False, f"改了自己范围外的文件 {paths}，而同时在跑的「{intruded[0][1]}」正把它们当输入使用。",
+                    fix=("Change only the files in your own scope. If these files must change, say so in your report "
+                         "instead, so the lead can give the change to the right step: " + ", ".join(p for p, _ in intruded)))
             if result.turn_limit and verdict.passed and not verdict.reviewer_model_id:
                 # Nobody checked it, and a summary made at the turn limit says the work is unfinished.
                 verdict = quality.Verdict(False, f"用完了工具调用轮次，{TURN_LIMIT_HINT}：只交了进度总结。")
@@ -779,10 +883,11 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                       next_model_id=node.model_id, until=exc.until.isoformat(), **context)
 
     async def _work(self, run: ExecutionRun, node, model_id: str, prompt: str, fallback: bool,
-                    conversation: Optional[Conversation] = None):
+                    conversation: Optional[Conversation] = None, head_start: bool = False):
         """Have ``model_id`` do ``node`` in its working folder: the user's project or the
         task's scratch folder. Returns (result, changed files, cost, working folder).
-        ``conversation`` continues the step's last attempt when it holds a followup."""
+        ``conversation`` continues the step's last attempt when it holds a followup. A
+        ``head_start`` (_head_start) records no contract baseline and has no progress watch."""
         async with self.locks.setdefault(run.id, asyncio.Lock()):
             latest = self.db.get_run(run.id)
             learning.attach(self.db, latest)
@@ -811,18 +916,26 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             if uses_files:
                 # Steps editing the same folder at once would clobber each other, unless the files
                 # they change do not overlap (scopes.py).
-                await stack.enter_async_context(self.folder_locks.setdefault(str(workspace), scopes.FolderLock()).hold(scope))
+                folder = self.folder_locks.setdefault(str(workspace), scopes.FolderLock())
+                queued = folder.busy(scope)
+                if queued and head_start:
+                    raise FolderBusy
+                if queued:
+                    await self._note_queued(run.id, node.id, True)
+                await stack.enter_async_context(folder.hold(scope))
+                if queued:
+                    await self._note_queued(run.id, node.id, False)
             before = await asyncio.to_thread(quality.file_state, workspace) if uses_files else {}
             if uses_files and before and not (conversation and conversation.followup):
                 # A continued conversation has its files already.
                 prompt = await asyncio.to_thread(self._with_files, run, node, workspace, prompt)
             self.work_results.pop((run.id, node.id), None)
             log = self.tool_logs[run.id, node.id] = []
-            trace = self.tool_traces[run.id, node.id] = trace_path(run.id, node.id, len(node.attempts) + 1)
+            trace = self.tool_traces[run.id, node.id] = trace_path(run.id, node.id, 0 if head_start else len(node.attempts) + 1)
             for governor in team.governors(run.plan, node):
                 if reason := self._contract_limit_reason(governor):
                     raise StepLimitExceeded(reason)
-            if node.artifact_contract:
+            if node.artifact_contract and not head_start:
                 await asyncio.to_thread(contracts.prepare, run, node)
                 async with self.locks.setdefault(run.id, asyncio.Lock()):
                     latest = self.db.get_run(run.id)
@@ -834,10 +947,10 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
                 result = await self._complete(
                     run, node, model_id, prompt, workspace, allow_api_fallback=fallback and not in_project,
                     attachments=run.attachments, act=act, max_turns=turns_for(node), tool_log=log, tool_trace=trace,
-                    watch=self._timed_watch(run, node, model_id),
+                    watch=None if head_start else self._timed_watch(run, node, model_id),
                     effort=settings.reasoning_by_difficulty.get(node.difficulty),
                     **({"conversation": conversation} if conversation else {}),
-                    **({"overrun": overrun} if (overrun := self._overrun_check(run, node, model_id)) else {}),
+                    **({"overrun": overrun} if not head_start and (overrun := self._overrun_check(run, node, model_id)) else {}),
                 )
             self.work_results[run.id, node.id] = result
             try:
@@ -845,10 +958,29 @@ class Executor(Reviewing, Leading, Diagnosing, SelfRepair, Engineering, Refining
             except (Exception, asyncio.CancelledError) as exc:
                 exc.accounted_cost_usd = result.accounted_cost_usd
                 raise
+            everything_changed = quality.changed_files(before, after)
+            changed = scope.own(everything_changed)
+            scope.changed = changed  # before it leaves the folder (FolderLock.hold)
+            if intruded := scope.intrusions(everything_changed):
+                self.intrusions[run.id, node.id] = intruded
         # The node's own model falls back to its routed estimate; a takeover has none.
         cost = self._actual_cost(result, node, None if model_id == node.model_id else model_id)
-        return result, scope.own(quality.changed_files(before, after)), cost, workspace
+        return result, changed, cost, workspace
 
+
+    async def _note_queued(self, run_id: str, node_id: str, waiting: bool) -> None:
+        """Show a running step as queued while it waits for the folder; when it gets in, its time
+        starts then (started_at), not when it began waiting."""
+        async with self.locks.setdefault(run_id, asyncio.Lock()):
+            run = self.db.get_run(run_id)
+            node = next((item for item in run.plan.nodes if item.id == node_id), None) if run else None
+            if node is None or node.status != NodeStatus.RUNNING:
+                return
+            node.waiting_for_folder = waiting
+            if not waiting:
+                node.started_at = datetime.now(timezone.utc)
+            self._save(run)
+        self.emit(run_id, "node.queued" if waiting else "node.dequeued", node_id=node_id)
 
     def _timed_watch(self, run, node, model_id: str):
         """The progress watch of an attempt; for a contract step on a membership CLI, which cannot

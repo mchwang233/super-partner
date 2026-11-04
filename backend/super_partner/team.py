@@ -87,7 +87,11 @@ async def form(say, request, models, configured):
                 "concurrency": settings.provider_limits.get(m.provider, {}).get("concurrency", 0)} for m in available]
     prompt = (
         "TEAM_SETUP: You are the project lead. Decide the project team FIRST. Do not split the project "
-        "into parts or tasks yet. Choose the smallest useful team (1-" + str(settings.team_max_employees) + "). "
+        "into parts or tasks yet. Staff it like a real project team (1-" + str(settings.team_max_employees) + " employees): "
+        "one employee for each module or area of responsibility that needs its own expertise and can move forward "
+        "on its own (for a chip, for example: processor core, bus and interconnect, peripheral groups, verification, "
+        "firmware, integration), not the fewest people. Give no two employees the same responsibility and no "
+        "employee without work of its own; a small job in one skill needs only one or two. "
         "Give each employee a stable id, name, role, model_id, capabilities, skills, skill_tools and reason. "
         "The name is the employee's job in a few words of the user's language (such as \"RTL 设计\" or "
         "\"验证\"), never a person's name. "
@@ -96,8 +100,8 @@ async def form(say, request, models, configured):
         "is its share of the subscription, and when its quota is tight give the work to other suitable models. "
         "Capabilities are responsibilities, not invented improvements to a model's scores. Use only catalog models "
         "and capabilities coding/planning/research/chinese/tool_use/structured_output. Keep independent verification "
-        "with a suitable separate employee when needed. An employee may work on several independent tasks at the "
-        "same time, each in a session of its own, so do not add employees only to run work in parallel. Choose skills "
+        "with a suitable separate employee when needed. An employee may also work on several independent tasks at "
+        "the same time, each in a session of its own. Choose skills "
         "by exact names from the library; skill_tools lists additional tool knowledge to prepare through the existing "
         "skill reuse/discovery workflow. Never invent an installed skill. In team_brief record the shared goal, "
         "constraints, interface ownership and acceptance responsibilities. Return only JSON: "
@@ -179,15 +183,18 @@ def route(node, plan, models, configured, needs_vision=False):
     # An explicit recovery switch is preserved for this attempt; new assignments use the employee's model.
     selected = node.model_id if node.attempts and node.model_id else employee.model_id
     allowed = [m for m in eligible_for_node(node, models, configured, needs_vision) if not node.files or can_act(m)]
-    best = max((m.scores.score_for(node.capability) for m in allowed), default=node.quality_threshold)
-    threshold = min(node.quality_threshold, best)
-    model = next((m for m in allowed if m.id == selected and m.scores.score_for(node.capability) >= threshold), None)
+    model = next((m for m in allowed if m.id == selected), None)
     if model is None:
-        raise NoEligibleModelError(f"员工「{employee.name}」的模型 {selected} 无法满足「{node.title}」的能力、上下文或通道要求；需负责人调整分工或模型。")
-    node.quality_threshold = threshold
+        raise NoEligibleModelError(f"员工「{employee.name}」的模型 {selected} 无法满足「{node.title}」的上下文或通道要求；需负责人调整分工或模型。")
+    # The lead chose both the bar and the employee; when they disagree, the assignment stands and the
+    # step's review still judges the result.
+    score = model.scores.score_for(node.capability)
+    lowered = score < node.quality_threshold
+    note = f"（门槛从 {node.quality_threshold:g} 调到该模型的 {score:g}）" if lowered else ""
+    node.quality_threshold = min(node.quality_threshold, score)
     node.model_id = model.id
     node.estimated_cost_usd = round(node_cost(node, model), 6)
-    node.routing_note = f"负责人分配给 {employee.name}（{employee.role}），使用 {model.display_name}。"
+    node.routing_note = f"负责人分配给 {employee.name}（{employee.role}），使用 {model.display_name}{note}。"
 
 
 def context(node, run):

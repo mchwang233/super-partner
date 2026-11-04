@@ -14,7 +14,7 @@ import { LeadPanel, hasLead, leadRepairIds, type AskLead, type Decision, type Le
 import { ProjectField, rememberProject } from "./project-picker";
 import { EngineerPage } from "./engineer";
 import { EngineerBubble } from "./engineer-bubble";
-import { canCancelMission, canDeleteMission, CancelMissionDialog, DeleteMissionButton, DeleteMissionDialog, formatUsd, MissionHistory, needsAttention, statusLabel } from "./mission-history";
+import { canCancelMission, canDeleteMission, CancelMissionDialog, DeleteMissionButton, DeleteMissionDialog, formatUsd, MissionHistory, needsAttention, statusLabel, detailText } from "./mission-history";
 import "./style.css";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
@@ -37,9 +37,9 @@ async function keyRequest(url:string,init:RequestInit={},ms=20000){
 
 function ProviderCard({provider,onChanged}:{provider:Provider;onChanged:()=>void}) {
   const [key,setKey]=useState(""),[busy,setBusy]=useState<""|"save"|"test"|"remove">(""),[message,setMessage]=useState<{text:string;tone:"ok"|"warn"|"bad"}|null>(null);
-  async function save(e:FormEvent){e.preventDefault();setBusy("save");setMessage(null);try{const r=await keyRequest(`${API}/api/providers/${provider.id}/key`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({api_key:key})});const body=await r.json().catch(()=>({}));if(!r.ok)throw new Error(body.detail||`保存失败（${r.status}）`);setKey("");setMessage(body.stored==="session"?{text:"Key 已生效，但系统密钥环被锁定或不可用，只在本次运行中有效。解锁密钥环后重新保存即可长期保存。",tone:"warn"}:{text:"已保存到系统密钥环",tone:"ok"});onChanged()}catch(e){setMessage({text:errorText(e),tone:"bad"})}finally{setBusy("")}}
-  async function test(){setBusy("test");setMessage(null);try{const r=await keyRequest(`${API}/api/providers/${provider.id}/test`,{method:"POST"},30000);const body=await r.json();if(!r.ok)throw new Error(body.detail||"连接失败");setMessage({text:"连接正常",tone:"ok"})}catch(e){setMessage({text:errorText(e),tone:"bad"})}finally{setBusy("")}}
-  async function remove(){if(!confirm(`移除 ${provider.name} 的 API Key？`))return;setBusy("remove");setMessage(null);try{const r=await keyRequest(`${API}/api/providers/${provider.id}/key`,{method:"DELETE"});const body=await r.json().catch(()=>({}));if(!r.ok)throw new Error(body.detail||`移除失败（${r.status}）`);setMessage(body.removed==="session"?{text:"已停止使用，但系统密钥环被锁定，已保存的副本仍在其中，下次启动可能重新加载。",tone:"warn"}:{text:"已移除",tone:"ok"});onChanged()}catch(e){setMessage({text:errorText(e),tone:"bad"})}finally{setBusy("")}}
+  async function save(e:FormEvent){e.preventDefault();setBusy("save");setMessage(null);try{const r=await keyRequest(`${API}/api/providers/${provider.id}/key`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({api_key:key})});const body=await r.json().catch(()=>({}));if(!r.ok)throw new Error(detailText(body.detail)||`保存失败（${r.status}）`);setKey("");setMessage(body.stored==="session"?{text:"Key 已生效，但系统密钥环被锁定或不可用，只在本次运行中有效。解锁密钥环后重新保存即可长期保存。",tone:"warn"}:{text:"已保存到系统密钥环",tone:"ok"});onChanged()}catch(e){setMessage({text:errorText(e),tone:"bad"})}finally{setBusy("")}}
+  async function test(){setBusy("test");setMessage(null);try{const r=await keyRequest(`${API}/api/providers/${provider.id}/test`,{method:"POST"},30000);const body=await r.json();if(!r.ok)throw new Error(detailText(body.detail)||"连接失败");setMessage({text:"连接正常",tone:"ok"})}catch(e){setMessage({text:errorText(e),tone:"bad"})}finally{setBusy("")}}
+  async function remove(){if(!confirm(`移除 ${provider.name} 的 API Key？`))return;setBusy("remove");setMessage(null);try{const r=await keyRequest(`${API}/api/providers/${provider.id}/key`,{method:"DELETE"});const body=await r.json().catch(()=>({}));if(!r.ok)throw new Error(detailText(body.detail)||`移除失败（${r.status}）`);setMessage(body.removed==="session"?{text:"已停止使用，但系统密钥环被锁定，已保存的副本仍在其中，下次启动可能重新加载。",tone:"warn"}:{text:"已移除",tone:"ok"});onChanged()}catch(e){setMessage({text:errorText(e),tone:"bad"})}finally{setBusy("")}}
   return <article className="provider-card"><div className="provider-head"><span className={`provider ${provider.id}`}>{provider.id.slice(0,2).toUpperCase()}</span><div><b>{provider.name}</b><small className={provider.configured?"ready":"off"} title={provider.keyring_locked?"已保存的 Key 在系统密钥环里，密钥环解锁后会自动加载":undefined}>{provider.configured?"已连接":provider.keyring_locked?"密钥环未解锁":"未配置"}</small></div></div><form className="key-form" onSubmit={save}><input type="password" autoComplete="new-password" value={key} onChange={e=>setKey(e.target.value)} placeholder={provider.configured?"输入新 Key 以替换":"粘贴 API Key"} minLength={8} required/><button disabled={!!busy}>{busy==="save"?"保存中…":"保存"}</button></form><div className="provider-actions"><button type="button" className="ghost" onClick={test} disabled={!provider.configured||!!busy}>{busy==="test"?"测试中…":"测试连接"}</button>{provider.configured&&<button type="button" className="danger" onClick={remove} disabled={!!busy}>{busy==="remove"?"移除中…":"移除"}</button>}</div>{message&&<p className={`provider-message ${message.tone}`} role={message.tone==="bad"?"alert":"status"}>{message.text}</p>}</article>
 }
 
@@ -168,6 +168,10 @@ const EVENT_LABELS:Record<string,(data:Record<string,any>,title:(id:string)=>str
   "part.refine_failed":data=>`大项「${data.title}」没能细化：${data.error??""}`,
   "workspace.snapshot":data=>data.git?`记录项目起点：分支 ${data.branch}，${data.uncommitted_files} 个未提交改动`:"项目不是 git 仓库",
   "node.started":(data,title)=>`${title(data.node_id)}：开始第 ${data.attempt??1} 次执行`,
+  "node.queued":(data,title)=>`${title(data.node_id)}：排队，等其他步骤用完工作目录`,
+  "node.dequeued":(data,title)=>`${title(data.node_id)}：轮到它，开始工作`,
+  "node.head_start":(data,title)=>`${title(data.node_id)}：先行准备，先做不需要前置步骤结果的部分`,
+  "node.head_started":(data,title)=>`${title(data.node_id)}：${data.skipped?"目录正被其他步骤使用，这次不先行准备":data.error?`先行准备结束：${data.error}`:"先行准备完成，等前置步骤完成后正式执行"}`,
   "node.model_switched":(data,title)=>`${title(data.node_id)}：${data.model_id} ${data.reason==="model_configuration_changed"?"配置已变更":data.reason==="model_unavailable"?"服务暂时不可用":"额度用完"}，换用 ${data.next_model_id}`,
   "node.superseded":(data,title)=>`${title(data.node_id)}：上游已返工，旧结果失效，将重新执行`,
   "run.recovered":data=>data.reason==="lead"?"负责人已处理你的回答，任务继续":"诊断已处理阻碍，任务自动继续",
@@ -395,17 +399,17 @@ function App() {
   useEffect(()=>{if(!toasts.length)return;const timer=window.setTimeout(()=>setToasts(current=>current.slice(1)),8000);return()=>window.clearTimeout(timer)},[toasts]);
   useEffect(()=>{if(!selectedProvider)return;const close=(event:KeyboardEvent)=>{if(event.key==="Escape")setSelectedProvider(null)};window.addEventListener("keydown",close);return()=>window.removeEventListener("keydown",close)},[selectedProvider]);
   /** 需求变更: plan a task that continues this one's results, then show it for confirmation. */
-  async function changeRequirement(run:Run,prompt:string,budget:number,options:ChangeOptions){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/followup`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({prompt,budget_usd:budget,...options})});const body=await r.json().catch(()=>({}));if(!r.ok)return body.detail||`生成变更计划失败（${r.status}）`;autoSelected.current=true;setSelected(body);await load(false);return null}catch(e){return errorText(e)}}
-  async function submit(e:FormEvent){e.preventDefault();setBusy(true);setFormError("");try{const r=await fetch(`${API}/api/tasks`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({prompt,budget_usd:budget,use_cli:useCli,allow_network:allowNetwork,project_dir:projectDir.trim()||null,attachments:attachments.ids})});if(!r.ok){const body=await r.json().catch(()=>({}));throw new Error(body.detail||`生成计划失败（${r.status}）`)}try{localStorage.setItem(PROJECT_KEY,projectDir.trim())}catch{}rememberProject(projectDir.trim());const task=await r.json();autoSelected.current=true;setSelected(task);setPrompt("");attachments.clear();setComposerOpen(false);await load(false)}catch(e){setFormError(errorText(e))}finally{setBusy(false)}}
-  async function confirmRun(run:Run,runBudget:number){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/confirm`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({budget_usd:runBudget})});if(!r.ok){const body=await r.json().catch(()=>({}));return body.detail||`确认失败（${r.status}）`}await load(false);return null}catch(e){return errorText(e)}}
-  async function chooseForPlan(run:Run,picks:string[]){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/choices`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({picks})});const body=await r.json().catch(()=>({}));if(!r.ok)return body.detail||`重新规划失败（${r.status}）`;loadRevision.current++;setRuns(current=>current.map(item=>item.id===run.id?body:item));setSelected(current=>current?.id===run.id?body:current);return null}catch(e){return errorText(e)}}
-  async function setNetwork(run:Run,allow:boolean){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/network`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({allow})});const body=await r.json().catch(()=>({}));if(!r.ok)return body.detail||`修改联网设置失败（${r.status}）`;loadRevision.current++;setRuns(current=>current.map(item=>item.id===run.id?body:item));setSelected(current=>current?.id===run.id?body:current);return null}catch(e){return errorText(e)}}
-  async function postAction(run:Run,action:"pause"|"diagnose",label:string){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/${action}`,{method:"POST"});const body=await r.json().catch(()=>({}));if(!r.ok)return body.detail||`${label}失败（${r.status}）`;loadRevision.current++;setRuns(current=>current.map(item=>item.id===run.id?body:item));setSelected(current=>current?.id===run.id?body:current);return null}catch(e){return errorText(e)}}
+  async function changeRequirement(run:Run,prompt:string,budget:number,options:ChangeOptions){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/followup`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({prompt,budget_usd:budget,...options})});const body=await r.json().catch(()=>({}));if(!r.ok)return detailText(body.detail)||`生成变更计划失败（${r.status}）`;autoSelected.current=true;setSelected(body);await load(false);return null}catch(e){return errorText(e)}}
+  async function submit(e:FormEvent){e.preventDefault();setBusy(true);setFormError("");try{const r=await fetch(`${API}/api/tasks`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({prompt,budget_usd:budget,use_cli:useCli,allow_network:allowNetwork,project_dir:projectDir.trim()||null,attachments:attachments.ids})});if(!r.ok){const body=await r.json().catch(()=>({}));throw new Error(detailText(body.detail)||`生成计划失败（${r.status}）`)}try{localStorage.setItem(PROJECT_KEY,projectDir.trim())}catch{}rememberProject(projectDir.trim());const task=await r.json();autoSelected.current=true;setSelected(task);setPrompt("");attachments.clear();setComposerOpen(false);await load(false)}catch(e){setFormError(errorText(e))}finally{setBusy(false)}}
+  async function confirmRun(run:Run,runBudget:number){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/confirm`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({budget_usd:runBudget})});if(!r.ok){const body=await r.json().catch(()=>({}));return detailText(body.detail)||`确认失败（${r.status}）`}await load(false);return null}catch(e){return errorText(e)}}
+  async function chooseForPlan(run:Run,picks:string[]){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/choices`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({picks})});const body=await r.json().catch(()=>({}));if(!r.ok)return detailText(body.detail)||`重新规划失败（${r.status}）`;loadRevision.current++;setRuns(current=>current.map(item=>item.id===run.id?body:item));setSelected(current=>current?.id===run.id?body:current);return null}catch(e){return errorText(e)}}
+  async function setNetwork(run:Run,allow:boolean){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/network`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({allow})});const body=await r.json().catch(()=>({}));if(!r.ok)return detailText(body.detail)||`修改联网设置失败（${r.status}）`;loadRevision.current++;setRuns(current=>current.map(item=>item.id===run.id?body:item));setSelected(current=>current?.id===run.id?body:current);return null}catch(e){return errorText(e)}}
+  async function postAction(run:Run,action:"pause"|"diagnose",label:string){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/${action}`,{method:"POST"});const body=await r.json().catch(()=>({}));if(!r.ok)return detailText(body.detail)||`${label}失败（${r.status}）`;loadRevision.current++;setRuns(current=>current.map(item=>item.id===run.id?body:item));setSelected(current=>current?.id===run.id?body:current);return null}catch(e){return errorText(e)}}
   async function replyToDiagnosis(run:Run,diagnosisId:string,body:{text:string;choice?:string}){
     try{
       const response=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/diagnoses/${encodeURIComponent(diagnosisId)}/reply`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
       const updated=await response.json().catch(()=>({}));
-      if(!response.ok)return updated.detail||`回复失败（${response.status}）`;
+      if(!response.ok)return detailText(updated.detail)||`回复失败（${response.status}）`;
       loadRevision.current++;
       setRuns(current=>current.map(item=>item.id===run.id?updated:item));
       setSelected(current=>current?.id===run.id?updated:current);
@@ -416,14 +420,14 @@ function App() {
     try{
       const response=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/lead`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({message:text})});
       const updated=await response.json().catch(()=>({}));
-      if(!response.ok)return updated.detail||`发送失败（${response.status}）`;
+      if(!response.ok)return detailText(updated.detail)||`发送失败（${response.status}）`;
       loadRevision.current++;
       setRuns(current=>current.map(item=>item.id===run.id?updated:item));
       setSelected(current=>current?.id===run.id?updated:current);
       return null;
     }catch(error){return errorText(error)}
   }
-  async function resumeRun(run:Run,runBudget:number){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/resume`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({budget_usd:runBudget})});if(!r.ok){const body=await r.json().catch(()=>({}));return body.detail||`继续失败（${r.status}）`}await load(false);return null}catch(e){return errorText(e)}}
+  async function resumeRun(run:Run,runBudget:number){try{const r=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/resume`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({budget_usd:runBudget})});if(!r.ok){const body=await r.json().catch(()=>({}));return detailText(body.detail)||`继续失败（${r.status}）`}await load(false);return null}catch(e){return errorText(e)}}
   function requestCancelRun(run:Run){
     if(cancellingRunId||!canCancelRun(run))return;
     setCancelError("");setCancelTarget(run);
@@ -436,7 +440,7 @@ function App() {
     const timeout=window.setTimeout(()=>controller.abort(),15000);
     try{
       const response=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}/cancel`,{method:"POST",signal:controller.signal});
-      if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.detail||`取消失败（${response.status}）`)}
+      if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(detailText(body.detail)||`取消失败（${response.status}）`)}
       const updated=await response.json() as Run;
       // Ignore older polls so they cannot overwrite the confirmed cancellation.
       loadRevision.current++;
@@ -458,7 +462,7 @@ function App() {
     const timeout=window.setTimeout(()=>controller.abort(),15000);
     try{
       const response=await fetch(`${API}/api/tasks/${encodeURIComponent(run.id)}`,{method:"DELETE",signal:controller.signal});
-      if(!response.ok&&response.status!==404){const body=await response.json().catch(()=>({}));throw new Error(body.detail||`删除失败（${response.status}）`)}
+      if(!response.ok&&response.status!==404){const body=await response.json().catch(()=>({}));throw new Error(detailText(body.detail)||`删除失败（${response.status}）`)}
       // Ignore polls started before deletion, so stale responses cannot restore the record.
       loadRevision.current++;
       setRuns(current=>current.filter(item=>item.id!==run.id));

@@ -272,9 +272,15 @@ def _paths(value) -> list[str]:
     return list(dict.fromkeys(str(item).strip().removeprefix("./") for item in items if str(item).strip()))[:20]
 
 
+def _folders(value) -> list[str]:
+    """Folders as "a/b/"; unsafe ones are dropped, which leaves the step the whole folder (scopes.py)."""
+    names = (path.rstrip("/") for path in _paths(value))
+    return [f"{name}/" for name in names if contracts.safe_name(name)]
+
+
 def package(raw: dict) -> dict:
     """A node's work-package fields from a planner's (or lead's) JSON."""
-    return {"files": _paths(raw.get("files")), "reads": _paths(raw.get("reads")),
+    return {"files": _paths(raw.get("files")), "reads": _paths(raw.get("reads")), "folders": _folders(raw.get("folders")),
             "provides": str(raw.get("provides") or "").strip()[:2000],
             "check": str(raw.get("check") or "").strip()[:500]}
 

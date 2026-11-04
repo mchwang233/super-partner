@@ -287,6 +287,9 @@ class TaskNode(BaseModel):
     # command that shows it works. A scoped step gets just these files, not the whole project.
     files: list[str] = Field(default_factory=list)
     reads: list[str] = Field(default_factory=list)
+    # Folders ("rtl/core/") a step without listed files alone changes while it runs, so steps in other
+    # folders run alongside it (scopes.py). Unlike files, they do not narrow what the step is given.
+    folders: list[str] = Field(default_factory=list)
     provides: str = ""
     check: str = ""
     artifact_contract: Optional[ArtifactContract] = None
@@ -313,6 +316,14 @@ class TaskNode(BaseModel):
     routing_note: Optional[str] = None
     # When the current (or last) attempt started; attempts record when each one ended.
     started_at: Optional[datetime] = None
+    # Running, but waiting for other steps to leave the folder it works in (scopes.py); started_at
+    # is reset when it gets in, so queueing does not count as working time.
+    waiting_for_folder: bool = False
+    # Started early while its dependencies were still at work (executor._head_start): true during that,
+    # and what it did then, for the generation it was done for.
+    preparing: bool = False
+    head_start: str = ""
+    head_start_generation: Optional[int] = None
     estimated_cost_usd: float = 0.0
     status: NodeStatus = NodeStatus.PENDING
     result: Optional[str] = None

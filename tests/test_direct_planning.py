@@ -251,3 +251,34 @@ async def test_short_or_easy_lines_are_not_questioned():
         provider = Replies(payload)
         await planned(provider)
         assert len(provider.messages) == 2
+
+
+async def test_tasks_whose_files_are_not_known_yet_own_folders_so_they_can_run_together():
+    nodes = [{**TASKS["nodes"][0], "key": "core", "title": "核", "folders": ["rtl/core", "./tests/core/", "../x", ".git"]},
+             {**TASKS["nodes"][0], "key": "periph", "title": "外设", "folders": ["rtl/periph/"]}]
+    provider = Planner({**TASKS, "nodes": nodes})
+    plan = await planned(provider)
+    assert '"folders"' in provider.messages[1]
+    assert [node.folders for node in plan.nodes] == [["rtl/core/", "tests/core/"], ["rtl/periph/"]]
+    assert all(not node.files for node in plan.nodes)
+
+
+async def test_a_folder_named_as_a_file_or_read_is_kept_as_that_folder():
+    nodes = [{**TASKS["nodes"][0], "files": ["fw/", "src/main.c"], "reads": ["docs/"]}]
+    plan = await planned(Planner({**TASKS, "nodes": nodes}))
+    assert plan.nodes[0].files == ["fw", "src/main.c"] and plan.nodes[0].reads == ["docs"]
+
+
+async def test_the_lead_is_told_which_paths_are_not_allowed_and_can_correct_them():
+    class Correcting(Planner):
+        async def converse(self, session, text, **kwargs):
+            if "TEAM_SETUP" not in text and len(self.messages) == 1:
+                self.payload = {**TASKS, "nodes": [{**TASKS["nodes"][0], "reads": ["rtl/*.sv", "../secret"]}]}
+            elif "TEAM_SETUP" not in text:
+                self.payload = {**TASKS, "nodes": [{**TASKS["nodes"][0], "reads": ["rtl/top.sv"]}]}
+            return await super().converse(session, text, **kwargs)
+
+    provider = Correcting()
+    plan = await planned(provider)
+    assert "rtl/*.sv, ../secret" in provider.messages[2]
+    assert plan.nodes[0].reads == ["rtl/top.sv"]

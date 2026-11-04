@@ -1,16 +1,16 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { CAPABILITIES, Radar, score, type CapabilityKey, type Model } from "./model-profiles";
-import { formatUsd, statusLabel } from "./mission-history";
+import { formatUsd, nodeStatusLabel, statusLabel } from "./mission-history";
 import { MarkdownView } from "./markdown";
 
 export type PlanNode = {
   id: string; title: string; model_id: string; status: string; estimated_cost_usd: number;
   employee_id?: string | null; delegation_parent_id?: string | null;
   capability?: string; dependencies?: string[]; needs_workspace?: boolean; result?: string;
-  difficulty?: string; quality_threshold?: number; routing_note?: string | null; started_at?: string | null;
+  difficulty?: string; quality_threshold?: number; routing_note?: string | null; started_at?: string | null; waiting_for_folder?: boolean; preparing?: boolean; head_start?: string;
   acceptance_criteria?: string; verifies?: string[]; attempts?: NodeAttempt[]; failed_attempts?: number;
   feedback?: string | null; unable_reason?: string | null; review_passed?: boolean | null; review?: string | null; summary?: string | null;
-  changed_files?: string[]; inputs?: { node_id: string; form: string; changed_files: number }[];
+  changed_files?: string[]; folders?: string[]; inputs?: { node_id: string; form: string; changed_files: number }[];
   files?: string[]; reads?: string[]; provides?: string; check?: string; part_id?: string | null;
 };
 type ToolCall = { turn: number; tool: string; detail?: string; ok?: boolean | null; output?: string; running?: boolean; status?: string; diagnostic?: string | null };
@@ -50,10 +50,13 @@ export function nodeLine(node: PlanNode, nodes: PlanNode[], number: Map<string, 
   if (node.status === "failed") return { tone: "bad", text: `✗ ${last ? OUTCOME_LABELS[last.outcome] ?? "失败" : "失败"}` };
   if (node.status === "unable") return { tone: "bad", text: "⊘ 当前环境无法完成" };
   if (node.status === "blocked") return { tone: "muted", text: "前置步骤无法完成，未执行" };
+  if (node.status === "running" && node.waiting_for_folder) return { tone: "muted", text: "排队中：等其他步骤用完工作目录" };
   if (node.status === "running") return { tone: node.feedback ? "warn" : "run", text: node.feedback ? `↻ 第 ${attempts.length + 1} 次尝试中` : "执行中…" };
   if (node.status === "cancelled") return { tone: "muted", text: "已取消" };
   if (node.feedback) return { tone: "warn", text: `↻ 待重做（${last ? OUTCOME_LABELS[last.outcome] ?? last.outcome : "返工"}）` };
   const waiting = (node.dependencies ?? []).filter(id => nodes.find(item => item.id === id)?.status !== "succeeded").map(id => number.get(id)).filter(Boolean);
+  if (node.preparing) return { tone: "run", text: `先行准备中：先做不需要 ${waiting.join("、")} 结果的部分` };
+  if (node.head_start && waiting.length) return { tone: "muted", text: `已先行准备，等待 ${waiting.join("、")}` };
   return { tone: "muted", text: waiting.length ? `等待 ${waiting.join("、")}` : "可以开始" };
 }
 
@@ -202,7 +205,7 @@ export function PlanGraph({ apiBase, runId, runStatus, nodes, all = nodes, inPro
                   onClick={open} onMouseEnter={() => setActive(node.id)} onMouseLeave={() => setActive(null)}>
                   <div className="plan-node-line"><span className="num">{number.get(node.id)}</span>
                     <button type="button" className="plan-node-title" aria-expanded={selectedId === node.id} onClick={event => { event.stopPropagation(); open(); }} onFocus={() => setActive(node.id)} onBlur={() => setActive(null)}>{node.title}</button>
-                    <span className={`state ${node.status}`}>{statusLabel(node.status)}</span></div>
+                    <span className={`state ${node.status}`}>{nodeStatusLabel(node)}</span></div>
                   <p className={`plan-check ${line.tone}`} title={node.review ?? undefined}>{line.text}</p>
                   <button type="button" className="plan-model" onClick={event => { event.stopPropagation(); setOpenNode(node); }} title={`${selectionReason(node, model)}点击查看模型能力图。`}>{model?.display_name ?? node.model_id ?? "未分配模型"}</button>
                 </article>;
@@ -242,6 +245,10 @@ function describe(event: TimelineEvent, nodeId: string, number: Map<string, stri
   if (data.node_id !== nodeId) return null;
   switch (event.kind) {
     case "node.started": return `开始第 ${data.attempt ?? 1} 次执行${data.model_id ? `（${data.model_id}）` : ""}`;
+    case "node.queued": return "排队：等其他步骤用完工作目录";
+    case "node.dequeued": return "轮到它，开始工作";
+    case "node.head_start": return "先行准备：先做不需要前置步骤结果的部分";
+    case "node.head_started": return data.skipped ? "目录正被其他步骤使用，这次不先行准备，等前置步骤完成后正式执行" : data.error ? `先行准备结束：${data.error}` : "先行准备完成，等前置步骤完成后正式执行";
     case "node.succeeded": return `完成${data.used_model_id && data.used_model_id !== data.selected_model_id ? `（实际由 ${data.used_model_id} 完成）` : ""} · ${formatUsd(data.cost_usd ?? 0)}`;
     case "node.delegated": return `已委派 ${(data.children ?? []).length} 个子任务，等待验收后继续：${data.reason ?? ""}`;
     case "node.retry": return `未通过，准备第 ${data.attempt} 次尝试${data.model_id ? `（换用 ${data.model_id}）` : ""}：${data.reason ?? ""}`;
@@ -262,14 +269,14 @@ export function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, m
   const [activity, setActivity] = useState<{ total: number; calls: ToolCall[] } | null>(null);
   useEffect(() => {
     // What the step is doing right now: its tool calls, or a CLI's commands and messages.
-    if (node.status !== "running") { setActivity(null); return; }
+    if (node.status !== "running" && !node.preparing) { setActivity(null); return; }
     let cancelled = false;
     const load = () => fetch(`${apiBase}/api/tasks/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(node.id)}/activity`)
       .then(r => r.ok ? r.json() : null).then(body => { if (!cancelled && body) setActivity(body); }).catch(() => {});
     load();
     const timer = window.setInterval(load, 3000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [apiBase, runId, node.id, node.status]);
+  }, [apiBase, runId, node.id, node.status, node.preparing]);
   useEffect(() => {
     let cancelled = false;
     const load = () => fetch(`${apiBase}/api/tasks/${encodeURIComponent(runId)}/timeline`).then(r => r.ok ? r.json() : []).then(list => { if (!cancelled && Array.isArray(list)) setEvents(list); }).catch(() => {});
@@ -291,7 +298,9 @@ export function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, m
   const ended = attempts.length ? new Date(attempts[attempts.length - 1].finished_at ?? "").getTime() : NaN;
   const waitingFor = (node.dependencies ?? []).filter(id => nodes.find(item => item.id === id)?.status !== "succeeded").map(id => number.get(id)).filter(Boolean);
   const now_text =
-    node.status === "running" ? `第 ${attempts.length + 1} 次执行中${started ? ` · 已运行 ${duration(now - started)}` : ""}`
+    node.status === "running" && node.waiting_for_folder ? `第 ${attempts.length + 1} 次执行排队中：等其他步骤用完工作目录${started ? ` · 已等 ${duration(now - started)}` : ""}`
+    : node.status === "running" ? `第 ${attempts.length + 1} 次执行中${started ? ` · 已运行 ${duration(now - started)}` : ""}`
+    : node.status === "pending" && node.preparing ? `先行准备中：先做不需要 ${waitingFor.join("、")} 结果的部分，之后等它们完成再正式执行`
     : node.status === "pending" ? (waitingFor.length ? `等待 ${waitingFor.join("、")} 完成` : node.feedback ? "等待重新执行" : live ? "等待空位或预算" : "尚未开始")
     : node.status === "succeeded" ? `已完成${started && !Number.isNaN(ended) ? ` · 本次用时 ${duration(ended - started)}` : ""}`
     : node.status === "failed" ? `已失败（共 ${attempts.length} 次尝试）`
@@ -300,10 +309,10 @@ export function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, m
   return <section className={`node-progress drawer ${node.status}`} role="dialog" aria-label={`${node.title} 的进行情况`}>
     <div className="node-progress-head">
       <div><p className="eyebrow">子任务 {number.get(node.id)} · 进行情况</p><h4>{node.title}</h4></div>
-      <span className={`state ${node.status}`}>{statusLabel(node.status)}</span>
+      <span className={`state ${node.status}`}>{nodeStatusLabel(node)}</span>
       <button type="button" className="modal-close" onClick={onClose} aria-label="关闭进行情况">×</button>
     </div>
-    <p className={`node-progress-now ${node.status}`}>{node.status === "running" && <i className="pulse" aria-hidden="true" />}{now_text}</p>
+    <p className={`node-progress-now ${node.preparing ? "running" : node.status}`}>{(node.status === "running" || node.preparing) && <i className="pulse" aria-hidden="true" />}{now_text}</p>
     <dl className="node-progress-facts">
       <div><dt>模型</dt><dd><button type="button" className="plan-model" onClick={onOpenModel}>{model?.display_name ?? node.model_id ?? "未分配"}</button></dd></div>
       {node.difficulty && <div><dt>难度</dt><dd>{DIFFICULTY_LABELS[node.difficulty] ?? node.difficulty} · 门槛 {Math.round(node.quality_threshold ?? 0)}</dd></div>}
@@ -314,7 +323,7 @@ export function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, m
       <div><dt>花费</dt><dd>{formatUsd(attempts.reduce((sum, attempt) => sum + attempt.cost_usd, 0))} / 预估 {formatUsd(node.estimated_cost_usd)}</dd></div>
     </dl>
     <p className="node-progress-reason">{selectionReason(node, model)}</p>
-    {node.status === "running" && <section className="node-activity" aria-live="polite"><h5>正在做</h5>
+    {((node.status === "running" && !node.waiting_for_folder) || (node.status === "pending" && node.preparing)) && <section className="node-activity" aria-live="polite"><h5>正在做</h5>
       {activity?.calls.length ? <>
         <ToolLog calls={activity.calls} open title={activity.total > activity.calls.length ? `最近的动作（共 ${activity.total} 次）` : "本次尝试的动作"} />
         <p className="muted">每 3 秒刷新。{activity.calls[activity.calls.length - 1].running ? "最后一条命令还在运行。" : ""}</p>
@@ -327,12 +336,14 @@ export function NodeProgress({ apiBase, runId, runStatus, node, nodes, number, m
       <div className="node-progress-side">
         {node.unable_reason && <section className="unable-reason"><h5>无法完成的原因</h5><MarkdownView text={node.unable_reason} /></section>}
         {node.acceptance_criteria && <section><h5>验收标准</h5><p>{node.acceptance_criteria}</p></section>}
-        {!!(node.files?.length || node.reads?.length) && <section className="node-scope"><h5>工作范围</h5>
+        {!!(node.files?.length || node.reads?.length || node.folders?.length) && <section className="node-scope"><h5>工作范围</h5>
           {!!node.files?.length && <p>改动：{node.files.join("、")}</p>}
+          {!node.files?.length && !!node.folders?.length && <p>负责的目录：{node.folders.join("、")}</p>}
           {!!node.reads?.length && <p>参考：{node.reads.join("、")}</p>}
           {node.provides && <p>交付：{node.provides}</p>}
           {node.check && <p>检查：<code>{node.check}</code></p>}
         </section>}
+        {node.head_start && !node.preparing && <section className="node-head-start"><h5>依赖完成前已做的准备</h5><MarkdownView text={node.head_start} /></section>}
         {node.review && <section><h5>验收意见</h5><p>{node.review}</p></section>}
         {node.feedback && node.status !== "succeeded" && <section><h5>需要修改</h5><p>{node.feedback}</p></section>}
         {!!inputs.length && <section><h5>收到的上游结果</h5><p>{inputs.map(input => `${number.get(input.node_id) ?? "?"} 的${INPUT_LABELS[input.form] ?? input.form}${input.changed_files ? `（改动 ${input.changed_files} 个文件）` : ""}`).join("，")}</p></section>}
